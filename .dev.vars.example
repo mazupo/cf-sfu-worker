@@ -1,0 +1,10 @@
+# Copy to .dev.vars for `wrangler dev`. Deployed values are set with `wrangler secret put`.
+# Realtime SFU app: Dashboard -> Realtime -> SFU -> create an application.
+REALTIME_SFU_APP_ID=
+REALTIME_SFU_BEARER_TOKEN=
+# Run `npm run keys` and paste the private keys here. Give the public keys to devices and viewers.
+DEVICE_PRIVATE_KEY=
+VIEWER_PRIVATE_KEY=
+# Optional. Adds TURN servers to the ICE servers sent to devices and viewers.
+REALTIME_TURN_KEY_ID=
+REALTIME_TURN_KEY_API_TOKEN=

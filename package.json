@@ -1,0 +1,32 @@
+{
+  "name": "cf-sfu-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types --env-file .dev.vars.example",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run cf-typegen -- --check && npm run typecheck && npm run test",
+    "keys": "node scripts/keys.mjs"
+  },
+  "dependencies": {
+    "hono": "^4.13.13",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.3",
+    "@msw/cloudflare": "^0.2.0",
+    "@types/node": "^26.6.5",
+    "msw": "^3.0.3",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.12",
+    "wrangler": "^4.151.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

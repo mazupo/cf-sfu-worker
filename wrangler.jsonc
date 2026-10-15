@@ -1,0 +1,69 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cf-sfu-worker",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  // The demo pages are static. Only /cloudflare/* runs the Worker.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/cloudflare/*"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "DEVICES", "class_name": "Device" },
+      { "name": "ROOMS", "class_name": "Room" }
+    ]
+  },
+  // Never edit a deployed migration. Add a new tag instead.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Device", "Room"] }],
+  // Limits token requests per IP address. Counts are kept per Cloudflare location.
+  "ratelimits": [
+    { "name": "TOKEN_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "*",
+    "TOKEN_TTL_SECONDS": "30",
+    "DEVICE_STALE_SECONDS": "45",
+    "WAKE_TIMEOUT_SECONDS": "20",
+    "IDLE_LINGER_SECONDS": "30",
+    "VIEWER_STALE_SECONDS": "45",
+    "VIEWER_RESUME_SECONDS": "30",
+    "MAX_VIEWERS_PER_DEVICE": "10",
+    "MAX_DEVICES_PER_ROOM": "16",
+    "MAX_ROOMS_PER_DEVICE": "4"
+  },
+  "observability": { "enabled": true },
+  // Secrets (wrangler secret put): REALTIME_SFU_APP_ID, REALTIME_SFU_BEARER_TOKEN,
+  // DEVICE_PRIVATE_KEY, VIEWER_PRIVATE_KEY, and optionally REALTIME_TURN_KEY_ID and
+  // REALTIME_TURN_KEY_API_TOKEN. See .dev.vars.example.
+  "env": {
+    // The mazupo deployment: `wrangler deploy --env mazupo`. Other deployments can ignore it.
+    "mazupo": {
+      "workers_dev": false,
+      "routes": [{ "pattern": "api.mazupo.com/cloudflare/*", "zone_name": "mazupo.com" }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "DEVICES", "class_name": "Device" },
+          { "name": "ROOMS", "class_name": "Room" }
+        ]
+      },
+      "ratelimits": [
+        { "name": "TOKEN_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
+      ],
+      "vars": {
+        "ALLOWED_ORIGINS": "*",
+        "TOKEN_TTL_SECONDS": "30",
+        "DEVICE_STALE_SECONDS": "45",
+        "WAKE_TIMEOUT_SECONDS": "20",
+        "IDLE_LINGER_SECONDS": "30",
+        "VIEWER_STALE_SECONDS": "45",
+        "VIEWER_RESUME_SECONDS": "30",
+        "MAX_VIEWERS_PER_DEVICE": "10",
+        "MAX_DEVICES_PER_ROOM": "16",
+        "MAX_ROOMS_PER_DEVICE": "4"
+      }
+    }
+  }
+}
