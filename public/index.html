@@ -1,1 +1,47 @@
-<!doctype html><title>cf-sfu-worker</title>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cf-sfu-worker viewer</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>cf-sfu-worker viewer</h1>
+      <nav>
+        <a href="./" aria-current="page">Viewer</a>
+        <a href="./device">Device simulator</a>
+      </nav>
+    </header>
+
+    <form class="panel" id="join-form">
+      <label>Worker URL
+        <input name="workerUrl" id="worker-url" required>
+      </label>
+      <label>Viewer public key
+        <input name="viewerKey" id="viewer-key" required autocomplete="off">
+      </label>
+      <label>Room
+        <input name="room" id="room" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" value="lab-a">
+      </label>
+      <div>
+        <button type="submit" id="join">Join</button>
+        <button type="button" class="secondary" id="leave" disabled>Leave</button>
+      </div>
+    </form>
+
+    <p class="status" id="status">Not connected.</p>
+    <section class="grid" id="tiles" aria-live="polite">
+      <p class="empty">Join a room to see its devices. Devices start publishing when you join.</p>
+    </section>
+
+    <details class="panel">
+      <summary>Log</summary>
+      <pre class="log" id="log"></pre>
+    </details>
+  </main>
+  <script type="module" src="./viewer.js"></script>
+</body>
+</html>

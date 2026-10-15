@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cf-sfu-worker device simulator</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Device simulator</h1>
+      <nav>
+        <a href="./">Viewer</a>
+        <a href="./device" aria-current="page">Device simulator</a>
+      </nav>
+    </header>
+    <p class="status">Acts like a camera device: it waits on the socket and publishes only after the worker sends <code>wake</code>.</p>
+
+    <form class="panel" id="device-form">
+      <label>Worker URL
+        <input name="workerUrl" id="worker-url" required>
+      </label>
+      <label>Device public key
+        <input name="deviceKey" id="device-key" required autocomplete="off">
+      </label>
+      <label>Device ID
+        <input name="deviceId" id="device-id" required pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" value="browser-cam">
+      </label>
+      <label>Rooms (comma separated)
+        <input name="rooms" id="rooms" required value="lab-a">
+      </label>
+      <label>Source
+        <select name="source" id="source">
+          <option value="pattern">Test pattern</option>
+          <option value="camera">Camera</option>
+        </select>
+      </label>
+      <div>
+        <button type="submit" id="connect">Connect</button>
+        <button type="button" class="secondary" id="disconnect" disabled>Disconnect</button>
+      </div>
+    </form>
+
+    <p class="status" id="status">Not connected.</p>
+    <section class="panel preview">
+      <video id="preview" autoplay playsinline muted></video>
+    </section>
+    <section class="panel">
+      <pre class="log" id="log"></pre>
+    </section>
+  </main>
+  <script type="module" src="./device.js"></script>
+</body>
+</html>

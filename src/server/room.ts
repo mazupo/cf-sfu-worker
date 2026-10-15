@@ -314,7 +314,12 @@ export class Room extends DurableObject<Env> {
     const byDevice = new Map<string, Set<string>>();
     for (const track of parsed.data.tracks) {
       if (!this.isMember(track.deviceId)) {
-        sendError(ws, { code: "not_member", message: `${track.deviceId} is not in this room.`, action: "subscribe" });
+        sendError(ws, {
+          code: "not_member",
+          message: `${track.deviceId} is not in this room.`,
+          action: "subscribe",
+          deviceId: track.deviceId,
+        });
         continue;
       }
       if (!byDevice.has(track.deviceId)) byDevice.set(track.deviceId, new Set());
@@ -328,12 +333,17 @@ export class Room extends DurableObject<Env> {
       const count = this.subscriberCount(deviceId) + (subscribed ? 0 : 1);
       const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, count);
       if (!resolved.ok) {
-        sendError(ws, { code: resolved.code, message: resolved.message, action: "subscribe" });
+        sendError(ws, { code: resolved.code, message: resolved.message, action: "subscribe", deviceId });
         continue;
       }
       for (const trackName of names) {
         if (!resolved.tracks.includes(trackName)) {
-          sendError(ws, { code: "track_not_found", message: `${deviceId} has no track ${trackName}.`, action: "subscribe" });
+          sendError(ws, {
+            code: "track_not_found",
+            message: `${deviceId} has no track ${trackName}.`,
+            action: "subscribe",
+            deviceId,
+          });
           continue;
         }
         const duplicate = current.some(

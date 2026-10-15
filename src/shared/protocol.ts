@@ -161,6 +161,8 @@ export type ErrorMessage = {
   code: string;
   message: string;
   action?: string;
+  /** Set when the error concerns one device, e.g. viewer_limit or not_live. */
+  deviceId?: string;
 };
 
 export type RTCIceServerLike = {
