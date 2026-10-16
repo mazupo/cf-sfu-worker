@@ -103,6 +103,18 @@ export class TestSocket {
     return this.waitFor(() => this.closeEvent ?? undefined, timeoutMs, "close");
   }
 
+  /** Waits for a "device" message that matches, skipping the ones before it. */
+  async device(deviceId: string, state: string, timeoutMs = 3000): Promise<any> {
+    return this.waitFor(() => {
+      while (true) {
+        const index = this.messages.findIndex((message) => message.action === "device" && message.message.deviceId === deviceId);
+        if (index < 0) return undefined;
+        const [found] = this.messages.splice(index, 1);
+        if (found!.message.state === state) return found!.message;
+      }
+    }, timeoutMs, `device ${deviceId} ${state}`);
+  }
+
   has(action: string): boolean {
     return this.messages.some((message) => message.action === action);
   }
@@ -139,7 +151,7 @@ export class TestSocket {
 export type SfuCall = { method: string; path: string; body: any };
 
 /** Fakes the Realtime SFU API and records every call. */
-export function mockSfu(): SfuCall[] {
+export function mockSfu(options: { missingTrack?: string } = {}): SfuCall[] {
   const calls: SfuCall[] = [];
   let sessions = 0;
   let mids = 100;
@@ -168,7 +180,16 @@ export function mockSfu(): SfuCall[] {
       return HttpResponse.json({
         requiresImmediateRenegotiation: true,
         sessionDescription: { type: "offer", sdp: "v=0 subscriber-offer" },
-        tracks: tracks.map((track) => ({ mid: String(mids++), trackName: track.trackName, sessionId: track.sessionId })),
+        tracks: tracks.map((track) =>
+          track.trackName === options.missingTrack
+            ? {
+                trackName: track.trackName,
+                sessionId: track.sessionId,
+                errorCode: "not_found_track_error",
+                errorDescription: "Track not found on remote peer.",
+              }
+            : { mid: String(mids++), trackName: track.trackName, sessionId: track.sessionId },
+        ),
       });
     }),
     http.put(`${SFU}/sessions/:sessionId/renegotiate`, async ({ request }) => {

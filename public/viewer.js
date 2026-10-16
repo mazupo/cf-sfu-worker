@@ -11,8 +11,8 @@ import {
   sendAction,
 } from "./common.js";
 
-/** Errors about one device. The server still finishes the subscribe for the other devices. */
-const DEVICE_ERRORS = new Set(["not_member", "not_live", "viewer_limit", "track_not_found"]);
+/** Errors that will not change for the same publication. Do not ask again. */
+const PERMANENT = new Set(["viewer_limit", "not_member", "track_not_found"]);
 
 const form = document.getElementById("join-form");
 const joinButton = document.getElementById("join");
@@ -24,16 +24,22 @@ const log = createLog(document.getElementById("log"));
 document.getElementById("worker-url").value = location.origin;
 persistForm(form, "cf-sfu-worker.viewer");
 
-let ws = null;
+/** The one socket this tab uses. Events from any older socket are ignored. */
+let socket = null;
+let connectSeq = 0;
+let reconnectTimer = null;
+let syncTimer = null;
 let pc = null;
 let iceServers = [];
 let leaving = true;
 let attempt = 0;
-/** True from sending subscribe or unsubscribe until the server says "subscribed". */
+/** True from sending subscribe or unsubscribe until the server answers. */
 let busy = false;
+let busyFailures = 0;
 const devices = new Map(); // deviceId -> DeviceInfo
 const subscriptions = new Map(); // mid -> { deviceId, trackName, generation }
-const refused = new Map(); // deviceId -> generation the server refused
+const refused = new Map(); // deviceId -> generation the server refused for good
+const retries = new Map(); // deviceId -> { generation, count, at }
 const tiles = new Map(); // deviceId -> { root, video, chip, note }
 
 function viewerId() {
@@ -55,6 +61,10 @@ function setStatus(text) {
 }
 
 async function join() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  dropSocket();
+  const seq = ++connectSeq;
   const data = new FormData(form);
   leaving = false;
   joinButton.disabled = true;
@@ -66,24 +76,42 @@ async function join() {
       room_id: data.get("room"),
       can_subscribe: true,
     });
-    ws = openSocket(url, token);
-    ws.addEventListener("message", (event) => handle(parseFrame(event.data)));
-    ws.addEventListener("close", onClose);
+    if (seq !== connectSeq || leaving) return;
+    const ws = openSocket(url, token);
+    socket = ws;
+    ws.addEventListener("message", (event) => {
+      if (ws === socket) handle(parseFrame(event.data));
+    });
+    ws.addEventListener("close", (event) => {
+      if (ws === socket) onClose(event);
+    });
     setStatus("Connecting…");
   } catch (error) {
+    if (seq !== connectSeq) return;
     log(`token: ${error.message}`);
     setStatus(error.message);
     scheduleReconnect();
   }
 }
 
+function dropSocket() {
+  const old = socket;
+  socket = null;
+  old?.close(1000, "closed by the page");
+}
+
 function leave() {
   leaving = true;
-  sendAction(ws, "leave");
-  ws?.close(1000, "leave");
-  ws = null;
+  connectSeq++;
+  clearTimeout(reconnectTimer);
+  clearTimeout(syncTimer);
+  reconnectTimer = null;
+  sendAction(socket, "leave");
+  dropSocket();
   resetPeer(false);
   devices.clear();
+  refused.clear();
+  retries.clear();
   renderTiles();
   joinButton.disabled = false;
   leaveButton.disabled = true;
@@ -91,7 +119,7 @@ function leave() {
 }
 
 function onClose(event) {
-  ws = null;
+  socket = null;
   busy = false;
   log(`socket closed ${event.code} ${event.reason}`);
   if (leaving) return;
@@ -104,11 +132,12 @@ function onClose(event) {
 }
 
 function scheduleReconnect() {
-  if (leaving) return;
+  if (leaving || reconnectTimer) return;
   const delay = backoff(attempt++);
   setStatus(`Reconnecting in ${Math.round(delay / 1000)} s…`);
   // The same viewer_id within 30 s resumes the subscriptions on the server.
-  setTimeout(() => {
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
     if (!leaving) join();
   }, delay);
 }
@@ -150,20 +179,38 @@ async function handle(frame) {
       break;
     case "subscribed":
       setSubscriptions(message.tracks);
+      for (const sub of message.tracks) retries.delete(sub.deviceId);
       busy = false;
+      busyFailures = 0;
       attachTracks();
       sync();
       break;
     case "error":
-      log(`error ${message.code}${message.deviceId ? ` (${message.deviceId})` : ""}: ${message.message}`);
-      if (message.deviceId && DEVICE_ERRORS.has(message.code)) {
-        refused.set(message.deviceId, devices.get(message.deviceId)?.generation);
-        renderTiles();
-      } else if (message.action === "subscribe" || message.action === "unsubscribe" || message.action === "answer") {
-        busy = false;
-        if (message.code === "busy") setTimeout(sync, 1000);
-      }
+      onError(message);
       break;
+  }
+}
+
+function onError(error) {
+  log(`error ${error.code}${error.deviceId ? ` (${error.deviceId})` : ""}: ${error.message}`);
+  if (error.deviceId) {
+    // The server still finishes the request for the other devices.
+    const generation = devices.get(error.deviceId)?.generation;
+    if (PERMANENT.has(error.code)) {
+      refused.set(error.deviceId, generation);
+    } else {
+      // Usually the device is still connecting. Ask again in a moment.
+      const previous = retries.get(error.deviceId);
+      const count = previous?.generation === generation ? previous.count + 1 : 0;
+      retries.set(error.deviceId, { generation, count, at: Date.now() + Math.min(10_000, 1000 * 2 ** count) });
+    }
+    renderTiles();
+    return;
+  }
+  if (["subscribe", "unsubscribe", "answer"].includes(error.action)) {
+    busy = false;
+    busyFailures++;
+    scheduleSync(Math.min(10_000, 1000 * 2 ** busyFailures));
   }
 }
 
@@ -173,13 +220,18 @@ async function onOffer(message) {
   await pc.setRemoteDescription({ type: "offer", sdp: message.sdp });
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
-  sendAction(ws, "answer", { sdp: answer.sdp });
+  sendAction(socket, "answer", { sdp: answer.sdp });
   attachTracks();
+}
+
+function scheduleSync(delay) {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(sync, delay);
 }
 
 /** Brings the subscriptions in line with the devices that are live. One request at a time. */
 function sync() {
-  if (busy || ws?.readyState !== WebSocket.OPEN) return;
+  if (busy || socket?.readyState !== WebSocket.OPEN) return;
 
   // Tracks from a publication that ended: the device slept, restarted or left.
   const stale = [...subscriptions].filter(([, sub]) => {
@@ -188,13 +240,20 @@ function sync() {
   });
   if (stale.length > 0) {
     busy = true;
-    sendAction(ws, "unsubscribe", { mids: stale.map(([mid]) => mid) });
+    sendAction(socket, "unsubscribe", { mids: stale.map(([mid]) => mid) });
     return;
   }
 
+  const now = Date.now();
+  let nextRetry = Infinity;
   const wanted = [];
   for (const info of devices.values()) {
     if (info.state !== "live" || refused.get(info.deviceId) === info.generation) continue;
+    const retry = retries.get(info.deviceId);
+    if (retry?.generation === info.generation && retry.at > now) {
+      nextRetry = Math.min(nextRetry, retry.at);
+      continue;
+    }
     for (const trackName of info.tracks) {
       const has = [...subscriptions.values()].some(
         (sub) => sub.deviceId === info.deviceId && sub.trackName === trackName && sub.generation === info.generation,
@@ -204,7 +263,9 @@ function sync() {
   }
   if (wanted.length > 0) {
     busy = true;
-    sendAction(ws, "subscribe", { tracks: wanted });
+    sendAction(socket, "subscribe", { tracks: wanted });
+  } else if (nextRetry !== Infinity) {
+    scheduleSync(nextRetry - now);
   }
 }
 
@@ -219,9 +280,12 @@ function resetPeer(create) {
   subscriptions.clear();
   for (const tile of tiles.values()) tile.video.srcObject = null;
   if (!create) return;
-  pc = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
-  pc.addEventListener("track", attachTracks);
-  pc.addEventListener("connectionstatechange", () => log(`peer ${pc?.connectionState}`));
+  const peer = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
+  pc = peer;
+  peer.addEventListener("track", attachTracks);
+  peer.addEventListener("connectionstatechange", () => {
+    if (peer === pc) log(`peer ${peer.connectionState}`);
+  });
 }
 
 /** Puts each received track on the tile of the device it came from, matched by mid. */
@@ -245,10 +309,12 @@ function attachTracks() {
 
 function renderTiles() {
   if (devices.size === 0) {
-    tilesEl.replaceChildren(Object.assign(document.createElement("p"), {
-      className: "empty",
-      textContent: ws ? "No devices in this room yet." : "Join a room to see its devices.",
-    }));
+    tilesEl.replaceChildren(
+      Object.assign(document.createElement("p"), {
+        className: "empty",
+        textContent: socket ? "No devices in this room yet." : "Join a room to see its devices.",
+      }),
+    );
     tiles.clear();
     return;
   }
@@ -264,7 +330,13 @@ function renderTiles() {
     if (!tile) {
       const root = document.createElement("article");
       root.className = "tile";
-      const video = Object.assign(document.createElement("video"), { autoplay: true, playsInline: true, muted: true, controls: true });
+      root.dataset.deviceId = info.deviceId;
+      const video = Object.assign(document.createElement("video"), {
+        autoplay: true,
+        playsInline: true,
+        muted: true,
+        controls: true,
+      });
       const bar = document.createElement("div");
       bar.className = "bar";
       const name = Object.assign(document.createElement("span"), { className: "name", textContent: info.deviceId });
@@ -280,7 +352,7 @@ function renderTiles() {
     tile.chip.className = `chip ${info.state}`;
     tile.chip.textContent = info.state;
     const refusedHere = refused.get(info.deviceId) === info.generation && info.state === "live";
-    tile.note.textContent = refusedHere ? "viewer limit" : info.lastError ?? "";
+    tile.note.textContent = refusedHere ? "refused" : info.lastError ?? "";
   }
   attachTracks();
 }
@@ -291,4 +363,4 @@ form.addEventListener("submit", (event) => {
   join();
 });
 leaveButton.addEventListener("click", leave);
-addEventListener("pagehide", () => sendAction(ws, "leave"));
+addEventListener("pagehide", () => sendAction(socket, "leave"));

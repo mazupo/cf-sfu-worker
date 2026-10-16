@@ -8,6 +8,7 @@ async function publish(device: Awaited<ReturnType<typeof connect>>) {
   const { wakeId } = await device.next("wake");
   device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
   await device.next("answer");
+  device.send("ready", { wakeId });
   return wakeId as string;
 }
 
@@ -25,8 +26,8 @@ describe("rooms", () => {
 
     await publish(cam1);
     await publish(cam2);
-    await viewer.next("device");
-    await viewer.next("device");
+    await viewer.device("cam-1", "live");
+    await viewer.device("cam-2", "live");
 
     viewer.send("subscribe", {
       tracks: [
@@ -55,7 +56,7 @@ describe("rooms", () => {
     expect((await viewer.next("members")).devices).toEqual([expect.objectContaining({ deviceId: "cam-1" })]);
     // The room was already watching, so the new device is woken right away.
     await cam1.next("wake");
-    expect(await viewer.next("device")).toMatchObject({ deviceId: "cam-1", state: "waking" });
+    await viewer.device("cam-1", "waking");
 
     // The device restarts in a different room.
     cam1.close();
@@ -85,7 +86,7 @@ describe("rooms", () => {
     const viewer = await connect(await viewerToken("v1", "lab-a"));
     await viewer.next("joined");
     await publish(cam1);
-    await viewer.next("device");
+    await viewer.device("cam-1", "live");
 
     viewer.send("subscribe", {
       tracks: [
@@ -107,6 +108,54 @@ describe("rooms", () => {
     for (const socket of [viewer, cam1]) socket.close();
   });
 
+  test("a track the SFU cannot find yet is reported, and the other tracks still subscribe", async () => {
+    mockSfu({ missingTrack: "audio_track" });
+    const cam1 = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await cam1.next("joined");
+    const viewer = await connect(await viewerToken("v1", "lab-a"));
+    await viewer.next("joined");
+    await publish(cam1);
+    await viewer.device("cam-1", "live");
+
+    viewer.send("subscribe", {
+      tracks: [
+        { deviceId: "cam-1", trackName: "video_track" },
+        { deviceId: "cam-1", trackName: "audio_track" },
+      ],
+    });
+    expect(await viewer.next("error")).toMatchObject({
+      code: "not_found_track_error",
+      deviceId: "cam-1",
+      trackName: "audio_track",
+      retryable: true,
+    });
+    const offer = await viewer.next("offer");
+    expect(offer.tracks).toEqual([expect.objectContaining({ trackName: "video_track" })]);
+    viewer.send("answer", { sdp: "v=0 viewer-answer" });
+    expect((await viewer.next("subscribed")).tracks).toHaveLength(1);
+    for (const socket of [viewer, cam1]) socket.close();
+  });
+
+  test("a device is not live until it sends ready", async () => {
+    mockSfu();
+    const cam1 = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await cam1.next("joined");
+    const viewer = await connect(await viewerToken("v1", "lab-a"));
+    await viewer.next("joined");
+    const { wakeId } = await cam1.next("wake");
+    cam1.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    await cam1.next("answer");
+    await viewer.device("cam-1", "waking");
+
+    viewer.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
+    expect(await viewer.next("error")).toMatchObject({ code: "not_live", deviceId: "cam-1", retryable: true });
+    await viewer.next("subscribed");
+
+    cam1.send("ready", { wakeId });
+    await viewer.device("cam-1", "live");
+    for (const socket of [viewer, cam1]) socket.close();
+  });
+
   test("a subscribe while an offer is waiting is refused", async () => {
     mockSfu();
     const cam1 = await connect(await deviceToken("cam-1", ["lab-a"]));
@@ -114,7 +163,7 @@ describe("rooms", () => {
     const viewer = await connect(await viewerToken("v1", "lab-a"));
     await viewer.next("joined");
     await publish(cam1);
-    await viewer.next("device");
+    await viewer.device("cam-1", "live");
 
     viewer.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
     await viewer.next("offer");
@@ -130,7 +179,7 @@ describe("rooms", () => {
     const viewer = await connect(await viewerToken("v1", "lab-a"));
     await viewer.next("joined");
     await publish(cam1);
-    await viewer.next("device");
+    await viewer.device("cam-1", "live");
 
     cam1.close();
     const stub = env.DEVICES.getByName("cam-1");
@@ -142,7 +191,7 @@ describe("rooms", () => {
       state.storage.sql.exec("UPDATE device SET disconnected_at = ?", Date.now() - 60_000);
     });
     expect(await runDurableObjectAlarm(stub)).toBe(true);
-    expect(await viewer.next("device")).toMatchObject({ deviceId: "cam-1", state: "offline", tracks: [] });
+    expect(await viewer.device("cam-1", "offline")).toMatchObject({ tracks: [] });
     viewer.close();
   });
 });

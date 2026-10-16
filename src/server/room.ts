@@ -333,7 +333,13 @@ export class Room extends DurableObject<Env> {
       const count = this.subscriberCount(deviceId) + (subscribed ? 0 : 1);
       const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, count);
       if (!resolved.ok) {
-        sendError(ws, { code: resolved.code, message: resolved.message, action: "subscribe", deviceId });
+        sendError(ws, {
+          code: resolved.code,
+          message: resolved.message,
+          action: "subscribe",
+          deviceId,
+          retryable: resolved.code === "not_live",
+        });
         continue;
       }
       for (const trackName of names) {
@@ -378,8 +384,20 @@ export class Room extends DurableObject<Env> {
 
     const returned = result.tracks ?? [];
     wanted.forEach((track, index) => {
-      const mid = returned[index]?.mid;
-      if (!mid) return;
+      const item = returned[index];
+      if (item?.errorCode || !item?.mid) {
+        // Usually not_found_track_error: the device is connected but its media is not there yet.
+        sendError(ws, {
+          code: item?.errorCode ?? "track_failed",
+          message: item?.errorDescription ?? `Could not pull ${track.trackName} from ${track.deviceId}.`,
+          action: "subscribe",
+          deviceId: track.deviceId,
+          trackName: track.trackName,
+          retryable: true,
+        });
+        return;
+      }
+      const mid = item.mid;
       this.sql.exec(
         "INSERT OR REPLACE INTO subscriptions (viewer_id, mid, device_id, track_name, generation) VALUES (?, ?, ?, ?, ?)",
         viewerId,

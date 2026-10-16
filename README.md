@@ -9,7 +9,7 @@ Devices wait on a WebSocket and publish video only while someone watches.
 
 - Each device has one Durable Object (`Device`). Each room has one Durable Object (`Room`). Viewers live in their room's object.
 - A device connects and waits. Its Durable Object hibernates. The device sends `ping` every 15 seconds, and the runtime answers `pong` without waking the object.
-- When the first viewer joins a room, each device in the room gets `wake`. The device opens a PeerConnection and sends an `offer`. The worker publishes it to the SFU and sends back the `answer`.
+- When the first viewer joins a room, each device in the room gets `wake`. The device opens a PeerConnection and sends an `offer`. The worker publishes it to the SFU and sends back the `answer`. When the PeerConnection is connected, the device sends `ready`, and viewers can pull its tracks.
 - 30 seconds after the last viewer leaves, the device gets `sleep` and stops publishing.
 - The SFU secret stays in the Worker. Viewers never see a device's SFU session ID.
 
@@ -35,6 +35,8 @@ Then open two browser tabs:
 2. `http://localhost:8787/`: the viewer. Paste the viewer public key, use the same room, and click **Join**.
 
 The simulator starts publishing when the viewer joins, and stops 30 seconds after the viewer leaves.
+
+Keep the simulator tab visible. Browsers slow down timers in hidden tabs, so its `ping` can stop and the worker then marks it offline.
 
 ## Protocol
 
@@ -66,6 +68,7 @@ Messages are JSON: `{"action": "...", "message": {...}}`. `ping` and `pong` are 
 | Worker → device | `wake` | `wakeId` |
 | Device → worker | `offer` | `wakeId`, `sdp`, `tracks: [{ mid, trackName }]` |
 | Worker → device | `answer` | `wakeId`, `generation`, `sdp` |
+| Device → worker | `ready` | `wakeId`. Send it when the PeerConnection is connected. Viewers can subscribe only after it. |
 | Worker → device | `sleep` | `wakeId` |
 | Device → worker | `unpublished` | `wakeId` |
 | Worker → viewer | `joined` | `viewerId`, `room`, `resumed`, `iceServers`, `devices`, `subscriptions` |

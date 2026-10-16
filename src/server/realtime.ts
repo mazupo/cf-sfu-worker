@@ -69,14 +69,8 @@ export class RealtimeSfu {
       `/sessions/${encodeURIComponent(sessionId)}/tracks/new`,
       sessionDescription ? { sessionDescription, tracks } : { tracks },
     );
-    const failed = body.tracks?.find((track) => track.errorCode);
-    if (failed) {
-      throw new SfuError(
-        failed.errorCode ?? "sfu_track_error",
-        failed.errorDescription ?? `The SFU rejected track ${failed.trackName ?? failed.mid ?? ""}.`,
-        502,
-      );
-    }
+    // Per-track errors stay in the response. The other tracks may have succeeded, and the
+    // response can still carry an offer that has to be answered.
     return body;
   }
 

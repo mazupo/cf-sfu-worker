@@ -28,7 +28,10 @@ async function liveDevice(deviceId: string, room: string, viewerId: string) {
   device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
   const answer = await device.next("answer");
   expect(answer).toEqual({ wakeId, generation: 1, sdp: "v=0 publisher-answer" });
-  expect(await viewer.next("device")).toMatchObject({ deviceId, state: "live", generation: 1, tracks: ["video_track", "audio_track"] });
+  // Not live yet: the SFU has no media until the device's PeerConnection connects.
+  expect(await viewer.device(deviceId, "waking")).toMatchObject({ generation: 1, tracks: [] });
+  device.send("ready", { wakeId });
+  expect(await viewer.device(deviceId, "live")).toMatchObject({ generation: 1, tracks: ["video_track", "audio_track"] });
   return { calls, device, viewer, wakeId };
 }
 
@@ -159,7 +162,7 @@ describe("watching", () => {
     expect(await device.next("wake")).toEqual(first);
 
     await expireDeviceTimer("cam-1", "wake_deadline");
-    expect(await viewer.next("device")).toMatchObject({ deviceId: "cam-1", state: "sleeping", lastError: "wake_timeout" });
+    expect(await viewer.device("cam-1", "sleeping")).toMatchObject({ lastError: "wake_timeout" });
     viewer.close();
     device.close();
   });
@@ -179,7 +182,7 @@ describe("watching", () => {
     const restarted = await connect(await deviceToken("cam-1", ["lab-a"]));
     expect(await restarted.next("joined")).toMatchObject({ state: "waking", generation: 2 });
     await restarted.next("wake");
-    expect(await viewer.next("device")).toMatchObject({ deviceId: "cam-1", state: "waking", generation: 2 });
+    expect(await viewer.device("cam-1", "waking")).toMatchObject({ generation: 2 });
     await device.closed();
     restarted.close();
     viewer.close();

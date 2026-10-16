@@ -103,6 +103,9 @@ export const offerMessageSchema = z.object({
 
 export const unpublishedMessageSchema = z.object({ wakeId: wakeIdSchema });
 
+/** The device sends this when its PeerConnection is connected and media is flowing. */
+export const readyMessageSchema = z.object({ wakeId: wakeIdSchema });
+
 export const subscribeMessageSchema = z.object({
   tracks: z
     .array(z.object({ deviceId: idSchema, trackName: trackNameSchema }))
@@ -163,6 +166,9 @@ export type ErrorMessage = {
   action?: string;
   /** Set when the error concerns one device, e.g. viewer_limit or not_live. */
   deviceId?: string;
+  trackName?: string;
+  /** True when trying again later can work, e.g. the device is still connecting. */
+  retryable?: boolean;
 };
 
 export type RTCIceServerLike = {

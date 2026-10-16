@@ -21,7 +21,10 @@ const log = createLog(document.getElementById("log"));
 document.getElementById("worker-url").value = location.origin;
 persistForm(form, "cf-sfu-worker.device");
 
-let ws = null;
+/** The one socket this tab uses. Events from any older socket are ignored. */
+let socket = null;
+let connectSeq = 0;
+let reconnectTimer = null;
 let pc = null;
 let stream = null;
 let iceServers = [];
@@ -35,6 +38,10 @@ function setStatus(text) {
 }
 
 async function connect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  dropSocket();
+  const seq = ++connectSeq;
   const data = new FormData(form);
   stopped = false;
   connectButton.disabled = true;
@@ -48,27 +55,43 @@ async function connect() {
       can_subscribe: false,
       ...(pc && wakeId ? { wake_id: wakeId } : {}),
     });
-    ws = openSocket(url, token);
-    ws.addEventListener("message", (event) => handle(parseFrame(event.data)));
-    ws.addEventListener("close", onClose);
+    if (seq !== connectSeq || stopped) return; // a newer connect or a disconnect won
+    const ws = openSocket(url, token);
+    socket = ws;
+    ws.addEventListener("message", (event) => {
+      if (ws === socket) handle(parseFrame(event.data));
+    });
+    ws.addEventListener("close", (event) => {
+      if (ws === socket) onClose(event);
+    });
   } catch (error) {
+    if (seq !== connectSeq) return;
     log(`token: ${error.message}`);
     scheduleReconnect();
   }
 }
 
+function dropSocket() {
+  const old = socket;
+  socket = null;
+  old?.close(1000, "closed by the page");
+}
+
 function disconnect() {
   stopped = true;
-  ws?.close(1000, "disconnect");
-  ws = null;
+  connectSeq++;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  dropSocket();
   stopPublishing();
+  wakeId = null;
   connectButton.disabled = false;
   disconnectButton.disabled = true;
   setStatus("Disconnected.");
 }
 
 function onClose(event) {
-  ws = null;
+  socket = null;
   log(`socket closed ${event.code} ${event.reason}`);
   if (stopped) return;
   if (event.code === CLOSE_REPLACED) {
@@ -81,10 +104,11 @@ function onClose(event) {
 }
 
 function scheduleReconnect() {
-  if (stopped) return;
+  if (stopped || reconnectTimer) return;
   const delay = backoff(attempt++);
   setStatus(`Reconnecting in ${Math.round(delay / 1000)} s…`);
-  setTimeout(() => {
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
     if (!stopped) connect();
   }, delay);
 }
@@ -97,24 +121,34 @@ async function handle(frame) {
     case "joined":
       attempt = 0;
       iceServers = message.iceServers;
-      // The worker started a new publication, so drop the old one.
-      if (message.state === "sleeping" && pc) stopPublishing();
+      if (message.state === "sleeping" && pc) {
+        // The worker started over, so the old publication is gone.
+        stopPublishing();
+        wakeId = null;
+      } else if (pc?.connectionState === "connected") {
+        sendAction(socket, "ready", { wakeId });
+      }
       setStatus(`Connected as ${message.deviceId} in ${message.rooms.join(", ") || "no rooms"}. State: ${message.state}.`);
       break;
     case "wake":
-      if (pc && wakeId === message.wakeId) return; // already publishing for this wake
+      if (pc && wakeId === message.wakeId) {
+        // A repeated wake. Confirm again if connected, otherwise let the current attempt finish.
+        if (pc.connectionState === "connected") sendAction(socket, "ready", { wakeId });
+        else if (pc.connectionState === "failed") await startPublishing(message.wakeId);
+        return;
+      }
       await startPublishing(message.wakeId);
       break;
     case "answer":
       if (pc && message.wakeId === wakeId) {
         await pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
-        setStatus(`Publishing (generation ${message.generation}).`);
+        setStatus(`Answer received (generation ${message.generation}). Connecting…`);
       }
       break;
     case "sleep":
       if (message.wakeId === wakeId) {
         stopPublishing();
-        sendAction(ws, "unpublished", { wakeId: message.wakeId });
+        sendAction(socket, "unpublished", { wakeId: message.wakeId });
         wakeId = null;
         setStatus("Sleeping. Nobody is watching.");
       }
@@ -124,7 +158,7 @@ async function handle(frame) {
         // Publishing failed. Try again while the wake is still current.
         const current = wakeId;
         setTimeout(() => {
-          if (wakeId === current && ws) startPublishing(current);
+          if (wakeId === current && socket) startPublishing(current);
         }, 3000);
       }
       break;
@@ -135,21 +169,33 @@ async function startPublishing(id) {
   stopPublishing();
   wakeId = id;
   setStatus("Woken up. Starting the camera…");
-  stream = await openMedia(new FormData(form).get("source"));
+  const media = await openMedia(new FormData(form).get("source"));
+  if (wakeId !== id) {
+    for (const track of media.getTracks()) track.stop();
+    return; // a sleep arrived while the camera was starting
+  }
+  stream = media;
   preview.srcObject = stream;
-  pc = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
-  for (const track of stream.getTracks()) pc.addTransceiver(track, { direction: "sendonly" });
-  pc.addEventListener("connectionstatechange", () => {
-    log(`peer ${pc?.connectionState}`);
-    if (pc?.connectionState === "failed" && wakeId === id) startPublishing(id);
+  const peer = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
+  pc = peer;
+  for (const track of stream.getTracks()) peer.addTransceiver(track, { direction: "sendonly" });
+  peer.addEventListener("connectionstatechange", () => {
+    if (peer !== pc) return;
+    log(`peer ${peer.connectionState}`);
+    if (peer.connectionState === "connected") {
+      // Media is flowing, so viewers can pull it now.
+      sendAction(socket, "ready", { wakeId: id });
+      setStatus("Publishing.");
+    }
+    if (peer.connectionState === "failed" && wakeId === id) startPublishing(id);
   });
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  const tracks = pc.getTransceivers().map((transceiver) => ({
+  const offer = await peer.createOffer();
+  await peer.setLocalDescription(offer);
+  const tracks = peer.getTransceivers().map((transceiver) => ({
     mid: transceiver.mid,
     trackName: transceiver.sender.track?.kind === "audio" ? "audio_track" : "video_track",
   }));
-  sendAction(ws, "offer", { wakeId: id, sdp: offer.sdp, tracks });
+  sendAction(socket, "offer", { wakeId: id, sdp: offer.sdp, tracks });
 }
 
 function stopPublishing() {

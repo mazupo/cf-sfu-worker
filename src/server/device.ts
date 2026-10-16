@@ -4,6 +4,7 @@ import {
   CLOSE_HEARTBEAT_TIMEOUT,
   CLOSE_REPLACED,
   offerMessageSchema,
+  readyMessageSchema,
   unpublishedMessageSchema,
   type Claims,
   type DeviceInfo,
@@ -184,6 +185,9 @@ export class Device extends DurableObject<Env> {
       case "offer":
         await this.queue.run("publish", () => this.onOffer(ws, incoming.message));
         return;
+      case "ready":
+        await this.queue.run("publish", () => this.onReady(ws, incoming.message));
+        return;
       case "unpublished":
         await this.queue.run("publish", () => this.onUnpublished(ws, incoming.message));
         return;
@@ -231,6 +235,10 @@ export class Device extends DurableObject<Env> {
         tracks.map((track) => ({ location: "local" as const, mid: track.mid, trackName: track.trackName })),
         { type: "offer", sdp },
       );
+      const failed = result.tracks?.find((track) => track.errorCode);
+      if (failed) {
+        throw new SfuError(failed.errorCode!, failed.errorDescription ?? `The SFU rejected ${failed.trackName}.`, 502);
+      }
       if (result.sessionDescription?.type !== "answer") {
         throw new SfuError("sfu_answer_missing", "The SFU did not answer the offer.", 502);
       }
@@ -241,13 +249,14 @@ export class Device extends DurableObject<Env> {
         sendError(ws, { code: "wake_stale", message: "This wake is no longer current.", action: "offer" });
         return;
       }
+      // The device is live once it says its PeerConnection is connected ("ready"). Until then
+      // the SFU has no packets for these tracks, and viewers would get not_found_track_error.
       const now = Date.now();
-      row.state = "live";
+      row.state = "waking";
       row.generation += 1;
       row.sfu_session_id = sessionId;
       row.tracks = JSON.stringify(tracks.map((track) => track.trackName));
-      row.wake_deadline = null;
-      row.wake_attempts = 0;
+      row.wake_deadline = now + this.config.wakeTimeoutMs;
       row.last_error = null;
       row.last_seen = now;
       this.save(row);
@@ -262,6 +271,28 @@ export class Device extends DurableObject<Env> {
       console.log(JSON.stringify({ event: "publish_failed", deviceId: this.deviceId, code }));
       sendError(ws, { code, message: text, action: "offer" });
     }
+  }
+
+  private async onReady(ws: WebSocket, message: unknown): Promise<void> {
+    const parsed = readyMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      sendError(ws, { code: "message_invalid", message: "ready needs a wakeId.", action: "ready" });
+      return;
+    }
+    const row = this.row();
+    if (!row || row.wake_id !== parsed.data.wakeId || !row.sfu_session_id) {
+      sendError(ws, { code: "wake_stale", message: "Send ready after the answer for the current wake.", action: "ready" });
+      return;
+    }
+    if (row.state === "live") return;
+    const now = Date.now();
+    row.state = "live";
+    row.wake_deadline = null;
+    row.wake_attempts = 0;
+    row.last_error = null;
+    this.save(row);
+    await this.notifyRooms(now);
+    await this.scheduleAlarm(now);
   }
 
   private async onUnpublished(ws: WebSocket, message: unknown): Promise<void> {
