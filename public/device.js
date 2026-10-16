@@ -10,6 +10,7 @@ import {
   requestToken,
   sendAction,
 } from "./common.js";
+import { startDebugPanel } from "./debug.js";
 
 const form = document.getElementById("device-form");
 const connectButton = document.getElementById("connect");
@@ -253,3 +254,15 @@ form.addEventListener("submit", (event) => {
   connect();
 });
 disconnectButton.addEventListener("click", disconnect);
+
+startDebugPanel({
+  panel: document.getElementById("debug-panel"),
+  body: document.getElementById("debug-body"),
+  updated: document.getElementById("debug-updated"),
+  url: () => {
+    const data = new FormData(form);
+    if (!data.get("workerUrl") || !data.get("deviceId") || !data.get("deviceKey")) return null;
+    return new URL(`/cloudflare/debug/devices/${encodeURIComponent(data.get("deviceId"))}`, data.get("workerUrl")).toString();
+  },
+  key: () => new FormData(form).get("deviceKey"),
+});

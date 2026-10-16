@@ -36,7 +36,9 @@ Then open two browser tabs:
 
 The simulator starts publishing when the viewer joins, and stops 30 seconds after the viewer leaves.
 
-Keep the simulator tab visible. Browsers slow down timers in hidden tabs, so its `ping` can stop and the worker then marks it offline.
+Both pages ping from a Web Worker, so they stay online in a background tab.
+
+Open **Server state** on either page to see what the Durable Objects hold, refreshed every 2 seconds: each device's state, generation, socket and last ping, which rooms watch it, and each viewer's subscriptions. The debug routes behind it (`GET /cloudflare/debug/rooms/:roomId` and `GET /cloudflare/debug/devices/:deviceId`) answer only on `localhost`, or when the worker has `DEBUG_STATE=true`. They show SFU session IDs, so keep them off in production.
 
 ## Protocol
 
@@ -83,6 +85,8 @@ Messages are JSON: `{"action": "...", "message": {...}}`. `ping` and `pong` are 
 | Worker → both | `error` | `code`, `message`, `action`, `deviceId` |
 
 Close code `4000` means another connection used the same `device_id` or `viewer_id`. Do not reconnect after it.
+
+The `generation` counts a device's publications. It goes up by one with each new offer, so viewers know when their tracks belong to an old publication.
 
 A device that reconnects while it publishes sends its current `wake_id` in the token request, so the stream continues.
 A viewer that reconnects with the same `viewer_id` within 30 seconds keeps its subscriptions.

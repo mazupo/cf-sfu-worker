@@ -10,6 +10,7 @@ import {
   requestToken,
   sendAction,
 } from "./common.js";
+import { startDebugPanel } from "./debug.js";
 
 /** Errors that will not change for the same publication. Do not ask again. */
 const PERMANENT = new Set(["viewer_limit", "not_member", "track_not_found"]);
@@ -363,4 +364,16 @@ form.addEventListener("submit", (event) => {
   join();
 });
 leaveButton.addEventListener("click", leave);
+
+startDebugPanel({
+  panel: document.getElementById("debug-panel"),
+  body: document.getElementById("debug-body"),
+  updated: document.getElementById("debug-updated"),
+  url: () => {
+    const data = new FormData(form);
+    if (!data.get("workerUrl") || !data.get("room") || !data.get("viewerKey")) return null;
+    return new URL(`/cloudflare/debug/rooms/${encodeURIComponent(data.get("room"))}`, data.get("workerUrl")).toString();
+  },
+  key: () => new FormData(form).get("viewerKey"),
+});
 addEventListener("pagehide", () => sendAction(socket, "leave"));

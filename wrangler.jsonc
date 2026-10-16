@@ -32,7 +32,9 @@
     "VIEWER_RESUME_SECONDS": "30",
     "MAX_VIEWERS_PER_DEVICE": "10",
     "MAX_DEVICES_PER_ROOM": "16",
-    "MAX_ROOMS_PER_DEVICE": "4"
+    "MAX_ROOMS_PER_DEVICE": "4",
+    // "true" opens /cloudflare/debug/* on this host. It is always open on localhost.
+    "DEBUG_STATE": "false"
   },
   "observability": { "enabled": true },
   // Secrets (wrangler secret put): REALTIME_SFU_APP_ID, REALTIME_SFU_BEARER_TOKEN,
@@ -62,7 +64,8 @@
         "VIEWER_RESUME_SECONDS": "30",
         "MAX_VIEWERS_PER_DEVICE": "10",
         "MAX_DEVICES_PER_ROOM": "16",
-        "MAX_ROOMS_PER_DEVICE": "4"
+        "MAX_ROOMS_PER_DEVICE": "4",
+        "DEBUG_STATE": "false"
       }
     }
   }

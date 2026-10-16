@@ -5,6 +5,7 @@ import {
   SOCKET_PATH,
   TOKEN_PATH,
   deviceTokenRequestSchema,
+  idSchema,
   tokenRequestSchema,
   viewerTokenRequestSchema,
   type Grant,
@@ -121,6 +122,27 @@ app.get(SOCKET_PATH, async (c) => {
 
 app.get("/cloudflare/health", (c) => c.json({ service: "cf-sfu-worker", ok: true }));
 
+// Debug views of the Durable Objects for the demo pages. They show SFU session IDs, so they
+// answer only on localhost, or when DEBUG_STATE is "true", and only with a public key.
+app.get("/cloudflare/debug/rooms/:roomId", async (c) => {
+  const denied = await debugDenied(c);
+  if (denied) return denied;
+  const roomId = idSchema.safeParse(c.req.param("roomId"));
+  if (!roomId.success) return error(c, 400, "id_invalid", "The room ID is not valid.");
+  const room = await c.env.ROOMS.getByName(roomId.data).debugState();
+  const devices = await Promise.all(room.members.map((member) => c.env.DEVICES.getByName(member.device_id).debugState()));
+  return c.json({ room, devices }, 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/cloudflare/debug/devices/:deviceId", async (c) => {
+  const denied = await debugDenied(c);
+  if (denied) return denied;
+  const deviceId = idSchema.safeParse(c.req.param("deviceId"));
+  if (!deviceId.success) return error(c, 400, "id_invalid", "The device ID is not valid.");
+  const device = await c.env.DEVICES.getByName(deviceId.data).debugState();
+  return c.json({ device }, 200, { "Cache-Control": "no-store" });
+});
+
 app.all("/cloudflare/*", (c) => error(c, 404, "route_not_found", "Unknown path."));
 
 app.onError((err, c) => {
@@ -132,6 +154,26 @@ export default app;
 
 function error(c: Context<App>, status: 400 | 401 | 404 | 413 | 426 | 429 | 500 | 503, code: string, message: string) {
   return c.json({ error: { code, message } }, status);
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+async function debugDenied(c: Context<App>): Promise<Response | null> {
+  const enabled = String(c.env.DEBUG_STATE) === "true" || LOOPBACK_HOSTS.has(new URL(c.req.url).hostname);
+  if (!enabled) return error(c, 404, "route_not_found", "Unknown path.");
+  const bearer = /^Bearer\s+(\S+)$/i.exec(c.req.header("Authorization") ?? "")?.[1];
+  let role: Awaited<ReturnType<typeof roleForPublicKey>> = null;
+  try {
+    role = bearer ? await roleForPublicKey(c.env, bearer) : null;
+  } catch (err) {
+    // A private key is missing, as for the token API.
+    if (err instanceof TokenError) return error(c, 503, err.code, err.message);
+    throw err;
+  }
+  if (!role) {
+    return error(c, 401, "key_required", "Send Authorization: Bearer <device or viewer public key>.");
+  }
+  return null;
 }
 
 /** Which field of a token request is wrong, for the role the body asks for. */

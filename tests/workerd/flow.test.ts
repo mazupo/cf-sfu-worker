@@ -177,12 +177,31 @@ describe("watching", () => {
     viewer.close();
   });
 
+  test("the generation goes up once per publication, not on sleep", async () => {
+    const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
+    viewer.send("leave");
+    await viewer.closed();
+    await expireDeviceTimer("cam-1", "linger_until");
+    const { wakeId: oldWake } = await device.next("sleep");
+    device.send("unpublished", { wakeId: oldWake });
+
+    const again = await connect(await viewerToken("v2", "lab-a"));
+    await again.next("joined");
+    const { wakeId } = await device.next("wake");
+    device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    expect(await device.next("answer")).toMatchObject({ generation: 2 });
+    again.close();
+    device.close();
+  });
+
   test("a restarted device without a wake_id starts a new publication", async () => {
     const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
     const restarted = await connect(await deviceToken("cam-1", ["lab-a"]));
-    expect(await restarted.next("joined")).toMatchObject({ state: "waking", generation: 2 });
-    await restarted.next("wake");
-    expect(await viewer.device("cam-1", "waking")).toMatchObject({ generation: 2 });
+    expect(await restarted.next("joined")).toMatchObject({ state: "waking", generation: 1 });
+    const { wakeId } = await restarted.next("wake");
+    expect(await viewer.device("cam-1", "waking")).toMatchObject({ generation: 1, tracks: [] });
+    restarted.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    expect(await restarted.next("answer")).toMatchObject({ generation: 2 });
     await device.closed();
     restarted.close();
     viewer.close();

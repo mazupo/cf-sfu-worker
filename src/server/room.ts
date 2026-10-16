@@ -539,6 +539,39 @@ export class Room extends DurableObject<Env> {
   // Helpers
   // -------------------------------------------------------------------------
 
+  /** Everything this object holds, for the local debug page. Includes SFU session IDs. */
+  async debugState() {
+    const now = Date.now();
+    if (!this.ready) {
+      return { roomId: this.roomId, now, members: [], devices: [], viewers: [], alarm: null };
+    }
+    const viewers = this.sql.exec<ViewerRow>("SELECT * FROM viewers ORDER BY created_at").toArray();
+    return {
+      roomId: this.roomId,
+      now,
+      members: this.sql.exec<{ device_id: string; joined_at: number }>("SELECT * FROM members ORDER BY device_id").toArray(),
+      devices: this.sql
+        .exec<{ device_id: string; info: string; lease_renewed_at: number }>("SELECT * FROM devices ORDER BY device_id")
+        .toArray()
+        .map((row) => ({ deviceId: row.device_id, info: JSON.parse(row.info) as DeviceInfo, leaseRenewedAt: row.lease_renewed_at })),
+      viewers: viewers.map((viewer) => ({
+        viewerId: viewer.viewer_id,
+        sfuSessionId: viewer.sfu_session_id,
+        negotiating: Boolean(viewer.negotiating),
+        pendingOfferBytes: viewer.pending_offer?.length ?? 0,
+        createdAt: viewer.created_at,
+        socketClosedAt: viewer.socket_closed_at,
+        sockets: this.ctx.getWebSockets(viewer.viewer_id).map((ws) => ({
+          readyState: ws.readyState,
+          connectedAt: (ws.deserializeAttachment() as ViewerAttachment | null)?.connectedAt ?? null,
+          lastPing: this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? null,
+        })),
+        subscriptions: this.subscriptions(viewer.viewer_id),
+      })),
+      alarm: await this.ctx.storage.getAlarm(),
+    };
+  }
+
   private viewer(viewerId: string): ViewerRow | null {
     return this.sql.exec<ViewerRow>("SELECT * FROM viewers WHERE viewer_id = ?", viewerId).toArray()[0] ?? null;
   }

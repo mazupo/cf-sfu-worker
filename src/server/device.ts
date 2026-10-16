@@ -391,6 +391,30 @@ export class Device extends DurableObject<Env> {
     return this.info(Date.now());
   }
 
+  /** Everything this object holds, for the local debug page. Includes the SFU session ID. */
+  async debugState() {
+    const now = Date.now();
+    const row = this.row();
+    return {
+      deviceId: this.deviceId,
+      now,
+      info: this.info(now),
+      online: this.isOnline(now),
+      row: row ? { ...row, tracks: JSON.parse(row.tracks) as string[], rooms: this.rooms(row) } : null,
+      watchingRooms: this.ready
+        ? this.sql
+            .exec<{ room_id: string; subscribers: number; expires_at: number }>("SELECT * FROM watching_rooms ORDER BY room_id")
+            .toArray()
+        : [],
+      sockets: this.ctx.getWebSockets().map((ws) => ({
+        readyState: ws.readyState,
+        connectedAt: (ws.deserializeAttachment() as SocketAttachment | null)?.connectedAt ?? null,
+        lastPing: this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? null,
+      })),
+      alarm: await this.ctx.storage.getAlarm(),
+    };
+  }
+
   // -------------------------------------------------------------------------
   // Alarm
   // -------------------------------------------------------------------------
@@ -589,9 +613,11 @@ export class Device extends DurableObject<Env> {
     this.save(row);
   }
 
-  /** Forgets the current publication. Viewers resubscribe when the generation changes. */
+  /**
+   * Forgets the current publication. The generation stays: it counts publications and goes up
+   * only with the next offer. Viewers drop their tracks because the state is no longer live.
+   */
   private resetPublication(row: DeviceRow): void {
-    if (row.state === "live") row.generation += 1;
     row.state = "sleeping";
     row.wake_id = null;
     row.wake_deadline = null;
