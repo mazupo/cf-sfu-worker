@@ -99,6 +99,12 @@ export class Device extends DurableObject<Env> {
     // Devices send "ping" every 15 s. The runtime answers without waking this object.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ready = tableExists(ctx.storage.sql, "device");
+    // A deploy drops the socket without a close event. Hibernation keeps it, so no socket here
+    // means it is gone: count the device as disconnected from now, so it has the usual grace
+    // time to reconnect before viewers see it offline.
+    if (this.ready && ctx.getWebSockets().length === 0) {
+      ctx.storage.sql.exec("UPDATE device SET disconnected_at = ? WHERE disconnected_at IS NULL", Date.now());
+    }
   }
 
   private get deviceId(): string {
@@ -157,9 +163,7 @@ export class Device extends DurableObject<Env> {
     row.offline_notified = 0;
     this.save(row);
 
-    if (this.hasWatchers(now) && row.state === "sleeping") this.startWake(server, now);
-    row = this.row()!;
-
+    // `joined` comes first: the device needs its ICE servers before a wake.
     send(server, {
       action: "joined",
       message: {
@@ -171,6 +175,7 @@ export class Device extends DurableObject<Env> {
       },
     });
     for (const error of roomErrors) sendError(server, error);
+    if (this.hasWatchers(now) && row.state === "sleeping") this.startWake(server, now);
 
     void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
@@ -440,7 +445,8 @@ export class Device extends DurableObject<Env> {
       // Half-open connection: the socket exists but pings stopped.
       console.log(JSON.stringify({ event: "device_stale", deviceId: this.deviceId, silentMs: now - this.lastSeen(ws) }));
       closeSocket(ws, CLOSE_HEARTBEAT_TIMEOUT, "No ping received.");
-      row.disconnected_at ??= now;
+      // The device has been silent since its last ping, so the grace time is already over.
+      row.disconnected_at ??= this.lastSeen(ws);
     }
 
     const online = this.isOnline(now);
@@ -712,7 +718,13 @@ export class Device extends DurableObject<Env> {
     const candidates: number[] = [];
     if (row.wake_deadline !== null) candidates.push(row.wake_deadline);
     if (row.linger_until !== null) candidates.push(row.linger_until);
-    if (this.hasWatchers(now)) candidates.push(now + PRESENCE_CHECK_MS);
+    if (this.hasWatchers(now)) {
+      // Check again when the last ping turns stale, so a silent device shows offline about
+      // DEVICE_STALE_SECONDS after its last ping instead of up to a full check interval later.
+      const ws = this.socket();
+      const stale = ws ? this.lastSeen(ws) + this.config.deviceStaleMs + 1000 : Infinity;
+      candidates.push(Math.min(now + PRESENCE_CHECK_MS, stale));
+    }
     const lease = this.sql
       .exec<{ next: number | null }>("SELECT MIN(expires_at) AS next FROM watching_rooms")
       .one().next;

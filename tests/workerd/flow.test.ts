@@ -226,8 +226,11 @@ describe("watching", () => {
   test("a restarted device without a wake_id starts a new publication", async () => {
     const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
     const restarted = await connect(await deviceToken("cam-1", ["lab-a"]));
-    expect(await restarted.next("joined")).toMatchObject({ state: "waking", generation: 1 });
     const { wakeId } = await restarted.next("wake");
+    // The old publication is over. `joined` came before the new wake, so the device has its
+    // ICE servers when it builds the PeerConnection.
+    expect(restarted.messages[0]?.action).toBe("joined");
+    expect(await restarted.next("joined")).toMatchObject({ state: "sleeping", generation: 1 });
     expect(await viewer.device("cam-1", "waking")).toMatchObject({ generation: 1, tracks: [] });
     restarted.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
     expect(await restarted.next("answer")).toMatchObject({ generation: 2 });

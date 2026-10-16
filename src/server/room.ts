@@ -88,6 +88,11 @@ export class Room extends DurableObject<Env> {
     this.config = settings(env);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ready = tableExists(ctx.storage.sql, "members");
+    // A deploy drops every socket without a close event. Hibernation keeps them, so no sockets
+    // here means they are gone: count the viewers as disconnected from now, so they can resume.
+    if (this.ready && ctx.getWebSockets().length === 0) {
+      ctx.storage.sql.exec("UPDATE viewers SET socket_closed_at = ? WHERE socket_closed_at IS NULL", Date.now());
+    }
   }
 
   private ensureSchema(): void {
@@ -697,6 +702,10 @@ export class Room extends DurableObject<Env> {
       .one().next;
     const candidates = [now + PRESENCE_CHECK_MS];
     if (closed !== null) candidates.push(closed + this.config.viewerResumeMs);
+    // Check again when a viewer's last ping turns stale.
+    for (const ws of this.ctx.getWebSockets()) {
+      if (ws.readyState === WebSocket.OPEN) candidates.push(this.lastSeen(ws) + this.config.viewerStaleMs + 1000);
+    }
     await this.ctx.storage.setAlarm(Math.max(Math.min(...candidates), now + 1000));
   }
 

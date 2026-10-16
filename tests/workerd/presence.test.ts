@@ -43,14 +43,22 @@ describe("presence", () => {
     const stub = env.DEVICES.getByName("cam-1");
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect((await device.closed()).code).toBe(4001);
-
-    // After the grace period, the room hears that the device is offline.
-    await runInDurableObject(stub, (_instance, state) => {
-      state.storage.sql.exec("UPDATE device SET disconnected_at = ?", Date.now() - 60_000);
-    });
-    await runDurableObjectAlarm(stub);
+    // The grace time counts from the last ping, so the room hears it in the same check.
     expect(await viewer.device("cam-1", "offline")).toMatchObject({ tracks: [] });
     viewer.close();
+  });
+
+  test("while watched, the heartbeat is checked when the last ping turns stale", async () => {
+    const { device, viewer } = await liveDevice("cam-1", "lab-a");
+    const { alarm, lastSeen } = await runInDurableObject(env.DEVICES.getByName("cam-1"), async (_instance, state) => {
+      const ws = state.getWebSockets()[0]!;
+      const pong = state.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0;
+      const { connectedAt } = ws.deserializeAttachment() as { connectedAt: number };
+      return { alarm: await state.storage.getAlarm(), lastSeen: Math.max(pong, connectedAt) };
+    });
+    // DEVICE_STALE_SECONDS is 45 in the test config.
+    expect(alarm).toBe(lastSeen + 46_000);
+    for (const socket of [viewer, device]) socket.close();
   });
 
   test("a room renewing its watch tells viewers when a device changed", async () => {
