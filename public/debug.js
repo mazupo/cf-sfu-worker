@@ -14,6 +14,8 @@ const SOCKET_STATES = ["connecting", "open", "closing", "closed"];
 export function startDebugPanel({ panel, body, updated, url, key, intervalMs = 2000 }) {
   let timer = null;
   let running = false;
+  // The body is rebuilt on every refresh, so remember what the user opened and scrolled.
+  const raw = { open: false, scrollTop: 0 };
 
   async function refresh() {
     if (!panel.open || running) return;
@@ -30,8 +32,14 @@ export function startDebugPanel({ panel, body, updated, url, key, intervalMs = 2
         body.replaceChildren(note("The debug view is off on this host. Run locally, or set DEBUG_STATE=true on the worker."));
       } else if (!response.ok) {
         body.replaceChildren(note(json.error?.message ?? `Request failed (${response.status}).`));
+      } else if (selecting(body)) {
+        // Rebuilding would drop the selection, so wait until the user has copied it.
+        updated.textContent = "paused while text is selected";
       } else {
-        body.replaceChildren(...render(json));
+        raw.scrollTop = body.querySelector("details.raw pre")?.scrollTop ?? raw.scrollTop;
+        body.replaceChildren(...render(json, raw));
+        const pre = body.querySelector("details.raw pre");
+        if (pre) pre.scrollTop = raw.scrollTop;
         updated.textContent = `updated ${new Date().toLocaleTimeString()}`;
       }
     } catch (error) {
@@ -51,7 +59,12 @@ export function startDebugPanel({ panel, body, updated, url, key, intervalMs = 2
   return refresh;
 }
 
-function render(json) {
+function selecting(element) {
+  const selection = getSelection();
+  return selection !== null && !selection.isCollapsed && element.contains(selection.anchorNode);
+}
+
+function render(json, raw) {
   const parts = [];
   if (json.room) {
     const room = json.room;
@@ -66,10 +79,11 @@ function render(json) {
     parts.push(heading(`Device ${json.device.deviceId}`));
     parts.push(deviceTable([json.device]));
   }
-  const raw = document.createElement("details");
-  raw.append(Object.assign(document.createElement("summary"), { textContent: "Raw JSON" }));
-  raw.append(Object.assign(document.createElement("pre"), { className: "log", textContent: JSON.stringify(json, null, 2) }));
-  parts.push(raw);
+  const details = Object.assign(document.createElement("details"), { className: "raw", open: raw.open });
+  details.addEventListener("toggle", () => (raw.open = details.open));
+  details.append(Object.assign(document.createElement("summary"), { textContent: "Raw JSON" }));
+  details.append(Object.assign(document.createElement("pre"), { className: "log", textContent: JSON.stringify(json, null, 2) }));
+  parts.push(details);
   return parts;
 }
 

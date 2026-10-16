@@ -46,12 +46,14 @@
     <section class="panel preview">
       <video id="preview" autoplay playsinline muted></video>
     </section>
-    <section class="panel">
-      <pre class="log" id="log"></pre>
-    </section>
     <details class="panel debug" id="debug-panel">
       <summary>Server state <span class="status" id="debug-updated"></span></summary>
       <div id="debug-body"></div>
+    </details>
+
+    <details class="panel">
+      <summary>Log</summary>
+      <pre class="log" id="log"></pre>
     </details>
   </main>
   <script type="module" src="./device.js"></script>
