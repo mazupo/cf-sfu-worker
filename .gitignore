@@ -1,6 +1,10 @@
 node_modules/
 .wrangler/
 dist/
+# Built from demo/ by npm run build:demo
+public/js/
+# Generated from external/protocol by npm run proto
+src/proto/
 .dev.vars
 .dev.vars.*
 !.dev.vars.example

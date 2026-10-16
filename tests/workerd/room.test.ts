@@ -2,14 +2,21 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
-import { PUBLISH_TRACKS, connect, deviceToken, mockSfu, publisherSessions, viewerToken } from "./helpers";
+import { ErrorCode } from "../../src/proto/cloudflare";
+import {
+  connect,
+  deviceToken,
+  mockSfu,
+  PUBLISH_TRACKS,
+  publisherSessions,
+  viewerToken,
+} from "./helpers";
 
 async function publish(device: Awaited<ReturnType<typeof connect>>) {
-  const { wakeId } = await device.next("wake");
-  device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+  await device.next("wake");
+  device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
   await device.next("answer");
-  device.send("ready", { wakeId });
-  return wakeId as string;
+  device.send("ready", {});
 }
 
 describe("rooms", () => {
@@ -76,7 +83,7 @@ describe("rooms", () => {
     }
     const fourth = await connect(await deviceToken("cam-4", ["lab-a", "lab-b"]));
     expect((await fourth.next("joined")).rooms).toEqual(["lab-b"]);
-    expect(await fourth.next("error")).toMatchObject({ code: "room_full" });
+    expect(await fourth.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_ROOM_FULL });
     for (const socket of [...sockets, fourth]) socket.close();
   });
 
@@ -125,7 +132,8 @@ describe("rooms", () => {
       ],
     });
     expect(await viewer.next("error")).toMatchObject({
-      code: "not_found_track_error",
+      code: ErrorCode.ERROR_CODE_TRACK_NOT_READY,
+      message: expect.stringContaining("not_found_track_error"),
       deviceId: "cam-1",
       trackName: "audio_track",
       retryable: true,
@@ -143,16 +151,16 @@ describe("rooms", () => {
     await cam1.next("joined");
     const viewer = await connect(await viewerToken("v1", "lab-a"));
     await viewer.next("joined");
-    const { wakeId } = await cam1.next("wake");
-    cam1.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    await cam1.next("wake");
+    cam1.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
     await cam1.next("answer");
     await viewer.device("cam-1", "waking");
 
     viewer.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
-    expect(await viewer.next("error")).toMatchObject({ code: "not_live", deviceId: "cam-1", retryable: true });
+    expect(await viewer.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_NOT_LIVE, deviceId: "cam-1", retryable: true });
     await viewer.next("subscribed");
 
-    cam1.send("ready", { wakeId });
+    cam1.send("ready", {});
     await viewer.device("cam-1", "live");
     for (const socket of [viewer, cam1]) socket.close();
   });
@@ -169,7 +177,7 @@ describe("rooms", () => {
     viewer.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
     await viewer.next("offer");
     viewer.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "audio_track" }] });
-    expect(await viewer.next("error")).toMatchObject({ code: "busy", action: "subscribe" });
+    expect(await viewer.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_BUSY, request: "subscribe" });
     for (const socket of [viewer, cam1]) socket.close();
   });
 

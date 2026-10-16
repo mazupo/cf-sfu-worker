@@ -1,13 +1,10 @@
 import { z } from "zod";
 
+import { DeviceState, ErrorCode, type DeviceInfo } from "../proto/cloudflare";
+
 /** Paths. The Worker only runs for /cloudflare/*; everything else is a static demo page. */
 export const TOKEN_PATH = "/cloudflare/token";
 export const SOCKET_PATH = "/cloudflare/rtc";
-
-/** Close codes sent by the Durable Objects. Clients must not reconnect after REPLACED. */
-export const CLOSE_REPLACED = 4000;
-export const CLOSE_HEARTBEAT_TIMEOUT = 4001;
-export const CLOSE_LEFT = 1000;
 
 /**
  * Device IDs and room IDs are locators, never credentials. They name Durable Objects and appear in
@@ -27,19 +24,21 @@ export const viewerIdSchema = z
     'use 1 to 64 letters, digits, spaces, ".", "_" or "-", with no space at either end',
   );
 export const trackNameSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
-export const wakeIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
+/** The generation of the device's last answer. Sent again on a reconnect, it keeps the stream. */
+const generationSchema = z.number().int().min(1);
 
 const sdpSchema = z.string().min(1).max(64_000);
+const midSchema = z.string().min(1).max(32);
 
 // ---------------------------------------------------------------------------
-// Token API
+// Token API (JSON over HTTP)
 // ---------------------------------------------------------------------------
 
 export const deviceTokenRequestSchema = z.object({
   device_id: idSchema,
   room_ids: z.array(idSchema).min(1),
   can_subscribe: z.literal(false),
-  wake_id: wakeIdSchema.optional(),
+  generation: generationSchema.optional(),
 });
 
 export const viewerTokenRequestSchema = z.object({
@@ -62,7 +61,7 @@ export const grantSchema = z.object({
   rooms: z.array(idSchema).min(1),
   canPublish: z.boolean(),
   canSubscribe: z.boolean(),
-  wakeId: wakeIdSchema.optional(),
+  generation: generationSchema.optional(),
 });
 export type Grant = z.infer<typeof grantSchema>;
 
@@ -79,100 +78,34 @@ export type Claims = z.infer<typeof claimsSchema>;
 export type Role = "device" | "viewer";
 
 // ---------------------------------------------------------------------------
-// Socket messages: {"action": "...", "message": {...}}. "ping" and "pong" are plain text.
+// Socket messages. The types come from cloudflare.proto in mazupo/protocol; these schemas add
+// the rules protobuf cannot express, and run on the decoded messages.
 // ---------------------------------------------------------------------------
 
-export type DeviceState = "offline" | "sleeping" | "waking" | "live";
-
-export type DeviceInfo = {
-  deviceId: string;
-  state: DeviceState;
-  generation: number;
-  tracks: string[];
-  lastError: string | null;
-};
-
-export const offerMessageSchema = z.object({
-  wakeId: wakeIdSchema,
+export const publishOfferSchema = z.object({
   sdp: sdpSchema,
-  tracks: z
-    .array(z.object({ mid: z.string().min(1).max(32), trackName: trackNameSchema }))
-    .min(1)
-    .max(16),
+  tracks: z.array(z.object({ mid: midSchema, trackName: trackNameSchema })).min(1).max(16),
 });
 
-export const unpublishedMessageSchema = z.object({ wakeId: wakeIdSchema });
-
-/** The device sends this when its PeerConnection is connected and media is flowing. */
-export const readyMessageSchema = z.object({ wakeId: wakeIdSchema });
-
-export const subscribeMessageSchema = z.object({
-  tracks: z
-    .array(z.object({ deviceId: idSchema, trackName: trackNameSchema }))
-    .min(1)
-    .max(64),
+export const subscribeSchema = z.object({
+  tracks: z.array(z.object({ deviceId: idSchema, trackName: trackNameSchema })).min(1).max(64),
 });
 
-export const answerMessageSchema = z.object({ sdp: sdpSchema });
+export const subscribeAnswerSchema = z.object({ sdp: sdpSchema });
 
-export const unsubscribeMessageSchema = z.object({
-  mids: z.array(z.string().min(1).max(32)).min(1).max(64),
-});
+export const unsubscribeSchema = z.object({ mids: z.array(midSchema).min(1).max(64) });
 
-export const incomingSchema = z.object({
-  action: z.string().min(1).max(32),
-  message: z.unknown().optional(),
-});
+/** DEVICE_STATE_LIVE → "live", for logs and the debug view. */
+export function stateName(state: DeviceState): string {
+  return (DeviceState[state] ?? "unknown").replace("DEVICE_STATE_", "").toLowerCase();
+}
 
-export type Subscription = {
-  deviceId: string;
-  trackName: string;
-  mid: string;
-  generation: number;
-};
+/** ERROR_CODE_WAKE_TIMEOUT → "wake_timeout", for logs and the debug view. */
+export function errorName(code: ErrorCode): string {
+  return (ErrorCode[code] ?? "unknown").replace("ERROR_CODE_", "").toLowerCase();
+}
 
-/** Messages the Durable Objects send. */
-export type OutgoingMessage =
-  | { action: "joined"; message: DeviceJoined | ViewerJoined }
-  | { action: "wake"; message: { wakeId: string } }
-  | { action: "sleep"; message: { wakeId: string } }
-  | { action: "answer"; message: { wakeId: string; generation: number; sdp: string } }
-  | { action: "device"; message: DeviceInfo }
-  | { action: "members"; message: { devices: DeviceInfo[] } }
-  | { action: "offer"; message: { sdp: string; tracks: Subscription[]; sessionReset: boolean } }
-  | { action: "subscribed"; message: { tracks: Subscription[] } }
-  | { action: "error"; message: ErrorMessage };
-
-export type DeviceJoined = {
-  deviceId: string;
-  state: DeviceState;
-  generation: number;
-  rooms: string[];
-  iceServers: RTCIceServerLike[];
-};
-
-export type ViewerJoined = {
-  viewerId: string;
-  room: string;
-  resumed: boolean;
-  iceServers: RTCIceServerLike[];
-  devices: DeviceInfo[];
-  subscriptions: Subscription[];
-};
-
-export type ErrorMessage = {
-  code: string;
-  message: string;
-  action?: string;
-  /** Set when the error concerns one device, e.g. viewer_limit or not_live. */
-  deviceId?: string;
-  trackName?: string;
-  /** True when trying again later can work, e.g. the device is still connecting. */
-  retryable?: boolean;
-};
-
-export type RTCIceServerLike = {
-  urls: string | string[];
-  username?: string;
-  credential?: string;
-};
+/** DeviceInfo with names instead of numbers, for the debug view. */
+export function debugInfo(info: DeviceInfo) {
+  return { ...info, state: stateName(info.state), lastError: info.lastError ? errorName(info.lastError) : null };
+}

@@ -1,15 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 
 import {
-  CLOSE_HEARTBEAT_TIMEOUT,
-  CLOSE_REPLACED,
-  offerMessageSchema,
-  readyMessageSchema,
-  unpublishedMessageSchema,
-  type Claims,
+  CloseCode,
+  DeviceRequest,
+  DeviceState,
+  ErrorCode,
   type DeviceInfo,
-  type DeviceState,
-} from "../shared/protocol";
+  type PublishOffer,
+  type SignalError,
+} from "../proto/cloudflare";
+import { debugInfo, errorName, publishOfferSchema, stateName, type Claims } from "../shared/protocol";
 import {
   DEVICE_RETENTION_MS,
   DISCONNECT_GRACE_MS,
@@ -21,22 +21,33 @@ import {
 } from "./config";
 import { iceServers, RealtimeSfu, SfuError } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
-import { KeyedQueue, closeSocket, parseIncoming, send, sendError, upgradeRequired } from "./socket";
+import {
+  KeyedQueue,
+  closeSocket,
+  decodeFrame,
+  requestName,
+  sendDevice,
+  signalError,
+  upgradeRequired,
+} from "./socket";
 
-/** The publishing state that survives hibernation. `offline` is computed from the socket. */
-type PublishState = Exclude<DeviceState, "offline">;
+const SLEEPING = DeviceState.DEVICE_STATE_SLEEPING;
+const WAKING = DeviceState.DEVICE_STATE_WAKING;
+const LIVE = DeviceState.DEVICE_STATE_LIVE;
+
+/** The publishing state that survives hibernation. Offline is computed from the socket. */
+type PublishState = typeof SLEEPING | typeof WAKING | typeof LIVE;
 
 type DeviceRow = {
   state: PublishState;
   generation: number;
-  wake_id: string | null;
   wake_deadline: number | null;
   wake_attempts: number;
   sfu_session_id: string | null;
   tracks: string;
   rooms: string;
   linger_until: number | null;
-  last_error: string | null;
+  last_error: ErrorCode;
   last_seen: number;
   disconnected_at: number | null;
   offline_notified: number;
@@ -48,21 +59,20 @@ export type WatchResult = { member: boolean; info: DeviceInfo };
 
 export type ResolveResult =
   | { ok: true; sessionId: string; generation: number; tracks: string[] }
-  | { ok: false; code: string; message: string };
+  | { ok: false; code: ErrorCode; message: string };
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS device (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    state TEXT NOT NULL,
+    state INTEGER NOT NULL,
     generation INTEGER NOT NULL,
-    wake_id TEXT,
     wake_deadline INTEGER,
     wake_attempts INTEGER NOT NULL,
     sfu_session_id TEXT,
     tracks TEXT NOT NULL,
     rooms TEXT NOT NULL,
     linger_until INTEGER,
-    last_error TEXT,
+    last_error INTEGER NOT NULL,
     last_seen INTEGER NOT NULL,
     disconnected_at INTEGER,
     offline_notified INTEGER NOT NULL
@@ -91,7 +101,7 @@ export class Device extends DurableObject<Env> {
   /** Tables exist from the first connection until the device is forgotten. */
   private ready: boolean;
   /** The SFU session started together with `wake`, so the offer needs one SFU call instead of two. */
-  private earlySession: { wakeId: string; sessionId: Promise<string | null> } | null = null;
+  private earlySession: Promise<string | null> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -138,10 +148,10 @@ export class Device extends DurableObject<Env> {
 
     let row = this.row() ?? this.createRow(now);
 
-    // A newer connection always wins. The old client stops reconnecting when it gets CLOSE_REPLACED.
+    // A newer connection always wins. The old client stops reconnecting when it gets REPLACED.
     for (const old of this.ctx.getWebSockets()) {
       console.log(JSON.stringify({ event: "device_replaced", deviceId: this.deviceId }));
-      closeSocket(old, CLOSE_REPLACED, "Another connection uses the same device_id.");
+      closeSocket(old, CloseCode.CLOSE_CODE_REPLACED, "Another connection uses the same device_id.");
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
@@ -151,12 +161,13 @@ export class Device extends DurableObject<Env> {
     const roomErrors = await this.updateRooms(row, claims, now);
     row = this.row()!;
 
-    // Keep the publication only when this is the same publisher reconnecting its socket.
+    // Keep the publication only when the same publisher reconnects its socket: it sends the
+    // generation of the answer its PeerConnection uses.
     const continuing =
-      (row.state === "waking" || row.state === "live") &&
-      claims.grant.wakeId !== undefined &&
-      claims.grant.wakeId === row.wake_id;
-    if (!continuing && row.state !== "sleeping") this.resetPublication(row);
+      (row.state === WAKING || row.state === LIVE) &&
+      row.sfu_session_id !== null &&
+      claims.grant.generation === row.generation;
+    if (!continuing && row.state !== SLEEPING) this.resetPublication(row);
 
     row.last_seen = now;
     row.disconnected_at = null;
@@ -164,9 +175,8 @@ export class Device extends DurableObject<Env> {
     this.save(row);
 
     // `joined` comes first: the device needs its ICE servers before a wake.
-    send(server, {
-      action: "joined",
-      message: {
+    sendDevice(server, {
+      joined: {
         deviceId: this.deviceId,
         state: row.state,
         generation: row.generation,
@@ -174,8 +184,8 @@ export class Device extends DurableObject<Env> {
         iceServers: await iceServers(this.env),
       },
     });
-    for (const error of roomErrors) sendError(server, error);
-    if (this.hasWatchers(now) && row.state === "sleeping") this.startWake(server, now);
+    for (const error of roomErrors) sendDevice(server, { error });
+    if (this.hasWatchers(now) && row.state === SLEEPING) this.startWake(server, now);
 
     void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
@@ -183,23 +193,17 @@ export class Device extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
-    const incoming = parseIncoming(data);
-    if (!incoming) {
-      sendError(ws, { code: "message_invalid", message: 'Send JSON like {"action": "...", "message": {...}}.' });
-      return;
-    }
-    switch (incoming.action) {
-      case "offer":
-        await this.queue.run("publish", () => this.onOffer(ws, incoming.message));
-        return;
-      case "ready":
-        await this.queue.run("publish", () => this.onReady(ws, incoming.message));
-        return;
-      case "unpublished":
-        await this.queue.run("publish", () => this.onUnpublished(ws, incoming.message));
-        return;
-      default:
-        sendError(ws, { code: "action_unknown", message: `Unknown action "${incoming.action}".`, action: incoming.action });
+    // A replaced socket is closing: what it still sends belongs to the old connection.
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const request = decodeFrame(DeviceRequest, data);
+    const { offer, ready } = request ?? {};
+    if (offer) {
+      await this.queue.run("publish", () => this.onOffer(ws, offer));
+    } else if (ready) {
+      await this.queue.run("publish", () => this.onReady(ws));
+    } else {
+      const name = request ? requestName(request) : "";
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "Send a binary DeviceRequest with offer or ready.", name);
     }
   }
 
@@ -234,23 +238,25 @@ export class Device extends DurableObject<Env> {
     await this.scheduleAlarm(now);
   }
 
-  private async onOffer(ws: WebSocket, message: unknown): Promise<void> {
-    const parsed = offerMessageSchema.safeParse(message);
+  private async onOffer(ws: WebSocket, message: PublishOffer): Promise<void> {
+    const parsed = publishOfferSchema.safeParse(message);
     if (!parsed.success) {
-      sendError(ws, { code: "offer_invalid", message: "The offer needs wakeId, sdp and tracks.", action: "offer" });
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "The offer needs sdp and tracks.", "offer");
       return;
     }
-    const { wakeId, sdp, tracks } = parsed.data;
+    const { sdp, tracks } = parsed.data;
+    // Any offer while waking or live will do, even one sent before the latest wake: it comes
+    // from the same device, which uses only the reply to its last offer.
     const before = this.row();
-    if (!before || before.wake_id !== wakeId || before.state === "sleeping") {
-      sendError(ws, { code: "wake_stale", message: "This wake is no longer current.", action: "offer" });
+    if (!before || before.state === SLEEPING) {
+      this.fail(ws, ErrorCode.ERROR_CODE_WAKE_STALE, "The device was put to sleep.", "offer");
       return;
     }
 
     try {
       const sfu = new RealtimeSfu(this.env);
       const local = tracks.map((track) => ({ location: "local" as const, mid: track.mid, trackName: track.trackName }));
-      const early = await this.takeEarlySession(wakeId);
+      const early = await this.takeEarlySession();
       let sessionId = early ?? (await sfu.createSession());
       let result;
       try {
@@ -271,23 +277,23 @@ export class Device extends DurableObject<Env> {
 
       // The device may have been put to sleep while the SFU call was running.
       const row = this.row();
-      if (!row || row.wake_id !== wakeId || row.state === "sleeping") {
-        sendError(ws, { code: "wake_stale", message: "This wake is no longer current.", action: "offer" });
+      if (!row || row.state === SLEEPING) {
+        this.fail(ws, ErrorCode.ERROR_CODE_WAKE_STALE, "The device was put to sleep.", "offer");
         return;
       }
       // The device is live once it says its PeerConnection is connected ("ready"). Until then
       // the SFU has no packets for these tracks, and viewers would get not_found_track_error.
       const now = Date.now();
-      row.state = "waking";
+      row.state = WAKING;
       row.generation += 1;
       row.sfu_session_id = sessionId;
       row.tracks = JSON.stringify(tracks.map((track) => track.trackName));
       row.wake_deadline = now + this.config.wakeTimeoutMs;
-      row.last_error = null;
+      row.last_error = ErrorCode.ERROR_CODE_UNSPECIFIED;
       row.last_seen = now;
       this.save(row);
 
-      send(ws, { action: "answer", message: { wakeId, generation: row.generation, sdp: result.sessionDescription.sdp } });
+      sendDevice(ws, { answer: { generation: row.generation, sdp: result.sessionDescription.sdp } });
       if (!this.hasWatchers(now)) this.startLinger(now);
       void this.notifyRoomsSoon();
       await this.scheduleAlarm(now);
@@ -295,43 +301,25 @@ export class Device extends DurableObject<Env> {
       const code = error instanceof SfuError ? error.code : "publish_failed";
       const text = error instanceof Error ? error.message : "Publishing failed.";
       console.log(JSON.stringify({ event: "publish_failed", deviceId: this.deviceId, code }));
-      sendError(ws, { code, message: text, action: "offer" });
+      this.fail(ws, ErrorCode.ERROR_CODE_SFU, `${code}: ${text}`, "offer");
     }
   }
 
-  private async onReady(ws: WebSocket, message: unknown): Promise<void> {
-    const parsed = readyMessageSchema.safeParse(message);
-    if (!parsed.success) {
-      sendError(ws, { code: "message_invalid", message: "ready needs a wakeId.", action: "ready" });
-      return;
-    }
+  private async onReady(ws: WebSocket): Promise<void> {
     const row = this.row();
-    if (!row || row.wake_id !== parsed.data.wakeId || !row.sfu_session_id) {
-      sendError(ws, { code: "wake_stale", message: "Send ready after the answer for the current wake.", action: "ready" });
+    if (!row) return;
+    if (row.state === SLEEPING) {
+      // This publication ended while the device was not looking, e.g. its wake timed out.
+      sendDevice(ws, { sleep: {} });
       return;
     }
-    if (row.state === "live") return;
+    // Waking with no answer yet: the wake went out after this ready, and the device starts over.
+    if (!row.sfu_session_id || row.state === LIVE) return;
     const now = Date.now();
-    row.state = "live";
+    row.state = LIVE;
     row.wake_deadline = null;
     row.wake_attempts = 0;
-    row.last_error = null;
-    this.save(row);
-    void this.notifyRoomsSoon();
-    await this.scheduleAlarm(now);
-  }
-
-  private async onUnpublished(ws: WebSocket, message: unknown): Promise<void> {
-    const parsed = unpublishedMessageSchema.safeParse(message);
-    if (!parsed.success) {
-      sendError(ws, { code: "message_invalid", message: "unpublished needs a wakeId.", action: "unpublished" });
-      return;
-    }
-    const row = this.row();
-    if (!row || row.wake_id !== parsed.data.wakeId) return;
-    const now = Date.now();
-    this.resetPublication(row);
-    row.last_error = this.hasWatchers(now) ? "device_stopped" : null;
+    row.last_error = ErrorCode.ERROR_CODE_UNSPECIFIED;
     this.save(row);
     void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
@@ -354,7 +342,7 @@ export class Device extends DurableObject<Env> {
       this.save(row);
     }
     const ws = this.socket();
-    if (row.state === "sleeping" && ws && this.isOnline(now)) {
+    if (row.state === SLEEPING && ws && this.isOnline(now)) {
       this.startWake(ws, now);
       // The asking room gets the new state in the reply.
       void this.notifyRoomsSoon(roomId);
@@ -369,7 +357,7 @@ export class Device extends DurableObject<Env> {
     const now = Date.now();
     this.sql.exec("DELETE FROM watching_rooms WHERE room_id = ?", roomId);
     const row = this.row();
-    if (row && row.state !== "sleeping" && !this.hasWatchers(now)) this.startLinger(now);
+    if (row && row.state !== SLEEPING && !this.hasWatchers(now)) this.startLinger(now);
     await this.scheduleAlarm(now);
   }
 
@@ -378,10 +366,10 @@ export class Device extends DurableObject<Env> {
     const now = Date.now();
     const row = this.row();
     if (!row || !this.rooms(row).includes(roomId)) {
-      return { ok: false, code: "not_member", message: `${this.deviceId} is not in room ${roomId}.` };
+      return { ok: false, code: ErrorCode.ERROR_CODE_NOT_MEMBER, message: `${this.deviceId} is not in room ${roomId}.` };
     }
-    if (row.state !== "live" || !row.sfu_session_id || !this.isOnline(now)) {
-      return { ok: false, code: "not_live", message: `${this.deviceId} is not publishing.` };
+    if (row.state !== LIVE || !row.sfu_session_id || !this.isOnline(now)) {
+      return { ok: false, code: ErrorCode.ERROR_CODE_NOT_LIVE, message: `${this.deviceId} is not publishing.` };
     }
     const others = this.sql
       .exec<{ total: number | null }>(
@@ -393,7 +381,7 @@ export class Device extends DurableObject<Env> {
     if (others + subscribers > this.config.maxViewersPerDevice) {
       return {
         ok: false,
-        code: "viewer_limit",
+        code: ErrorCode.ERROR_CODE_VIEWER_LIMIT,
         message: `${this.deviceId} already has ${this.config.maxViewersPerDevice} viewers.`,
       };
     }
@@ -412,9 +400,17 @@ export class Device extends DurableObject<Env> {
     return {
       deviceId: this.deviceId,
       now,
-      info: this.info(now),
+      info: debugInfo(this.info(now)),
       online: this.isOnline(now),
-      row: row ? { ...row, tracks: JSON.parse(row.tracks) as string[], rooms: this.rooms(row) } : null,
+      row: row
+        ? {
+            ...row,
+            state: stateName(row.state),
+            last_error: row.last_error ? errorName(row.last_error) : null,
+            tracks: JSON.parse(row.tracks) as string[],
+            rooms: this.rooms(row),
+          }
+        : null,
       watchingRooms: this.ready
         ? this.sql
             .exec<{ room_id: string; subscribers: number; expires_at: number }>("SELECT * FROM watching_rooms ORDER BY room_id")
@@ -444,7 +440,7 @@ export class Device extends DurableObject<Env> {
     if (ws && now - this.lastSeen(ws) > this.config.deviceStaleMs) {
       // Half-open connection: the socket exists but pings stopped.
       console.log(JSON.stringify({ event: "device_stale", deviceId: this.deviceId, silentMs: now - this.lastSeen(ws) }));
-      closeSocket(ws, CLOSE_HEARTBEAT_TIMEOUT, "No ping received.");
+      closeSocket(ws, CloseCode.CLOSE_CODE_HEARTBEAT_TIMEOUT, "No ping received.");
       // The device has been silent since its last ping, so the grace time is already over.
       row.disconnected_at ??= this.lastSeen(ws);
     }
@@ -458,15 +454,16 @@ export class Device extends DurableObject<Env> {
       changed = true;
     }
 
-    if (row.state === "waking" && row.wake_deadline !== null && row.wake_deadline <= now) {
+    if (row.state === WAKING && row.wake_deadline !== null && row.wake_deadline <= now) {
       const current = this.socket();
-      if (online && current && row.wake_attempts < WAKE_ATTEMPTS && row.wake_id) {
+      if (online && current && row.wake_attempts < WAKE_ATTEMPTS) {
+        // The device starts over with a new PeerConnection.
         row.wake_attempts += 1;
         row.wake_deadline = now + this.config.wakeTimeoutMs;
-        send(current, { action: "wake", message: { wakeId: row.wake_id } });
+        sendDevice(current, { wake: {} });
       } else {
         this.resetPublication(row);
-        row.last_error = "wake_timeout";
+        row.last_error = ErrorCode.ERROR_CODE_WAKE_TIMEOUT;
         changed = true;
         timedOut = true;
       }
@@ -476,7 +473,7 @@ export class Device extends DurableObject<Env> {
       row.linger_until = null;
       if (!this.hasWatchers(now)) {
         const current = this.socket();
-        if (current && row.wake_id) send(current, { action: "sleep", message: { wakeId: row.wake_id } });
+        if (current) sendDevice(current, { sleep: {} });
         this.resetPublication(row);
         changed = true;
       }
@@ -486,7 +483,7 @@ export class Device extends DurableObject<Env> {
     // Rooms are still watching but the device is not publishing. Try again on the next check,
     // so viewers see the timeout first.
     const current = this.socket();
-    if (!timedOut && this.hasWatchers(now) && row.state === "sleeping" && online && current) {
+    if (!timedOut && this.hasWatchers(now) && row.state === SLEEPING && online && current) {
       this.startWake(current, now);
       changed = true;
     }
@@ -507,6 +504,10 @@ export class Device extends DurableObject<Env> {
   // Helpers
   // -------------------------------------------------------------------------
 
+  private fail(ws: WebSocket, code: ErrorCode, message: string, request: string): void {
+    sendDevice(ws, { error: signalError({ code, message, request }) });
+  }
+
   private row(): DeviceRow | null {
     if (!this.ready) return null;
     return this.sql.exec<DeviceRow>("SELECT * FROM device WHERE id = 1").toArray()[0] ?? null;
@@ -514,16 +515,15 @@ export class Device extends DurableObject<Env> {
 
   private createRow(now: number): DeviceRow {
     const row: DeviceRow = {
-      state: "sleeping",
+      state: SLEEPING,
       generation: 0,
-      wake_id: null,
       wake_deadline: null,
       wake_attempts: 0,
       sfu_session_id: null,
       tracks: "[]",
       rooms: "[]",
       linger_until: null,
-      last_error: null,
+      last_error: ErrorCode.ERROR_CODE_UNSPECIFIED,
       last_seen: now,
       disconnected_at: null,
       offline_notified: 0,
@@ -534,12 +534,11 @@ export class Device extends DurableObject<Env> {
 
   private save(row: DeviceRow): void {
     this.sql.exec(
-      `INSERT OR REPLACE INTO device (id, state, generation, wake_id, wake_deadline, wake_attempts,
+      `INSERT OR REPLACE INTO device (id, state, generation, wake_deadline, wake_attempts,
          sfu_session_id, tracks, rooms, linger_until, last_error, last_seen, disconnected_at, offline_notified)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.state,
       row.generation,
-      row.wake_id,
       row.wake_deadline,
       row.wake_attempts,
       row.sfu_session_id,
@@ -561,7 +560,7 @@ export class Device extends DurableObject<Env> {
   private async updateRooms(row: DeviceRow, claims: Claims, now: number) {
     const wanted = [...new Set(claims.grant.rooms)];
     const previous = this.rooms(row);
-    const errors: Array<{ code: string; message: string }> = [];
+    const errors: SignalError[] = [];
     const joined: string[] = [];
 
     const results = await Promise.allSettled(
@@ -572,10 +571,10 @@ export class Device extends DurableObject<Env> {
       if (result.status === "fulfilled" && result.value.ok) {
         joined.push(room);
         if (result.value.viewers > 0) this.setWatching(room, 0, now);
+      } else if (result.status === "fulfilled" && !result.value.ok) {
+        errors.push(signalError({ code: result.value.code, message: result.value.message }));
       } else {
-        const message =
-          result.status === "fulfilled" && !result.value.ok ? result.value.message : `Could not join room ${room}.`;
-        errors.push({ code: result.status === "fulfilled" && !result.value.ok ? result.value.code : "room_unavailable", message });
+        errors.push(signalError({ code: ErrorCode.ERROR_CODE_ROOM_UNAVAILABLE, message: `Could not join room ${room}.` }));
       }
     });
 
@@ -611,26 +610,22 @@ export class Device extends DurableObject<Env> {
 
   private startWake(ws: WebSocket, now: number): void {
     const row = this.row()!;
-    row.state = "waking";
-    row.wake_id = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+    row.state = WAKING;
     row.wake_deadline = now + this.config.wakeTimeoutMs;
     row.wake_attempts = 1;
     row.linger_until = null;
-    row.last_error = null;
+    row.last_error = ErrorCode.ERROR_CODE_UNSPECIFIED;
     this.save(row);
-    send(ws, { action: "wake", message: { wakeId: row.wake_id } });
+    sendDevice(ws, { wake: {} });
     // The device needs a moment to build its offer. Create the SFU session meanwhile.
-    this.earlySession = {
-      wakeId: row.wake_id,
-      sessionId: new RealtimeSfu(this.env).createSession().catch(() => null),
-    };
+    this.earlySession = new RealtimeSfu(this.env).createSession().catch(() => null);
   }
 
   /** The session started with this wake, or null when there is none (a retry, or the object restarted). */
-  private async takeEarlySession(wakeId: string): Promise<string | null> {
+  private async takeEarlySession(): Promise<string | null> {
     const early = this.earlySession;
     this.earlySession = null;
-    return early?.wakeId === wakeId ? early.sessionId : null;
+    return early ? await early : null;
   }
 
   private startLinger(now: number): void {
@@ -645,13 +640,13 @@ export class Device extends DurableObject<Env> {
    * only with the next offer. Viewers drop their tracks because the state is no longer live.
    */
   private resetPublication(row: DeviceRow): void {
-    row.state = "sleeping";
-    row.wake_id = null;
+    row.state = SLEEPING;
     row.wake_deadline = null;
     row.wake_attempts = 0;
     row.sfu_session_id = null;
     row.tracks = "[]";
     row.linger_until = null;
+    this.earlySession = null;
   }
 
   private socket(): WebSocket | null {
@@ -676,13 +671,21 @@ export class Device extends DurableObject<Env> {
 
   private info(now: number): DeviceInfo {
     const row = this.row();
-    if (!row) return { deviceId: this.deviceId, state: "offline", generation: 0, tracks: [], lastError: null };
+    if (!row) {
+      return {
+        deviceId: this.deviceId,
+        state: DeviceState.DEVICE_STATE_OFFLINE,
+        generation: 0,
+        tracks: [],
+        lastError: ErrorCode.ERROR_CODE_UNSPECIFIED,
+      };
+    }
     const online = this.isOnline(now) || (row.disconnected_at !== null && !this.disconnectGraceOver(row, now));
     return {
       deviceId: this.deviceId,
-      state: online ? row.state : "offline",
+      state: online ? row.state : DeviceState.DEVICE_STATE_OFFLINE,
       generation: row.generation,
-      tracks: online && row.state === "live" ? (JSON.parse(row.tracks) as string[]) : [],
+      tracks: online && row.state === LIVE ? (JSON.parse(row.tracks) as string[]) : [],
       lastError: row.last_error,
     };
   }

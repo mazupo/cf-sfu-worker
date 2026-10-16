@@ -2,14 +2,16 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
+import { ErrorCode, ViewerRequest } from "../../src/proto/cloudflare";
 import {
-  PUBLISH_TRACKS,
   connect,
   deviceToken,
   mockSfu,
+  PUBLISH_TRACKS,
   publisherSessions,
-  viewerToken,
+  state_,
   type TestSocket,
+  viewerToken,
 } from "./helpers";
 
 /** Moves a Device DO timer into the past and runs its alarm. */
@@ -25,22 +27,22 @@ async function expireDeviceTimer(deviceId: string, column: "linger_until" | "wak
 async function liveDevice(deviceId: string, room: string, viewerId: string) {
   const calls = mockSfu();
   const device = await connect(await deviceToken(deviceId, [room]));
-  expect(await device.next("joined")).toMatchObject({ deviceId, state: "sleeping", rooms: [room] });
+  expect(await device.next("joined")).toMatchObject({ deviceId, state: state_("sleeping"), rooms: [room] });
 
   const viewer = await connect(await viewerToken(viewerId, room));
-  const { wakeId } = await device.next("wake");
+  await device.next("wake");
   const joined = await viewer.next("joined");
   expect(joined).toMatchObject({ viewerId, room, resumed: false });
-  expect(joined.devices).toEqual([expect.objectContaining({ deviceId, state: "waking" })]);
+  expect(joined.devices).toEqual([expect.objectContaining({ deviceId, state: state_("waking") })]);
 
-  device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+  device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
   const answer = await device.next("answer");
-  expect(answer).toEqual({ wakeId, generation: 1, sdp: "v=0 publisher-answer" });
+  expect(answer).toEqual({ generation: 1, sdp: "v=0 publisher-answer" });
   // Not live yet: the SFU has no media until the device's PeerConnection connects.
   expect(await viewer.device(deviceId, "waking")).toMatchObject({ generation: 1, tracks: [] });
-  device.send("ready", { wakeId });
+  device.send("ready", {});
   expect(await viewer.device(deviceId, "live")).toMatchObject({ generation: 1, tracks: ["video_track", "audio_track"] });
-  return { calls, device, viewer, wakeId };
+  return { calls, device, viewer };
 }
 
 async function subscribeAll(viewer: TestSocket, deviceId: string) {
@@ -61,13 +63,23 @@ describe("device socket", () => {
     const device = await connect(await deviceToken("cam-1", ["lab-a", "cam-1-only"]));
     expect(await device.next("joined")).toMatchObject({
       deviceId: "cam-1",
-      state: "sleeping",
+      state: state_("sleeping"),
       generation: 0,
       rooms: ["lab-a", "cam-1-only"],
-      iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }],
+      iceServers: [{ urls: ["stun:stun.cloudflare.com:3478"], username: "", credential: "" }],
     });
     device.sendText("ping");
     expect(await device.nextText()).toBe("pong");
+    device.close();
+  });
+
+  test("a frame that is not a DeviceRequest gets an invalid-message error", async () => {
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    device.sendText("hello");
+    expect(await device.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_INVALID_MESSAGE });
+    device.ws.send(new Uint8Array([0xff, 0xff, 0xff]));
+    expect(await device.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_INVALID_MESSAGE });
     device.close();
   });
 
@@ -79,11 +91,31 @@ describe("device socket", () => {
     expect((await first.closed()).code).toBe(4000);
     second.close();
   });
+
+  test("what a replaced viewer socket still sends, such as a late leave, is ignored", async () => {
+    mockSfu();
+    const room = env.ROOMS.getByName("lab-a");
+    const first = await connect(await viewerToken("v1", "lab-a"));
+    await first.next("joined");
+    const old = await runInDurableObject(room, async (_instance, state) => state.getWebSockets("v1")[0]!);
+    const second = await connect(await viewerToken("v1", "lab-a"));
+    expect((await second.next("joined")).resumed).toBe(true);
+    // The old page sent leave before it heard that it was replaced, so it reaches the closed socket.
+    const leave = ViewerRequest.encode(ViewerRequest.fromPartial({ leave: {} })).finish();
+    const viewers = await runInDurableObject(room, async (instance, state) => {
+      expect(old.readyState).not.toBe(WebSocket.OPEN);
+      await instance.webSocketMessage(old, leave.slice().buffer);
+      return state.storage.sql.exec<{ viewer_id: string }>("SELECT viewer_id FROM viewers").toArray();
+    });
+    expect(viewers).toEqual([{ viewer_id: "v1" }]);
+    expect(second.has("error")).toBe(false);
+    second.close();
+  });
 });
 
 describe("watching", () => {
   test("a viewer wakes the device, subscribes, and the device sleeps after the last viewer leaves", async () => {
-    const { calls, device, viewer, wakeId } = await liveDevice("cam-1", "cam-1-only", "v1");
+    const { calls, device, viewer } = await liveDevice("cam-1", "cam-1-only", "v1");
 
     // The device published through its own SFU session.
     const publish = calls.find((call) => call.path.endsWith("/tracks/new"))!;
@@ -116,8 +148,7 @@ describe("watching", () => {
     // Nothing happens before the linger time is over.
     expect(device.has("sleep")).toBe(false);
     await expireDeviceTimer("cam-1", "linger_until");
-    expect(await device.next("sleep")).toEqual({ wakeId });
-    device.send("unpublished", { wakeId });
+    expect(await device.next("sleep")).toEqual({});
     device.close();
   });
 
@@ -127,7 +158,7 @@ describe("watching", () => {
     await viewer.closed();
 
     const again = await connect(await viewerToken("v2", "lab-a"));
-    expect((await again.next("joined")).devices).toEqual([expect.objectContaining({ deviceId: "cam-1", state: "live" })]);
+    expect((await again.next("joined")).devices).toEqual([expect.objectContaining({ deviceId: "cam-1", state: state_("live") })]);
     await runDurableObjectAlarm(env.DEVICES.getByName("cam-1"));
     expect(device.has("sleep")).toBe(false);
     again.close();
@@ -157,7 +188,7 @@ describe("watching", () => {
     const third = await connect(await viewerToken("v3", "lab-a"));
     await third.next("joined");
     third.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
-    expect(await third.next("error")).toMatchObject({ code: "viewer_limit", action: "subscribe" });
+    expect(await third.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_VIEWER_LIMIT, request: "subscribe" });
     for (const socket of [viewer, second, third, device]) socket.close();
   });
 
@@ -173,7 +204,7 @@ describe("watching", () => {
     expect(await device.next("wake")).toEqual(first);
 
     await expireDeviceTimer("cam-1", "wake_deadline");
-    expect(await viewer.device("cam-1", "sleeping")).toMatchObject({ lastError: "wake_timeout" });
+    expect(await viewer.device("cam-1", "sleeping")).toMatchObject({ lastError: ErrorCode.ERROR_CODE_WAKE_TIMEOUT });
     viewer.close();
     device.close();
   });
@@ -183,11 +214,11 @@ describe("watching", () => {
     const device = await connect(await deviceToken("cam-1", ["lab-a"]));
     await device.next("joined");
     const viewer = await connect(await viewerToken("v1", "lab-a"));
-    const { wakeId } = await device.next("wake");
+    await device.next("wake");
     await viewer.next("joined");
 
-    device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
-    expect(await device.next("answer")).toMatchObject({ wakeId, generation: 1 });
+    device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    expect(await device.next("answer")).toMatchObject({ generation: 1 });
     const [expired, used] = publisherSessions(calls);
     expect(used).toBeDefined();
     expect(used).not.toBe(expired);
@@ -196,12 +227,24 @@ describe("watching", () => {
     device.close();
   });
 
-  test("a device that reconnects with its wake_id keeps publishing", async () => {
-    const { device, viewer, wakeId } = await liveDevice("cam-1", "lab-a", "v1");
-    const reconnected = await connect(await deviceToken("cam-1", ["lab-a"], wakeId));
-    expect(await reconnected.next("joined")).toMatchObject({ state: "live", generation: 1 });
+  test("a device that reconnects with the generation of its answer keeps publishing", async () => {
+    const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
+    const reconnected = await connect(await deviceToken("cam-1", ["lab-a"], 1));
+    expect(await reconnected.next("joined")).toMatchObject({ state: state_("live"), generation: 1 });
     expect((await device.closed()).code).toBe(4000);
     expect(reconnected.has("wake")).toBe(false);
+    reconnected.close();
+    viewer.close();
+  });
+
+  test("a device that reconnects with an older generation starts over", async () => {
+    const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
+    // Its answer for generation 2 was lost with the old socket, so it still knows generation 1.
+    device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    await device.next("answer");
+    const reconnected = await connect(await deviceToken("cam-1", ["lab-a"], 1));
+    expect(await reconnected.next("joined")).toMatchObject({ state: state_("sleeping"), generation: 2 });
+    await reconnected.next("wake");
     reconnected.close();
     viewer.close();
   });
@@ -211,28 +254,33 @@ describe("watching", () => {
     viewer.send("leave");
     await viewer.closed();
     await expireDeviceTimer("cam-1", "linger_until");
-    const { wakeId: oldWake } = await device.next("sleep");
-    device.send("unpublished", { wakeId: oldWake });
+    await device.next("sleep");
+
+    // Messages that crossed the sleep: the worker does not take them as a new publication.
+    device.send("ready", {});
+    expect(await device.next("sleep")).toEqual({});
+    device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    expect(await device.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_WAKE_STALE, request: "offer" });
 
     const again = await connect(await viewerToken("v2", "lab-a"));
     await again.next("joined");
-    const { wakeId } = await device.next("wake");
-    device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    await device.next("wake");
+    device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
     expect(await device.next("answer")).toMatchObject({ generation: 2 });
     again.close();
     device.close();
   });
 
-  test("a restarted device without a wake_id starts a new publication", async () => {
+  test("a restarted device without a generation starts a new publication", async () => {
     const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
     const restarted = await connect(await deviceToken("cam-1", ["lab-a"]));
-    const { wakeId } = await restarted.next("wake");
+    await restarted.next("wake");
     // The old publication is over. `joined` came before the new wake, so the device has its
     // ICE servers when it builds the PeerConnection.
-    expect(restarted.messages[0]?.action).toBe("joined");
-    expect(await restarted.next("joined")).toMatchObject({ state: "sleeping", generation: 1 });
+    expect(Object.keys(restarted.messages[0] ?? {})).toEqual(["joined"]);
+    expect(await restarted.next("joined")).toMatchObject({ state: state_("sleeping"), generation: 1 });
     expect(await viewer.device("cam-1", "waking")).toMatchObject({ generation: 1, tracks: [] });
-    restarted.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    restarted.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
     expect(await restarted.next("answer")).toMatchObject({ generation: 2 });
     await device.closed();
     restarted.close();

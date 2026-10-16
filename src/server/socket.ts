@@ -1,16 +1,35 @@
-import type { ErrorMessage, OutgoingMessage } from "../shared/protocol";
-import { incomingSchema } from "../shared/protocol";
+import {
+  DeviceRequest,
+  DeviceResponse,
+  SignalError,
+  ViewerRequest,
+  ViewerResponse,
+  type ErrorCode,
+  type MessageFns,
+} from "../proto/cloudflare";
 
-export function send(ws: WebSocket, message: OutgoingMessage): void {
+/** Largest frame accepted from a client. The SDP makes up most of it. */
+const MAX_FRAME_BYTES = 128 * 1024;
+
+export function sendDevice(ws: WebSocket, message: DeviceResponse): void {
+  sendBytes(ws, DeviceResponse.encode(message).finish());
+}
+
+export function sendViewer(ws: WebSocket, message: ViewerResponse): void {
+  sendBytes(ws, ViewerResponse.encode(message).finish());
+}
+
+function sendBytes(ws: WebSocket, bytes: Uint8Array): void {
   try {
-    ws.send(JSON.stringify(message));
+    ws.send(bytes);
   } catch {
     // The socket is closing. Presence checks decide what happens next.
   }
 }
 
-export function sendError(ws: WebSocket, error: ErrorMessage): void {
-  send(ws, { action: "error", message: error });
+/** A SignalError; the fields left out keep their defaults. */
+export function signalError(fields: Partial<SignalError> & { code: ErrorCode; message: string }): SignalError {
+  return SignalError.create(fields);
 }
 
 export function closeSocket(ws: WebSocket, code: number, reason: string): void {
@@ -21,16 +40,19 @@ export function closeSocket(ws: WebSocket, code: number, reason: string): void {
   }
 }
 
-export type Incoming = { action: string; message: unknown };
-
-export function parseIncoming(data: string | ArrayBuffer): Incoming | null {
-  if (typeof data !== "string" || data.length > 128 * 1024) return null;
+/** Decodes a binary frame, or returns null for text, oversized or broken frames. */
+export function decodeFrame<T>(codec: MessageFns<T>, data: string | ArrayBuffer): T | null {
+  if (typeof data === "string" || data.byteLength > MAX_FRAME_BYTES) return null;
   try {
-    const parsed = incomingSchema.safeParse(JSON.parse(data));
-    return parsed.success ? { action: parsed.data.action, message: parsed.data.message } : null;
+    return codec.decode(new Uint8Array(data));
   } catch {
     return null;
   }
+}
+
+/** The oneof field that is set, e.g. "offer". Errors name the request they answer. */
+export function requestName(request: DeviceRequest | ViewerRequest): string {
+  return Object.entries(request).find(([, value]) => value !== undefined)?.[0] ?? "";
 }
 
 /** Runs tasks for one key one at a time, in arrival order. Lives only in memory. */

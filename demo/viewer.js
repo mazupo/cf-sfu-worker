@@ -2,18 +2,22 @@
 // through a single PeerConnection. All signaling happens on one WebSocket.
 import {
   CLOSE_REPLACED,
+  DeviceState,
+  ErrorCode,
   backoff,
   createLog,
+  errorName,
   openSocket,
-  parseFrame,
   persistForm,
   requestToken,
-  sendAction,
+  stateName,
+  viewerProtocol as protocol,
 } from "./common.js";
 import { startDebugPanel } from "./debug.js";
 
 /** Errors that will not change for the same publication. Do not ask again. */
-const PERMANENT = new Set(["viewer_limit", "not_member", "track_not_found"]);
+const PERMANENT = new Set([ErrorCode.ERROR_CODE_VIEWER_LIMIT, ErrorCode.ERROR_CODE_NOT_MEMBER, ErrorCode.ERROR_CODE_TRACK_NOT_FOUND]);
+const LIVE = DeviceState.DEVICE_STATE_LIVE;
 
 const form = document.getElementById("join-form");
 const joinButton = document.getElementById("join");
@@ -81,7 +85,7 @@ async function join() {
     const ws = openSocket(url, token);
     socket = ws;
     ws.addEventListener("message", (event) => {
-      if (ws === socket) handle(parseFrame(event.data));
+      if (ws === socket) handle(protocol.parse(event.data));
     });
     ws.addEventListener("close", (event) => {
       if (ws === socket) onClose(event);
@@ -107,7 +111,7 @@ function leave() {
   clearTimeout(reconnectTimer);
   clearTimeout(syncTimer);
   reconnectTimer = null;
-  sendAction(socket, "leave");
+  protocol.send(socket, "leave");
   dropSocket();
   resetPeer(false);
   devices.clear();
@@ -193,7 +197,7 @@ async function handle(frame) {
 }
 
 function onError(error) {
-  log(`error ${error.code}${error.deviceId ? ` (${error.deviceId})` : ""}: ${error.message}`);
+  log(`error ${errorName(error.code)}${error.deviceId ? ` (${error.deviceId})` : ""}: ${error.message}`);
   if (error.deviceId) {
     // The server still finishes the request for the other devices.
     const generation = devices.get(error.deviceId)?.generation;
@@ -208,7 +212,7 @@ function onError(error) {
     renderTiles();
     return;
   }
-  if (["subscribe", "unsubscribe", "answer"].includes(error.action)) {
+  if (["subscribe", "unsubscribe", "answer"].includes(error.request)) {
     busy = false;
     busyFailures++;
     scheduleSync(Math.min(10_000, 1000 * 2 ** busyFailures));
@@ -221,7 +225,7 @@ async function onOffer(message) {
   await pc.setRemoteDescription({ type: "offer", sdp: message.sdp });
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
-  sendAction(socket, "answer", { sdp: answer.sdp });
+  protocol.send(socket, "answer", { sdp: answer.sdp });
   attachTracks();
 }
 
@@ -237,11 +241,11 @@ function sync() {
   // Tracks from a publication that ended: the device slept, restarted or left.
   const stale = [...subscriptions].filter(([, sub]) => {
     const info = devices.get(sub.deviceId);
-    return !info || info.state !== "live" || info.generation !== sub.generation;
+    return !info || info.state !== LIVE || info.generation !== sub.generation;
   });
   if (stale.length > 0) {
     busy = true;
-    sendAction(socket, "unsubscribe", { mids: stale.map(([mid]) => mid) });
+    protocol.send(socket, "unsubscribe", { mids: stale.map(([mid]) => mid) });
     return;
   }
 
@@ -249,7 +253,7 @@ function sync() {
   let nextRetry = Infinity;
   const wanted = [];
   for (const info of devices.values()) {
-    if (info.state !== "live" || refused.get(info.deviceId) === info.generation) continue;
+    if (info.state !== LIVE || refused.get(info.deviceId) === info.generation) continue;
     const retry = retries.get(info.deviceId);
     if (retry?.generation === info.generation && retry.at > now) {
       nextRetry = Math.min(nextRetry, retry.at);
@@ -264,7 +268,7 @@ function sync() {
   }
   if (wanted.length > 0) {
     busy = true;
-    sendAction(socket, "subscribe", { tracks: wanted });
+    protocol.send(socket, "subscribe", { tracks: wanted });
   } else if (nextRetry !== Infinity) {
     scheduleSync(nextRetry - now);
   }
@@ -350,10 +354,10 @@ function renderTiles() {
       tile = { root, video, chip, note };
       tiles.set(info.deviceId, tile);
     }
-    tile.chip.className = `chip ${info.state}`;
-    tile.chip.textContent = info.state;
-    const refusedHere = refused.get(info.deviceId) === info.generation && info.state === "live";
-    tile.note.textContent = refusedHere ? "refused" : info.lastError ?? "";
+    tile.chip.className = `chip ${stateName(info.state)}`;
+    tile.chip.textContent = stateName(info.state);
+    const refusedHere = refused.get(info.deviceId) === info.generation && info.state === LIVE;
+    tile.note.textContent = refusedHere ? "refused" : info.lastError ? errorName(info.lastError) : "";
   }
   attachTracks();
 }
@@ -376,4 +380,3 @@ startDebugPanel({
   },
   key: () => new FormData(form).get("viewerKey"),
 });
-addEventListener("pagehide", () => sendAction(socket, "leave"));

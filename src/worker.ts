@@ -78,7 +78,7 @@ app.post(TOKEN_PATH, async (c) => {
         return error(c, 400, "too_many_rooms", `A device can join up to ${config.maxRoomsPerDevice} rooms.`);
       }
       sub = body.device_id;
-      grant = { rooms, canPublish: true, canSubscribe: false, ...(body.wake_id ? { wakeId: body.wake_id } : {}) };
+      grant = { rooms, canPublish: true, canSubscribe: false, ...(body.generation ? { generation: body.generation } : {}) };
     }
 
     const token = await signToken(c.env, role, sub, grant, config.tokenTtlSec);

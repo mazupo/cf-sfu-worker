@@ -1,0 +1,14 @@
+# npm run proto: generates src/proto from the mazupo/protocol submodule. buf compiles the
+# protos itself, so no protoc install is needed.
+version: v2
+inputs:
+  - directory: external/protocol/protos
+    paths:
+      - external/protocol/protos/cloudflare.proto
+plugins:
+  - local: protoc-gen-ts_proto
+    out: src/proto
+    opt:
+      - esModuleInterop=true
+      - outputJsonMethods=false
+      - env=browser

@@ -2,7 +2,15 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
-import { PUBLISH_TRACKS, connect, deviceToken, mockSfu, viewerToken, type TestSocket } from "./helpers";
+import {
+  connect,
+  deviceToken,
+  mockSfu,
+  PUBLISH_TRACKS,
+  state_,
+  type TestSocket,
+  viewerToken,
+} from "./helpers";
 
 async function liveDevice(deviceId: string, room: string) {
   mockSfu();
@@ -10,10 +18,10 @@ async function liveDevice(deviceId: string, room: string) {
   await device.next("joined");
   const viewer = await connect(await viewerToken("v1", room));
   await viewer.next("joined");
-  const { wakeId } = await device.next("wake");
-  device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+  await device.next("wake");
+  device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
   await device.next("answer");
-  device.send("ready", { wakeId });
+  device.send("ready", {});
   await viewer.device(deviceId, "live");
   return { device, viewer };
 }
@@ -83,7 +91,7 @@ describe("presence", () => {
   test("a new viewer sees the same state as the viewers already there", async () => {
     const { device, viewer } = await liveDevice("cam-1", "lab-a");
     const second: TestSocket = await connect(await viewerToken("v2", "lab-a"));
-    expect((await second.next("joined")).devices).toEqual([expect.objectContaining({ deviceId: "cam-1", state: "live" })]);
+    expect((await second.next("joined")).devices).toEqual([expect.objectContaining({ deviceId: "cam-1", state: state_("live") })]);
     for (const socket of [viewer, second, device]) socket.close();
   });
 });

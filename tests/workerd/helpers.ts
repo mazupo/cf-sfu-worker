@@ -2,6 +2,7 @@ import { exports as workerExports } from "cloudflare:workers";
 import { http, HttpResponse } from "msw";
 import { expect } from "vitest";
 
+import { DeviceRequest, DeviceResponse, DeviceState, ViewerRequest, ViewerResponse } from "../../src/proto/cloudflare";
 import { network } from "./network";
 
 export const ORIGIN = "http://localhost";
@@ -21,12 +22,12 @@ export function requestToken(key: string, body: unknown): Promise<Response> {
   );
 }
 
-export async function deviceToken(deviceId: string, rooms: string[], wakeId?: string): Promise<string> {
+export async function deviceToken(deviceId: string, rooms: string[], generation?: number): Promise<string> {
   const response = await requestToken(DEVICE_PUBLIC_KEY, {
     device_id: deviceId,
     room_ids: rooms,
     can_subscribe: false,
-    ...(wakeId ? { wake_id: wakeId } : {}),
+    ...(generation ? { generation } : {}),
   });
   expect(response.status).toBe(200);
   return (await response.json<{ token: string }>()).token;
@@ -49,26 +50,35 @@ export async function openSocket(token: string): Promise<Response> {
 export async function connect(token: string): Promise<TestSocket> {
   const response = await openSocket(token);
   expect(response.status).toBe(101);
-  return new TestSocket(response.webSocket!);
+  // The token's grant says whether this is a device or a viewer, which decides the messages.
+  const payload = JSON.parse(atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/")));
+  return new TestSocket(response.webSocket!, payload.grant.canPublish ? "device" : "viewer");
 }
 
-type Message = { action: string; message: any };
+/** A decoded DeviceResponse or ViewerResponse: one field is set, e.g. `joined`. */
+type Message = Record<string, any>;
 
-/** Collects what a socket receives so tests can wait for a given action. */
+/** Collects what a socket receives so tests can wait for a given message. */
 export class TestSocket {
   readonly messages: Message[] = [];
   readonly texts: string[] = [];
   closeEvent: { code: number; reason: string } | null = null;
   private listeners: Array<() => void> = [];
 
-  constructor(readonly ws: WebSocket) {
+  constructor(
+    readonly ws: WebSocket,
+    readonly role: "device" | "viewer",
+  ) {
+    ws.binaryType = "arraybuffer";
     ws.accept();
     ws.addEventListener("message", (event) => {
-      const data = String(event.data);
-      try {
-        this.messages.push(JSON.parse(data) as Message);
-      } catch {
-        this.texts.push(data);
+      if (typeof event.data === "string") {
+        this.texts.push(event.data);
+      } else {
+        const bytes = new Uint8Array(event.data as ArrayBuffer);
+        const decoded = this.role === "device" ? DeviceResponse.decode(bytes) : ViewerResponse.decode(bytes);
+        const set = Object.entries(decoded).filter(([, value]) => value !== undefined);
+        this.messages.push(Object.fromEntries(set));
       }
       this.notify();
     });
@@ -78,21 +88,27 @@ export class TestSocket {
     });
   }
 
-  send(action: string, message?: unknown): void {
-    this.ws.send(JSON.stringify({ action, message }));
+  /** Sends a request, e.g. send("offer", {...}). Fields left out get their defaults. */
+  send(request: string, message: Record<string, unknown> = {}): void {
+    const partial: any = { [request]: message };
+    const bytes =
+      this.role === "device"
+        ? DeviceRequest.encode(DeviceRequest.fromPartial(partial)).finish()
+        : ViewerRequest.encode(ViewerRequest.fromPartial(partial)).finish();
+    this.ws.send(bytes);
   }
 
   sendText(text: string): void {
     this.ws.send(text);
   }
 
-  /** Waits for the next message with this action that has not been taken yet. */
-  async next(action: string, timeoutMs = 3000): Promise<any> {
+  /** Waits for the next message of this kind (e.g. "joined") that has not been taken yet. */
+  async next(kind: string, timeoutMs = 3000): Promise<any> {
     return this.waitFor(() => {
-      const index = this.messages.findIndex((message) => message.action === action);
+      const index = this.messages.findIndex((message) => message[kind] !== undefined);
       if (index < 0) return undefined;
-      return this.messages.splice(index, 1)[0]!.message;
-    }, timeoutMs, `action "${action}"`);
+      return this.messages.splice(index, 1)[0]![kind];
+    }, timeoutMs, `message "${kind}"`);
   }
 
   async nextText(timeoutMs = 3000): Promise<string> {
@@ -103,20 +119,21 @@ export class TestSocket {
     return this.waitFor(() => this.closeEvent ?? undefined, timeoutMs, "close");
   }
 
-  /** Waits for a "device" message that matches, skipping the ones before it. */
-  async device(deviceId: string, state: string, timeoutMs = 3000): Promise<any> {
+  /** Waits for a `device` message in this state ("live", ...), skipping the ones before it. */
+  async device(deviceId: string, stateName: string, timeoutMs = 3000): Promise<any> {
+    const state = state_(stateName);
     return this.waitFor(() => {
       while (true) {
-        const index = this.messages.findIndex((message) => message.action === "device" && message.message.deviceId === deviceId);
+        const index = this.messages.findIndex((message) => message.device?.deviceId === deviceId);
         if (index < 0) return undefined;
         const [found] = this.messages.splice(index, 1);
-        if (found!.message.state === state) return found!.message;
+        if (found!.device.state === state) return found!.device;
       }
-    }, timeoutMs, `device ${deviceId} ${state}`);
+    }, timeoutMs, `device ${deviceId} ${stateName}`);
   }
 
-  has(action: string): boolean {
-    return this.messages.some((message) => message.action === action);
+  has(kind: string): boolean {
+    return this.messages.some((message) => message[kind] !== undefined);
   }
 
   close(): void {
@@ -228,3 +245,10 @@ export const PUBLISH_TRACKS = [
   { mid: "0", trackName: "video_track" },
   { mid: "1", trackName: "audio_track" },
 ];
+
+/** "live" → DeviceState.DEVICE_STATE_LIVE */
+export function state_(name: string): DeviceState {
+  const state = DeviceState[`DEVICE_STATE_${name.toUpperCase()}` as keyof typeof DeviceState];
+  if (state === undefined) throw new Error(`Unknown device state ${name}`);
+  return state;
+}

@@ -7,21 +7,27 @@
   "scripts": {
     "dev": "wrangler dev --ip 0.0.0.0",
     "deploy": "wrangler deploy",
+    "build:demo": "esbuild demo/viewer.js demo/device.js --bundle --format=esm --target=es2022 --outdir=public/js --log-level=warning",
+    "proto": "node scripts/check-protocol.mjs && buf generate",
     "cf-typegen": "wrangler types --env-file .dev.vars.example",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run cf-typegen -- --check && npm run typecheck && npm run test",
+    "check": "npm run proto && npm run cf-typegen -- --check && npm run typecheck && npm run test",
     "keys": "node scripts/keys.mjs"
   },
   "dependencies": {
+    "@bufbuild/protobuf": "^2.16.0",
     "hono": "^4.13.13",
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@bufbuild/buf": "^1.73.0",
     "@cloudflare/vitest-plugin": "^1.4.3",
     "@msw/cloudflare": "^0.2.0",
     "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
     "msw": "^3.0.3",
+    "ts-proto": "^2.12.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.12",
     "wrangler": "^4.151.0"

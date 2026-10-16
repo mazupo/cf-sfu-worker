@@ -89,7 +89,7 @@ function render(json, raw) {
 
 function deviceTable(devices) {
   return table(
-    ["Device", "State", "Stored", "Gen", "Wake", "SFU session", "Socket", "Last ping", "Watched by", "Alarm", "Error"],
+    ["Device", "State", "Stored", "Gen", "SFU session", "Socket", "Last ping", "Watched by", "Alarm", "Error"],
     devices.map((device) => {
       const now = device.now;
       const row = device.row;
@@ -99,7 +99,6 @@ function deviceTable(devices) {
         chip(device.info.state),
         row?.state ?? "—",
         row?.generation ?? "—",
-        row?.wake_id ?? "—",
         short(row?.sfu_session_id),
         device.sockets.length
           ? device.sockets.map((socket) => `${SOCKET_STATES[socket.readyState] ?? socket.readyState}, ${ago(socket.connectedAt, now)}`).join("; ")

@@ -1,20 +1,33 @@
 import { DurableObject } from "cloudflare:workers";
 
 import {
-  CLOSE_HEARTBEAT_TIMEOUT,
-  CLOSE_LEFT,
-  CLOSE_REPLACED,
-  answerMessageSchema,
-  subscribeMessageSchema,
-  unsubscribeMessageSchema,
+  CloseCode,
+  DeviceState,
+  ErrorCode,
+  ViewerRequest,
   type DeviceInfo,
-  type OutgoingMessage,
+  type Subscribe,
+  type SubscribeAnswer,
   type Subscription,
-} from "../shared/protocol";
+  type Unsubscribe,
+  type ViewerResponse,
+} from "../proto/cloudflare";
+import { debugInfo, subscribeAnswerSchema, subscribeSchema, unsubscribeSchema } from "../shared/protocol";
 import { PRESENCE_CHECK_MS, WATCH_RENEW_MS, settings, type Settings } from "./config";
 import { iceServers, RealtimeSfu, SfuError, type TrackObject, type TracksResponse } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
-import { KeyedQueue, closeSocket, parseIncoming, send, sendError, upgradeRequired } from "./socket";
+import {
+  KeyedQueue,
+  closeSocket,
+  decodeFrame,
+  requestName,
+  sendViewer,
+  signalError,
+  upgradeRequired,
+} from "./socket";
+
+/** A viewer that sends leave gets a normal close. */
+const CLOSE_LEFT = 1000;
 
 type ViewerRow = {
   viewer_id: string;
@@ -35,7 +48,7 @@ type SubscriptionRow = {
 
 type ViewerAttachment = { viewerId: string; connectedAt: number };
 
-export type AddMemberResult = { ok: true; viewers: number } | { ok: false; code: string; message: string };
+export type AddMemberResult = { ok: true; viewers: number } | { ok: false; code: ErrorCode; message: string };
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS members (
@@ -123,7 +136,7 @@ export class Room extends DurableObject<Env> {
       if (count >= this.config.maxDevicesPerRoom) {
         return {
           ok: false,
-          code: "room_full",
+          code: ErrorCode.ERROR_CODE_ROOM_FULL,
           message: `Room ${this.roomId} already has ${this.config.maxDevicesPerRoom} devices.`,
         };
       }
@@ -138,7 +151,7 @@ export class Room extends DurableObject<Env> {
         JSON.stringify(offlineInfo(deviceId)),
         now,
       );
-      this.broadcast({ action: "members", message: { devices: this.memberInfos() } });
+      this.broadcast({ members: { devices: this.memberInfos() } });
     }
     return { ok: true, viewers };
   }
@@ -147,7 +160,7 @@ export class Room extends DurableObject<Env> {
     if (!this.ready) return;
     this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
     this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
-    if (this.viewerCount() > 0) this.broadcast({ action: "members", message: { devices: this.memberInfos() } });
+    if (this.viewerCount() > 0) this.broadcast({ members: { devices: this.memberInfos() } });
     await this.deleteIfEmpty();
   }
 
@@ -161,7 +174,7 @@ export class Room extends DurableObject<Env> {
       JSON.stringify(info),
       Date.now(),
     );
-    this.broadcast({ action: "device", message: info });
+    this.broadcast({ device: info });
     return { watching: true };
   }
 
@@ -196,7 +209,7 @@ export class Room extends DurableObject<Env> {
         viewer = null;
       }
     }
-    for (const old of oldSockets) closeSocket(old, CLOSE_REPLACED, "Another connection uses the same viewer_id.");
+    for (const old of oldSockets) closeSocket(old, CloseCode.CLOSE_CODE_REPLACED, "Another connection uses the same viewer_id.");
 
     const wasEmpty = this.viewerCount() === 0;
     if (viewer) {
@@ -221,9 +234,8 @@ export class Room extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server, [viewerId]);
     server.serializeAttachment({ viewerId, connectedAt: now } satisfies ViewerAttachment);
 
-    send(server, {
-      action: "joined",
-      message: {
+    sendViewer(server, {
+      joined: {
         viewerId,
         room: this.roomId,
         resumed,
@@ -234,9 +246,8 @@ export class Room extends DurableObject<Env> {
     });
     // A viewer that dropped while an offer was pending gets the same offer again.
     if (resumed && viewer?.negotiating && viewer.pending_offer) {
-      send(server, {
-        action: "offer",
-        message: { sdp: viewer.pending_offer, tracks: this.subscriptions(viewerId), sessionReset: false },
+      sendViewer(server, {
+        offer: { sdp: viewer.pending_offer, tracks: this.subscriptions(viewerId), sessionReset: false },
       });
     }
     await this.scheduleAlarm(now);
@@ -245,46 +256,42 @@ export class Room extends DurableObject<Env> {
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
     const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
-    if (!attachment || !this.ready) return;
-    const incoming = parseIncoming(data);
-    if (!incoming) {
-      sendError(ws, { code: "message_invalid", message: 'Send JSON like {"action": "...", "message": {...}}.' });
+    // A replaced socket is closing: what it still sends, e.g. a late leave, belongs to the old connection.
+    if (!attachment || !this.ready || ws.readyState !== WebSocket.OPEN) return;
+    const request = decodeFrame(ViewerRequest, data);
+    const name = request ? requestName(request) : "";
+    if (!request || !name) {
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "Send a binary ViewerRequest.", name);
       return;
     }
     const { viewerId } = attachment;
     const run = (task: () => Promise<void>) =>
       this.queue.run(viewerId, async () => {
         if (!this.viewer(viewerId)) {
-          sendError(ws, { code: "viewer_gone", message: "Join the room again.", action: incoming.action });
+          this.fail(ws, ErrorCode.ERROR_CODE_VIEWER_GONE, "Join the room again.", name);
           return;
         }
         try {
           await task();
         } catch (error) {
-          const code = error instanceof SfuError ? error.code : "internal_error";
+          const sfu = error instanceof SfuError;
           const message = error instanceof Error ? error.message : "Something went wrong.";
-          console.log(JSON.stringify({ event: "viewer_action_failed", room: this.roomId, action: incoming.action, code }));
-          sendError(ws, { code, message, action: incoming.action });
+          console.log(JSON.stringify({ event: "viewer_request_failed", room: this.roomId, request: name, code: sfu ? error.code : "internal" }));
+          this.fail(ws, sfu ? ErrorCode.ERROR_CODE_SFU : ErrorCode.ERROR_CODE_INTERNAL, message, name);
         }
       });
-    switch (incoming.action) {
-      case "subscribe":
-        await run(() => this.onSubscribe(ws, viewerId, incoming.message));
-        return;
-      case "answer":
-        await run(() => this.onAnswer(ws, viewerId, incoming.message));
-        return;
-      case "unsubscribe":
-        await run(() => this.onUnsubscribe(ws, viewerId, incoming.message));
-        return;
-      case "leave":
-        await run(async () => {
-          await this.dropViewer(viewerId);
-          closeSocket(ws, CLOSE_LEFT, "Left the room.");
-        });
-        return;
-      default:
-        sendError(ws, { code: "action_unknown", message: `Unknown action "${incoming.action}".`, action: incoming.action });
+    const { subscribe, answer, unsubscribe, leave } = request;
+    if (subscribe) {
+      await run(() => this.onSubscribe(ws, viewerId, subscribe));
+    } else if (answer) {
+      await run(() => this.onAnswer(ws, viewerId, answer));
+    } else if (unsubscribe) {
+      await run(() => this.onUnsubscribe(ws, viewerId, unsubscribe));
+    } else if (leave) {
+      await run(async () => {
+        await this.dropViewer(viewerId);
+        closeSocket(ws, CLOSE_LEFT, "Left the room.");
+      });
     }
   }
 
@@ -312,15 +319,15 @@ export class Room extends DurableObject<Env> {
     await this.scheduleAlarm(now);
   }
 
-  private async onSubscribe(ws: WebSocket, viewerId: string, message: unknown): Promise<void> {
-    const parsed = subscribeMessageSchema.safeParse(message);
+  private async onSubscribe(ws: WebSocket, viewerId: string, message: Subscribe): Promise<void> {
+    const parsed = subscribeSchema.safeParse(message);
     if (!parsed.success) {
-      sendError(ws, { code: "subscribe_invalid", message: "subscribe needs tracks [{deviceId, trackName}].", action: "subscribe" });
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "subscribe needs tracks [{deviceId, trackName}].", "subscribe");
       return;
     }
     const viewer = this.viewer(viewerId)!;
     if (viewer.negotiating) {
-      sendError(ws, { code: "busy", message: "Send the answer for the last offer first.", action: "subscribe" });
+      this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Send the answer for the last offer first.", "subscribe");
       return;
     }
 
@@ -328,10 +335,9 @@ export class Room extends DurableObject<Env> {
     const byDevice = new Map<string, Set<string>>();
     for (const track of parsed.data.tracks) {
       if (!this.isMember(track.deviceId)) {
-        sendError(ws, {
-          code: "not_member",
+        this.failTrack(ws, {
+          code: ErrorCode.ERROR_CODE_NOT_MEMBER,
           message: `${track.deviceId} is not in this room.`,
-          action: "subscribe",
           deviceId: track.deviceId,
         });
         continue;
@@ -347,22 +353,21 @@ export class Room extends DurableObject<Env> {
       const count = this.subscriberCount(deviceId) + (subscribed ? 0 : 1);
       const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, count);
       if (!resolved.ok) {
-        sendError(ws, {
+        this.failTrack(ws, {
           code: resolved.code,
           message: resolved.message,
-          action: "subscribe",
           deviceId,
-          retryable: resolved.code === "not_live",
+          retryable: resolved.code === ErrorCode.ERROR_CODE_NOT_LIVE,
         });
         continue;
       }
       for (const trackName of names) {
         if (!resolved.tracks.includes(trackName)) {
-          sendError(ws, {
-            code: "track_not_found",
+          this.failTrack(ws, {
+            code: ErrorCode.ERROR_CODE_TRACK_NOT_FOUND,
             message: `${deviceId} has no track ${trackName}.`,
-            action: "subscribe",
             deviceId,
+            trackName,
           });
           continue;
         }
@@ -375,7 +380,7 @@ export class Room extends DurableObject<Env> {
       }
     }
     if (remote.length === 0) {
-      send(ws, { action: "subscribed", message: { tracks: this.subscriptions(viewerId) } });
+      sendViewer(ws, { subscribed: { tracks: this.subscriptions(viewerId) } });
       return;
     }
 
@@ -406,10 +411,9 @@ export class Room extends DurableObject<Env> {
       const item = returned[index];
       if (item?.errorCode || !item?.mid) {
         // Usually not_found_track_error: the device is connected but its media is not there yet.
-        sendError(ws, {
-          code: item?.errorCode ?? "track_failed",
-          message: item?.errorDescription ?? `Could not pull ${track.trackName} from ${track.deviceId}.`,
-          action: "subscribe",
+        this.failTrack(ws, {
+          code: ErrorCode.ERROR_CODE_TRACK_NOT_READY,
+          message: `${item?.errorCode ?? "track_failed"}: ${item?.errorDescription ?? `Could not pull ${track.trackName}.`}`,
           deviceId: track.deviceId,
           trackName: track.trackName,
           retryable: true,
@@ -429,36 +433,36 @@ export class Room extends DurableObject<Env> {
     this.finishNegotiation(ws, viewerId, result, sessionReset);
   }
 
-  private async onAnswer(ws: WebSocket, viewerId: string, message: unknown): Promise<void> {
-    const parsed = answerMessageSchema.safeParse(message);
+  private async onAnswer(ws: WebSocket, viewerId: string, message: SubscribeAnswer): Promise<void> {
+    const parsed = subscribeAnswerSchema.safeParse(message);
     if (!parsed.success) {
-      sendError(ws, { code: "answer_invalid", message: "answer needs an sdp.", action: "answer" });
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "answer needs an sdp.", "answer");
       return;
     }
     const viewer = this.viewer(viewerId)!;
     if (!viewer.negotiating || !viewer.sfu_session_id) {
-      sendError(ws, { code: "no_offer", message: "There is no offer waiting for an answer.", action: "answer" });
+      this.fail(ws, ErrorCode.ERROR_CODE_NO_OFFER, "There is no offer waiting for an answer.", "answer");
       return;
     }
     await new RealtimeSfu(this.env).renegotiate(viewer.sfu_session_id, parsed.data.sdp);
     this.sql.exec("UPDATE viewers SET negotiating = 0, pending_offer = NULL WHERE viewer_id = ?", viewerId);
-    send(ws, { action: "subscribed", message: { tracks: this.subscriptions(viewerId) } });
+    sendViewer(ws, { subscribed: { tracks: this.subscriptions(viewerId) } });
   }
 
-  private async onUnsubscribe(ws: WebSocket, viewerId: string, message: unknown): Promise<void> {
-    const parsed = unsubscribeMessageSchema.safeParse(message);
+  private async onUnsubscribe(ws: WebSocket, viewerId: string, message: Unsubscribe): Promise<void> {
+    const parsed = unsubscribeSchema.safeParse(message);
     if (!parsed.success) {
-      sendError(ws, { code: "unsubscribe_invalid", message: "unsubscribe needs mids.", action: "unsubscribe" });
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "unsubscribe needs mids.", "unsubscribe");
       return;
     }
     const viewer = this.viewer(viewerId)!;
     if (viewer.negotiating) {
-      sendError(ws, { code: "busy", message: "Send the answer for the last offer first.", action: "unsubscribe" });
+      this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Send the answer for the last offer first.", "unsubscribe");
       return;
     }
     const closing = this.subscriptions(viewerId).filter((sub) => parsed.data.mids.includes(sub.mid));
     if (closing.length === 0 || !viewer.sfu_session_id) {
-      send(ws, { action: "subscribed", message: { tracks: this.subscriptions(viewerId) } });
+      sendViewer(ws, { subscribed: { tracks: this.subscriptions(viewerId) } });
       return;
     }
 
@@ -487,10 +491,10 @@ export class Room extends DurableObject<Env> {
         result.sessionDescription.sdp,
         viewerId,
       );
-      send(ws, { action: "offer", message: { sdp: result.sessionDescription.sdp, tracks, sessionReset } });
+      sendViewer(ws, { offer: { sdp: result.sessionDescription.sdp, tracks, sessionReset } });
       return;
     }
-    send(ws, { action: "subscribed", message: { tracks } });
+    sendViewer(ws, { subscribed: { tracks } });
   }
 
   private async newSession(sfu: RealtimeSfu, viewerId: string): Promise<string> {
@@ -513,7 +517,7 @@ export class Room extends DurableObject<Env> {
       if (ws.readyState !== WebSocket.OPEN || now - this.lastSeen(ws) <= this.config.viewerStaleMs) continue;
       const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
       console.log(JSON.stringify({ event: "viewer_stale", room: this.roomId, viewerId: attachment?.viewerId ?? null }));
-      closeSocket(ws, CLOSE_HEARTBEAT_TIMEOUT, "No ping received.");
+      closeSocket(ws, CloseCode.CLOSE_CODE_HEARTBEAT_TIMEOUT, "No ping received.");
       if (attachment) {
         this.sql.exec(
           "UPDATE viewers SET socket_closed_at = COALESCE(socket_closed_at, ?) WHERE viewer_id = ?",
@@ -570,7 +574,11 @@ export class Room extends DurableObject<Env> {
       devices: this.sql
         .exec<{ device_id: string; info: string; lease_renewed_at: number }>("SELECT * FROM devices ORDER BY device_id")
         .toArray()
-        .map((row) => ({ deviceId: row.device_id, info: JSON.parse(row.info) as DeviceInfo, leaseRenewedAt: row.lease_renewed_at })),
+        .map((row) => ({
+          deviceId: row.device_id,
+          info: debugInfo(JSON.parse(row.info) as DeviceInfo),
+          leaseRenewedAt: row.lease_renewed_at,
+        })),
       viewers: viewers.map((viewer) => ({
         viewerId: viewer.viewer_id,
         sfuSessionId: viewer.sfu_session_id,
@@ -638,7 +646,7 @@ export class Room extends DurableObject<Env> {
     if (!result.member) {
       this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
       this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
-      if (this.viewerCount() > 0) this.broadcast({ action: "members", message: { devices: this.memberInfos() } });
+      if (this.viewerCount() > 0) this.broadcast({ members: { devices: this.memberInfos() } });
       return;
     }
     const previous = this.sql
@@ -646,7 +654,7 @@ export class Room extends DurableObject<Env> {
       .toArray()[0]?.info;
     const info = JSON.stringify(result.info);
     // Every viewer must see the same state, including changes found while renewing.
-    if (previous !== undefined && previous !== info) this.broadcast({ action: "device", message: result.info });
+    if (previous !== undefined && previous !== info) this.broadcast({ device: result.info });
     this.sql.exec(
       `INSERT INTO devices (device_id, info, lease_renewed_at) VALUES (?, ?, ?)
        ON CONFLICT (device_id) DO UPDATE SET info = excluded.info, lease_renewed_at = excluded.lease_renewed_at`,
@@ -680,10 +688,22 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("DELETE FROM devices");
   }
 
-  private broadcast(message: OutgoingMessage): void {
+  private broadcast(message: ViewerResponse): void {
     for (const ws of this.ctx.getWebSockets()) {
-      if (ws.readyState === WebSocket.OPEN) send(ws, message);
+      if (ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
     }
+  }
+
+  private fail(ws: WebSocket, code: ErrorCode, message: string, request: string): void {
+    sendViewer(ws, { error: signalError({ code, message, request }) });
+  }
+
+  /** An error for one device or track of a subscribe. The rest of the request goes on. */
+  private failTrack(
+    ws: WebSocket,
+    fields: { code: ErrorCode; message: string; deviceId: string; trackName?: string; retryable?: boolean },
+  ): void {
+    sendViewer(ws, { error: signalError({ ...fields, request: "subscribe" }) });
   }
 
   private lastSeen(ws: WebSocket): number {
@@ -720,5 +740,11 @@ export class Room extends DurableObject<Env> {
 }
 
 function offlineInfo(deviceId: string): DeviceInfo {
-  return { deviceId, state: "offline", generation: 0, tracks: [], lastError: null };
+  return {
+    deviceId,
+    state: DeviceState.DEVICE_STATE_OFFLINE,
+    generation: 0,
+    tracks: [],
+    lastError: ErrorCode.ERROR_CODE_UNSPECIFIED,
+  };
 }

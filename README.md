@@ -18,6 +18,7 @@ Devices wait on a WebSocket and publish video only while someone watches.
 ## Run it locally
 
 ```sh
+git submodule update --init       # mazupo/protocol: the message definitions
 npm install
 npm run keys                      # prints a device key pair and a viewer key pair
 cp .dev.vars.example .dev.vars    # then fill it in
@@ -66,17 +67,21 @@ The answer is `{ "token": "...", "expires_in": 30, "url": "wss://.../cloudflare/
 wss://<host>/cloudflare/rtc?access_token=<token>
 ```
 
-Messages are JSON: `{"action": "...", "message": {...}}`. `ping` and `pong` are plain text.
+Messages are protobuf, defined in [`protos/cloudflare.proto`](https://github.com/mazupo/protocol/blob/main/protos/cloudflare.proto) of [mazupo/protocol](https://github.com/mazupo/protocol). Each binary frame is one message:
 
-| From | Action | Message |
+- A device sends `DeviceRequest` and receives `DeviceResponse`.
+- A viewer sends `ViewerRequest` and receives `ViewerResponse`.
+
+Each of these sets exactly one field, listed below. `ping` and `pong` are text frames.
+
+| From | Field | Contents |
 | --- | --- | --- |
 | Worker → device | `joined` | `deviceId`, `state`, `generation`, `rooms`, `iceServers` |
-| Worker → device | `wake` | `wakeId` |
-| Device → worker | `offer` | `wakeId`, `sdp`, `tracks: [{ mid, trackName }]` |
-| Worker → device | `answer` | `wakeId`, `generation`, `sdp` |
-| Device → worker | `ready` | `wakeId`. Send it when the PeerConnection is connected. Viewers can subscribe only after it. |
-| Worker → device | `sleep` | `wakeId` |
-| Device → worker | `unpublished` | `wakeId` |
+| Worker → device | `wake` | Nothing. Publish from the start: close any PeerConnection, create a new one and send an offer. |
+| Device → worker | `offer` | `sdp`, `tracks: [{ mid, trackName }]` |
+| Worker → device | `answer` | `generation`, `sdp` |
+| Device → worker | `ready` | Nothing. Send it when the PeerConnection is connected. Viewers can subscribe only after it. |
+| Worker → device | `sleep` | Nothing. Close the PeerConnection. |
 | Worker → viewer | `joined` | `viewerId`, `room`, `resumed`, `iceServers`, `devices`, `subscriptions` |
 | Worker → viewer | `device` | One device's new state |
 | Worker → viewer | `members` | The room's devices changed |
@@ -86,13 +91,17 @@ Messages are JSON: `{"action": "...", "message": {...}}`. `ping` and `pong` are 
 | Worker → viewer | `subscribed` | `tracks` |
 | Viewer → worker | `unsubscribe` | `mids` |
 | Viewer → worker | `leave` | |
-| Worker → both | `error` | `code`, `message`, `action`, `deviceId` |
+| Worker → both | `error` | `code`, `message`, `request`, `deviceId`, `trackName`, `retryable` |
 
-Close code `4000` means another connection used the same `device_id` or `viewer_id`. Do not reconnect after it.
+The proto file also defines the device states (`DeviceState`), the error codes (`ErrorCode`) and the close codes (`CloseCode`). Close code `4000` means another connection used the same `device_id` or `viewer_id`. Do not reconnect after it.
 
-The `generation` counts a device's publications. It goes up by one with each new offer, so viewers know when their tracks belong to an old publication.
+The TypeScript for these messages is generated into `src/proto` and is not in git. `npm run dev`, `npm run deploy` and `npm run check` generate it from the `external/protocol` submodule. To run the tests or the typecheck on their own, run `npm run proto` first. It uses [buf](https://buf.build) from npm, so you do not need to install `protoc`. To change the messages, edit the proto files in `external/protocol`.
 
-A device that reconnects while it publishes sends its current `wake_id` in the token request, so the stream continues.
+The `generation` counts a device's publications. It goes up by one with each offer the worker answers, so viewers know when their tracks belong to an old publication.
+
+The worker replies to each offer, in order, with `answer` or an `error` for `offer`. A device uses only the reply to its last offer: one it sent before a new `wake` may still get a reply.
+
+A device that reconnects while it publishes adds `"generation"` from its last `answer` to the token request, so the stream continues. Otherwise the worker starts over: `joined` says `sleeping`, and a new `wake` follows if someone watches.
 A viewer that reconnects with the same `viewer_id` within 30 seconds keeps its subscriptions.
 
 ## Tests

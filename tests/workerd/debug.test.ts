@@ -12,10 +12,10 @@ test("the debug view shows the room, its viewers and its devices", async () => {
   await device.next("joined");
   const viewer = await connect(await viewerToken("v1", "lab-a"));
   await viewer.next("joined");
-  const { wakeId } = await device.next("wake");
-  device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+  await device.next("wake");
+  device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
   await device.next("answer");
-  device.send("ready", { wakeId });
+  device.send("ready", {});
   await viewer.device("cam-1", "live");
 
   const response = await debug("http://localhost/cloudflare/debug/rooms/lab-a", VIEWER_PUBLIC_KEY);
@@ -26,7 +26,7 @@ test("the debug view shows the room, its viewers and its devices", async () => {
   expect(body.devices[0]).toMatchObject({
     deviceId: "cam-1",
     online: true,
-    row: { state: "live", generation: 1, wake_id: wakeId, rooms: ["lab-a"] },
+    row: { state: "live", generation: 1, rooms: ["lab-a"] },
     watchingRooms: [expect.objectContaining({ room_id: "lab-a" })],
   });
   expect(body.devices[0].alarm).toBeGreaterThan(Date.now());

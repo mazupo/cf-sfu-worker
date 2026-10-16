@@ -2,13 +2,15 @@
 // This is what pi-webrtc does on a real device.
 import {
   CLOSE_REPLACED,
+  DeviceState,
+  ErrorCode,
   backoff,
   createLog,
+  deviceProtocol as protocol,
   openSocket,
-  parseFrame,
   persistForm,
   requestToken,
-  sendAction,
+  stateName,
 } from "./common.js";
 import { startDebugPanel } from "./debug.js";
 
@@ -29,7 +31,14 @@ let reconnectTimer = null;
 let pc = null;
 let stream = null;
 let iceServers = [];
-let wakeId = null;
+/** Goes up with each start and stop, so a camera that opens late knows it is no longer wanted. */
+let publication = 0;
+/** The generation of the answer the PeerConnection uses, or 0 before the answer. */
+let generation = 0;
+/** Offers sent on this socket with no reply yet. Only the reply to the last offer counts. */
+let unanswered = 0;
+/** The PeerConnection sent its offer. Until then, any reply is for an older one. */
+let offered = false;
 let stopped = true;
 let attempt = 0;
 let stopPattern = null;
@@ -49,18 +58,18 @@ async function connect() {
   disconnectButton.disabled = false;
   const rooms = String(data.get("rooms")).split(",").map((room) => room.trim()).filter(Boolean);
   try {
-    // While publishing, send the current wake_id so a reconnect keeps the stream.
+    // While publishing, send the generation of our answer so a reconnect keeps the stream.
     const { token, url } = await requestToken(data.get("workerUrl"), data.get("deviceKey"), {
       device_id: data.get("deviceId"),
       room_ids: rooms,
       can_subscribe: false,
-      ...(pc && wakeId ? { wake_id: wakeId } : {}),
+      ...(pc && generation ? { generation } : {}),
     });
     if (seq !== connectSeq || stopped) return; // a newer connect or a disconnect won
     const ws = openSocket(url, token);
     socket = ws;
     ws.addEventListener("message", (event) => {
-      if (ws === socket) handle(parseFrame(event.data));
+      if (ws === socket) handle(protocol.parse(event.data));
     });
     ws.addEventListener("close", (event) => {
       if (ws === socket) onClose(event);
@@ -85,7 +94,6 @@ function disconnect() {
   reconnectTimer = null;
   dropSocket();
   stopPublishing();
-  wakeId = null;
   connectButton.disabled = false;
   disconnectButton.disabled = true;
   setStatus("Disconnected.");
@@ -122,58 +130,60 @@ async function handle(frame) {
     case "joined":
       attempt = 0;
       iceServers = message.iceServers;
-      if (message.state === "sleeping" && pc) {
+      // Replies to offers on the old socket are lost.
+      unanswered = 0;
+      if (message.state === DeviceState.DEVICE_STATE_SLEEPING && pc) {
         // The worker started over, so the old publication is gone.
         stopPublishing();
-        wakeId = null;
       } else if (pc?.connectionState === "connected") {
-        sendAction(socket, "ready", { wakeId });
+        // `ready` may have been lost with the old socket.
+        protocol.send(socket, "ready", {});
       }
-      setStatus(`Connected as ${message.deviceId} in ${message.rooms.join(", ") || "no rooms"}. State: ${message.state}.`);
+      setStatus(`Connected as ${message.deviceId} in ${message.rooms.join(", ") || "no rooms"}. State: ${stateName(message.state)}.`);
       break;
     case "wake":
-      if (pc && wakeId === message.wakeId) {
-        // A repeated wake. Confirm again if connected, otherwise let the current attempt finish.
-        if (pc.connectionState === "connected") sendAction(socket, "ready", { wakeId });
-        else if (pc.connectionState === "failed") await startPublishing(message.wakeId);
-        return;
-      }
-      await startPublishing(message.wakeId);
+      await startPublishing();
       break;
     case "answer":
-      if (pc && message.wakeId === wakeId) {
+      unanswered = Math.max(0, unanswered - 1);
+      if (pc && offered && unanswered === 0) {
+        generation = message.generation;
         await pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
         setStatus(`Answer received (generation ${message.generation}). Connecting…`);
       }
       break;
     case "sleep":
-      if (message.wakeId === wakeId) {
-        stopPublishing();
-        sendAction(socket, "unpublished", { wakeId: message.wakeId });
-        wakeId = null;
-        setStatus("Sleeping. Nobody is watching.");
-      }
+      stopPublishing();
+      setStatus("Sleeping. Nobody is watching.");
       break;
     case "error":
-      if (message.action === "offer" && wakeId) {
-        // Publishing failed. Try again while the wake is still current.
-        const current = wakeId;
+      if (message.request === "offer") {
+        unanswered = Math.max(0, unanswered - 1);
+        if (!offered || unanswered > 0) break;
+        if (message.code === ErrorCode.ERROR_CODE_WAKE_STALE) {
+          // The worker wakes the device again if someone watches.
+          stopPublishing();
+          break;
+        }
+        // Publishing failed. Try again unless something else started or stopped meanwhile.
+        const current = publication;
         setTimeout(() => {
-          if (wakeId === current && socket) startPublishing(current);
+          if (publication === current && socket) startPublishing();
         }, 3000);
       }
       break;
   }
 }
 
-async function startPublishing(id) {
+/** Publishes from the start, with a new PeerConnection. */
+async function startPublishing() {
   stopPublishing();
-  wakeId = id;
+  const mine = publication;
   setStatus("Woken up. Starting the camera…");
   const media = await openMedia(new FormData(form).get("source"));
-  if (wakeId !== id) {
+  if (publication !== mine) {
     for (const track of media.getTracks()) track.stop();
-    return; // a sleep arrived while the camera was starting
+    return; // a sleep or another wake arrived while the camera was starting
   }
   stream = media;
   preview.srcObject = stream;
@@ -185,10 +195,10 @@ async function startPublishing(id) {
     log(`peer ${peer.connectionState}`);
     if (peer.connectionState === "connected") {
       // Media is flowing, so viewers can pull it now.
-      sendAction(socket, "ready", { wakeId: id });
+      protocol.send(socket, "ready", {});
       setStatus("Publishing.");
     }
-    if (peer.connectionState === "failed" && wakeId === id) startPublishing(id);
+    if (peer.connectionState === "failed") startPublishing();
   });
   const offer = await peer.createOffer();
   await peer.setLocalDescription(offer);
@@ -196,10 +206,16 @@ async function startPublishing(id) {
     mid: transceiver.mid,
     trackName: transceiver.sender.track?.kind === "audio" ? "audio_track" : "video_track",
   }));
-  sendAction(socket, "offer", { wakeId: id, sdp: offer.sdp, tracks });
+  if (publication !== mine || socket?.readyState !== WebSocket.OPEN) return;
+  unanswered += 1;
+  offered = true;
+  protocol.send(socket, "offer", { sdp: offer.sdp, tracks });
 }
 
 function stopPublishing() {
+  publication += 1;
+  generation = 0;
+  offered = false;
   pc?.close();
   pc = null;
   stopPattern?.();

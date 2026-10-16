@@ -1,8 +1,8 @@
-import type { RTCIceServerLike } from "../shared/protocol";
+import type { IceServer } from "../proto/cloudflare";
 
 const SFU_BASE = "https://rtc.live.cloudflare.com/v1";
 const REQUEST_TIMEOUT_MS = 10_000;
-const DEFAULT_ICE_SERVERS: RTCIceServerLike[] = [{ urls: "stun:stun.cloudflare.com:3478" }];
+const DEFAULT_ICE_SERVERS: IceServer[] = [{ urls: ["stun:stun.cloudflare.com:3478"], username: "", credential: "" }];
 
 export class SfuError extends Error {
   constructor(
@@ -128,31 +128,50 @@ export class RealtimeSfu {
   }
 }
 
+/** TURN credentials last a day. Everyone in this isolate shares them for an hour. */
+const TURN_TTL_SECONDS = 86_400;
+const TURN_REUSE_MS = 60 * 60 * 1000;
+let turnCache: { keyId: string; servers: IceServer[]; expiresAt: number } | null = null;
+
 /** STUN, plus short-lived TURN credentials when a TURN key is configured. */
-export async function iceServers(env: Env): Promise<RTCIceServerLike[]> {
+export async function iceServers(env: Env): Promise<IceServer[]> {
   const keyId = env.REALTIME_TURN_KEY_ID?.trim();
   const apiToken = env.REALTIME_TURN_KEY_API_TOKEN?.trim();
   if (!keyId || !apiToken) return DEFAULT_ICE_SERVERS;
+  const now = Date.now();
+  if (turnCache?.keyId === keyId && turnCache.expiresAt > now) return turnCache.servers;
+  const servers = await turnServers(keyId, apiToken);
+  // Only good answers are kept, so the next join asks again after a failure.
+  if (servers) turnCache = { keyId, servers, expiresAt: now + TURN_REUSE_MS };
+  return servers ?? DEFAULT_ICE_SERVERS;
+}
+
+/** Asks the TURN API for credentials. Null when it fails or takes too long: joins wait for it. */
+async function turnServers(keyId: string, apiToken: string): Promise<IceServer[] | null> {
   try {
     const response = await fetch(
       `${SFU_BASE}/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,
       {
         method: "POST",
         headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ ttl: 86_400 }),
+        body: JSON.stringify({ ttl: TURN_TTL_SECONDS }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       },
     );
-    if (!response.ok) return DEFAULT_ICE_SERVERS;
-    const body = await response.json<{ iceServers?: RTCIceServerLike[] | RTCIceServerLike }>();
+    if (!response.ok) return null;
+    type TurnServer = { urls: string | string[]; username?: string; credential?: string };
+    const body = await response.json<{ iceServers?: TurnServer[] | TurnServer }>();
     const servers = Array.isArray(body.iceServers) ? body.iceServers : body.iceServers ? [body.iceServers] : [];
     // Browsers time out on port 53, so leave those URLs out.
-    return servers
+    const usable = servers
       .map((server) => ({
-        ...server,
         urls: (Array.isArray(server.urls) ? server.urls : [server.urls]).filter((url) => !/:53(\?|$)/.test(url)),
+        username: server.username ?? "",
+        credential: server.credential ?? "",
       }))
       .filter((server) => server.urls.length > 0);
+    return usable.length > 0 ? usable : null;
   } catch {
-    return DEFAULT_ICE_SERVERS;
+    return null;
   }
 }

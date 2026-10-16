@@ -1,7 +1,19 @@
-// Shared helpers for the demo pages. Plain browser APIs only.
+// Shared helpers for the demo pages. Socket messages are protobuf (cloudflare.proto in
+// mazupo/protocol); esbuild bundles the generated code into public/js.
+import {
+  CloseCode,
+  DeviceRequest,
+  DeviceResponse,
+  DeviceState,
+  ErrorCode,
+  ViewerRequest,
+  ViewerResponse,
+} from "../src/proto/cloudflare";
+
+export { DeviceState, ErrorCode };
 
 export const PING_INTERVAL_MS = 15_000;
-export const CLOSE_REPLACED = 4000;
+export const CLOSE_REPLACED = CloseCode.CLOSE_CODE_REPLACED;
 
 /** Trades a public key for a 30 s, single-use access token. */
 export async function requestToken(workerUrl, publicKey, body) {
@@ -37,6 +49,7 @@ function startTicker(intervalMs, onTick) {
 /** Opens the socket and sends "ping" every 15 s. The server answers "pong". */
 export function openSocket(url, token) {
   const ws = new WebSocket(`${url}?access_token=${encodeURIComponent(token)}`);
+  ws.binaryType = "arraybuffer";
   const stop = startTicker(PING_INTERVAL_MS, () => {
     if (ws.readyState === WebSocket.OPEN) ws.send("ping");
   });
@@ -44,18 +57,40 @@ export function openSocket(url, token) {
   return ws;
 }
 
-export function sendAction(ws, action, message) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action, message }));
+/**
+ * Sends requests and reads responses as `{action, message}`, where action is the field set in
+ * the protobuf message, e.g. send(ws, "offer", {...}) sends DeviceRequest { offer: {...} }.
+ */
+function protocol(Request, Response) {
+  return {
+    send(ws, action, message = {}) {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(Request.encode(Request.fromPartial({ [action]: message })).finish());
+    },
+    /** Returns null for "pong" and for frames it cannot read. */
+    parse(data) {
+      if (typeof data === "string") return null;
+      try {
+        const decoded = Response.decode(new Uint8Array(data));
+        const [action, message] = Object.entries(decoded).find(([, value]) => value !== undefined) ?? [];
+        return action ? { action, message } : null;
+      } catch {
+        return null;
+      }
+    },
+  };
 }
 
-/** Parses a frame. Returns null for "pong". */
-export function parseFrame(data) {
-  if (data === "pong") return null;
-  try {
-    return JSON.parse(data);
-  } catch {
-    return null;
-  }
+export const deviceProtocol = protocol(DeviceRequest, DeviceResponse);
+export const viewerProtocol = protocol(ViewerRequest, ViewerResponse);
+
+/** DEVICE_STATE_LIVE → "live" */
+export function stateName(state) {
+  return (DeviceState[state] ?? "unknown").replace("DEVICE_STATE_", "").toLowerCase();
+}
+
+/** ERROR_CODE_VIEWER_LIMIT → "viewer_limit" */
+export function errorName(code) {
+  return (ErrorCode[code] ?? "unknown").replace("ERROR_CODE_", "").toLowerCase();
 }
 
 /** Remembers form values in this browser. Storage can be blocked, so failures are ignored. */
