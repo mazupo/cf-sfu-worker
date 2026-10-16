@@ -196,21 +196,34 @@ export class Device extends DurableObject<Env> {
     }
   }
 
-  override async webSocketClose(ws: WebSocket): Promise<void> {
-    await this.onSocketGone(ws);
+  override async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+    await this.onSocketGone(ws, code);
   }
 
   override async webSocketError(ws: WebSocket): Promise<void> {
     await this.onSocketGone(ws);
   }
 
-  private async onSocketGone(ws: WebSocket): Promise<void> {
+  private async onSocketGone(ws: WebSocket, code?: number): Promise<void> {
+    console.log(JSON.stringify({ event: "device_socket_closed", deviceId: this.deviceId, code: code ?? null }));
     if (this.ctx.getWebSockets().some((other) => other !== ws)) return; // replaced, not gone
     const row = this.row();
     if (!row) return;
     const now = Date.now();
     row.disconnected_at = now;
-    this.save(row);
+    if (code === 1000 || code === 1001) {
+      // The device closed on purpose, e.g. it shut down or changed its ID. It leaves its rooms,
+      // so viewers do not keep an offline tile for it. It joins them again when it reconnects.
+      const rooms = this.rooms(row);
+      this.resetPublication(row);
+      row.rooms = "[]";
+      row.offline_notified = 1;
+      this.save(row);
+      this.sql.exec("DELETE FROM watching_rooms");
+      await Promise.allSettled(rooms.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
+    } else {
+      this.save(row);
+    }
     await this.scheduleAlarm(now);
   }
 
@@ -392,6 +405,7 @@ export class Device extends DurableObject<Env> {
     const ws = this.socket();
     if (ws && now - this.lastSeen(ws) > this.config.deviceStaleMs) {
       // Half-open connection: the socket exists but pings stopped.
+      console.log(JSON.stringify({ event: "device_stale", deviceId: this.deviceId, silentMs: now - this.lastSeen(ws) }));
       closeSocket(ws, CLOSE_HEARTBEAT_TIMEOUT, "No ping received.");
       row.disconnected_at ??= now;
     }

@@ -15,13 +15,32 @@ export async function requestToken(workerUrl, publicKey, body) {
   return json;
 }
 
+/**
+ * Calls onTick every intervalMs from a dedicated worker. When a tab is hidden for a few
+ * minutes, browsers run its timers only once a minute, which is longer than the worker's
+ * 45 s presence window. Timers in a dedicated worker keep their pace.
+ */
+function startTicker(intervalMs, onTick) {
+  try {
+    const source = `setInterval(() => postMessage(0), ${intervalMs});`;
+    const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+    const worker = new Worker(url);
+    URL.revokeObjectURL(url);
+    worker.onmessage = onTick;
+    return () => worker.terminate();
+  } catch {
+    const timer = setInterval(onTick, intervalMs);
+    return () => clearInterval(timer);
+  }
+}
+
 /** Opens the socket and sends "ping" every 15 s. The server answers "pong". */
 export function openSocket(url, token) {
   const ws = new WebSocket(`${url}?access_token=${encodeURIComponent(token)}`);
-  const timer = setInterval(() => {
+  const stop = startTicker(PING_INTERVAL_MS, () => {
     if (ws.readyState === WebSocket.OPEN) ws.send("ping");
-  }, PING_INTERVAL_MS);
-  ws.addEventListener("close", () => clearInterval(timer));
+  });
+  ws.addEventListener("close", stop);
   return ws;
 }
 

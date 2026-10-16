@@ -172,7 +172,7 @@ describe("rooms", () => {
     for (const socket of [viewer, cam1]) socket.close();
   });
 
-  test("a device whose socket closes shows as offline after the grace period", async () => {
+  test("a device whose connection drops shows as offline after the grace period", async () => {
     mockSfu();
     const cam1 = await connect(await deviceToken("cam-1", ["lab-a"]));
     await cam1.next("joined");
@@ -181,7 +181,8 @@ describe("rooms", () => {
     await publish(cam1);
     await viewer.device("cam-1", "live");
 
-    cam1.close();
+    // A dropped connection, not a goodbye: 1000 and 1001 would make the device leave the room.
+    cam1.ws.close(3000, "network lost");
     const stub = env.DEVICES.getByName("cam-1");
     // Wait for the Device DO to see the close, then skip the grace period.
     await expect

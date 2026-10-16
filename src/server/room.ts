@@ -276,7 +276,9 @@ export class Room extends DurableObject<Env> {
     }
   }
 
-  override async webSocketClose(ws: WebSocket): Promise<void> {
+  override async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+    const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
+    console.log(JSON.stringify({ event: "viewer_socket_closed", room: this.ready ? this.roomId : null, viewerId: attachment?.viewerId ?? null, code }));
     await this.onSocketGone(ws);
   }
 
@@ -493,6 +495,7 @@ export class Room extends DurableObject<Env> {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws.readyState !== WebSocket.OPEN || now - this.lastSeen(ws) <= this.config.viewerStaleMs) continue;
       const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
+      console.log(JSON.stringify({ event: "viewer_stale", room: this.roomId, viewerId: attachment?.viewerId ?? null }));
       closeSocket(ws, CLOSE_HEARTBEAT_TIMEOUT, "No ping received.");
       if (attachment) {
         this.sql.exec(
@@ -585,13 +588,20 @@ export class Room extends DurableObject<Env> {
     if (!result.member) {
       this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
       this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
+      if (this.viewerCount() > 0) this.broadcast({ action: "members", message: { devices: this.memberInfos() } });
       return;
     }
+    const previous = this.sql
+      .exec<{ info: string }>("SELECT info FROM devices WHERE device_id = ?", deviceId)
+      .toArray()[0]?.info;
+    const info = JSON.stringify(result.info);
+    // Every viewer must see the same state, including changes found while renewing.
+    if (previous !== undefined && previous !== info) this.broadcast({ action: "device", message: result.info });
     this.sql.exec(
       `INSERT INTO devices (device_id, info, lease_renewed_at) VALUES (?, ?, ?)
        ON CONFLICT (device_id) DO UPDATE SET info = excluded.info, lease_renewed_at = excluded.lease_renewed_at`,
       deviceId,
-      JSON.stringify(result.info),
+      info,
       now,
     );
   }
