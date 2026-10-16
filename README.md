@@ -24,6 +24,8 @@ cp .dev.vars.example .dev.vars    # then fill it in
 npm run dev
 ```
 
+`npm run dev` listens on all network interfaces, so a device on your network can connect to `http://<your computer's IP>:8787`. Your firewall may ask you to allow it.
+
 In `.dev.vars`:
 
 - `REALTIME_SFU_APP_ID` and `REALTIME_SFU_BEARER_TOKEN`: from the Cloudflare dashboard, **Realtime > SFU**. Create an app just for development.
