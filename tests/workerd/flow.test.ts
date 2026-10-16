@@ -2,7 +2,15 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
-import { PUBLISH_TRACKS, connect, deviceToken, mockSfu, viewerToken, type TestSocket } from "./helpers";
+import {
+  PUBLISH_TRACKS,
+  connect,
+  deviceToken,
+  mockSfu,
+  publisherSessions,
+  viewerToken,
+  type TestSocket,
+} from "./helpers";
 
 /** Moves a Device DO timer into the past and runs its alarm. */
 async function expireDeviceTimer(deviceId: string, column: "linger_until" | "wake_deadline"): Promise<void> {
@@ -92,12 +100,15 @@ describe("watching", () => {
       { deviceId: "cam-1", trackName: "audio_track", mid: "101", generation: 1 },
     ]);
     // The viewer pulled from the device's session; it never sees that session ID.
+    const [publisher] = publisherSessions(calls);
     const pull = calls.filter((call) => call.path.endsWith("/tracks/new"))[1]!;
     expect(pull.body.tracks).toEqual([
-      { location: "remote", sessionId: "session-1", trackName: "video_track" },
-      { location: "remote", sessionId: "session-1", trackName: "audio_track" },
+      { location: "remote", sessionId: publisher, trackName: "video_track" },
+      { location: "remote", sessionId: publisher, trackName: "audio_track" },
     ]);
-    expect(JSON.stringify(viewer.messages)).not.toContain("session-1");
+    expect(JSON.stringify(viewer.messages)).not.toContain(publisher);
+    // One session for the device (made with the wake) and one for the viewer (made at join).
+    expect(calls.filter((call) => call.path.endsWith("/sessions/new"))).toHaveLength(2);
 
     viewer.send("leave");
     expect((await viewer.closed()).code).toBe(1000);
@@ -163,6 +174,24 @@ describe("watching", () => {
 
     await expireDeviceTimer("cam-1", "wake_deadline");
     expect(await viewer.device("cam-1", "sleeping")).toMatchObject({ lastError: "wake_timeout" });
+    viewer.close();
+    device.close();
+  });
+
+  test("an offer that finds the wake-time session expired publishes on a new session", async () => {
+    const calls = mockSfu({ expireFirstPublish: true });
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    const viewer = await connect(await viewerToken("v1", "lab-a"));
+    const { wakeId } = await device.next("wake");
+    await viewer.next("joined");
+
+    device.send("offer", { wakeId, sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    expect(await device.next("answer")).toMatchObject({ wakeId, generation: 1 });
+    const [expired, used] = publisherSessions(calls);
+    expect(used).toBeDefined();
+    expect(used).not.toBe(expired);
+    expect(device.has("error")).toBe(false);
     viewer.close();
     device.close();
   });

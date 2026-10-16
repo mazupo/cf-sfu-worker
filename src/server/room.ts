@@ -80,6 +80,8 @@ export class Room extends DurableObject<Env> {
   private readonly queue = new KeyedQueue();
   /** Tables exist only while the room has members or viewers. */
   private ready: boolean;
+  /** Receive sessions started at join time, by viewer_id. The first subscribe picks one up. */
+  private readonly earlySessions = new Map<string, Promise<string | null>>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -201,6 +203,11 @@ export class Room extends DurableObject<Env> {
         viewerId,
         now,
       );
+    }
+    // Devices are waking now. Create the receive session meanwhile, so the first subscribe
+    // needs one SFU call less.
+    if (!viewer?.sfu_session_id && !this.earlySessions.has(viewerId)) {
+      this.earlySessions.set(viewerId, new RealtimeSfu(this.env).createSession().catch(() => null));
     }
     if (wasEmpty) await this.watchAll(now);
 
@@ -370,14 +377,19 @@ export class Room extends DurableObject<Env> {
     const sfu = new RealtimeSfu(this.env);
     let sessionId = viewer.sfu_session_id;
     let sessionReset = false;
-    // The receive session is created on the first subscribe: an unused session can expire.
-    if (!sessionId) sessionId = await this.newSession(sfu, viewerId);
+    if (!sessionId) {
+      const early = this.earlySessions.get(viewerId);
+      this.earlySessions.delete(viewerId);
+      sessionId = (early && (await early)) || (await sfu.createSession());
+      this.sql.exec("UPDATE viewers SET sfu_session_id = ? WHERE viewer_id = ?", sessionId, viewerId);
+    }
     let result: TracksResponse;
     try {
       result = await sfu.addTracks(sessionId, remote);
     } catch (error) {
       if (!(error instanceof SfuError && error.sessionGone)) throw error;
-      // The session expired. The viewer has to start a new PeerConnection for the new one.
+      // The session expired, e.g. it was made at join time and nothing was live for a long
+      // time. The viewer has to start a new PeerConnection for the new one.
       this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
       sessionId = await this.newSession(sfu, viewerId);
       sessionReset = true;
@@ -646,6 +658,7 @@ export class Room extends DurableObject<Env> {
   }
 
   private async dropViewer(viewerId: string): Promise<void> {
+    this.earlySessions.delete(viewerId);
     const affected = new Set(this.subscriptions(viewerId).map((sub) => sub.deviceId));
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);

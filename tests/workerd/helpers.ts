@@ -151,10 +151,11 @@ export class TestSocket {
 export type SfuCall = { method: string; path: string; body: any };
 
 /** Fakes the Realtime SFU API and records every call. */
-export function mockSfu(options: { missingTrack?: string } = {}): SfuCall[] {
+export function mockSfu(options: { missingTrack?: string; expireFirstPublish?: boolean } = {}): SfuCall[] {
   const calls: SfuCall[] = [];
   let sessions = 0;
   let mids = 100;
+  let publishes = 0;
   const record = async (request: { method: string; url: string; text(): Promise<string>; headers: Headers }) => {
     const text = await request.text();
     const call = { method: request.method, path: new URL(request.url).pathname, body: text ? JSON.parse(text) : null };
@@ -172,6 +173,9 @@ export function mockSfu(options: { missingTrack?: string } = {}): SfuCall[] {
       const call = await record(request);
       const tracks = call.body.tracks as Array<{ location: string; mid?: string; trackName: string; sessionId?: string }>;
       if (tracks[0]?.location === "local") {
+        if (options.expireFirstPublish && publishes++ === 0) {
+          return HttpResponse.json({ errorCode: "session_error", errorDescription: "Session expired." }, { status: 410 });
+        }
         return HttpResponse.json({
           sessionDescription: { type: "answer", sdp: "v=0 publisher-answer" },
           tracks: tracks.map((track) => ({ mid: track.mid, trackName: track.trackName })),
@@ -206,6 +210,18 @@ export function mockSfu(options: { missingTrack?: string } = {}): SfuCall[] {
     }),
   );
   return calls;
+}
+
+/** The SFU session a call was made on, e.g. "session-2" for /sessions/session-2/tracks/new. */
+export function sessionOf(call: SfuCall): string {
+  return /\/sessions\/([^/]+)\//.exec(call.path)![1]!;
+}
+
+/** The session each device published on, by the order of the publish calls. */
+export function publisherSessions(calls: SfuCall[]): string[] {
+  return calls
+    .filter((call) => call.path.endsWith("/tracks/new") && call.body.tracks[0].location === "local")
+    .map(sessionOf);
 }
 
 export const PUBLISH_TRACKS = [

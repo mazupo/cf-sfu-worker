@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test } from "vitest";
 
-import { PUBLISH_TRACKS, connect, deviceToken, mockSfu, viewerToken } from "./helpers";
+import { PUBLISH_TRACKS, connect, deviceToken, mockSfu, publisherSessions, viewerToken } from "./helpers";
 
 async function publish(device: Awaited<ReturnType<typeof connect>>) {
   const { wakeId } = await device.next("wake");
@@ -43,7 +43,8 @@ describe("rooms", () => {
     // Both devices' tracks came through a single tracks/new call on the viewer's session.
     const pulls = calls.filter((call) => call.path.endsWith("/tracks/new") && call.body.tracks[0].location === "remote");
     expect(pulls).toHaveLength(1);
-    expect(pulls[0]!.body.tracks.map((track: { sessionId: string }) => track.sessionId)).toEqual(["session-1", "session-2"]);
+    expect(pulls[0]!.body.tracks.map((track: { sessionId: string }) => track.sessionId)).toEqual(publisherSessions(calls));
+    expect(calls.filter((call) => call.path.endsWith("/sessions/new"))).toHaveLength(3);
     for (const socket of [viewer, cam1, cam2]) socket.close();
   });
 

@@ -90,6 +90,8 @@ export class Device extends DurableObject<Env> {
   private readonly queue = new KeyedQueue();
   /** Tables exist from the first connection until the device is forgotten. */
   private ready: boolean;
+  /** The SFU session started together with `wake`, so the offer needs one SFU call instead of two. */
+  private earlySession: { wakeId: string; sessionId: Promise<string | null> } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -170,7 +172,7 @@ export class Device extends DurableObject<Env> {
     });
     for (const error of roomErrors) sendError(server, error);
 
-    await this.notifyRooms(now);
+    void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -242,12 +244,18 @@ export class Device extends DurableObject<Env> {
 
     try {
       const sfu = new RealtimeSfu(this.env);
-      const sessionId = await sfu.createSession();
-      const result = await sfu.addTracks(
-        sessionId,
-        tracks.map((track) => ({ location: "local" as const, mid: track.mid, trackName: track.trackName })),
-        { type: "offer", sdp },
-      );
+      const local = tracks.map((track) => ({ location: "local" as const, mid: track.mid, trackName: track.trackName }));
+      const early = await this.takeEarlySession(wakeId);
+      let sessionId = early ?? (await sfu.createSession());
+      let result;
+      try {
+        result = await sfu.addTracks(sessionId, local, { type: "offer", sdp });
+      } catch (error) {
+        // A session made at wake time can expire if the offer comes late. Start a new one.
+        if (!(early && error instanceof SfuError && error.sessionGone)) throw error;
+        sessionId = await sfu.createSession();
+        result = await sfu.addTracks(sessionId, local, { type: "offer", sdp });
+      }
       const failed = result.tracks?.find((track) => track.errorCode);
       if (failed) {
         throw new SfuError(failed.errorCode!, failed.errorDescription ?? `The SFU rejected ${failed.trackName}.`, 502);
@@ -276,7 +284,7 @@ export class Device extends DurableObject<Env> {
 
       send(ws, { action: "answer", message: { wakeId, generation: row.generation, sdp: result.sessionDescription.sdp } });
       if (!this.hasWatchers(now)) this.startLinger(now);
-      await this.notifyRooms(now);
+      void this.notifyRoomsSoon();
       await this.scheduleAlarm(now);
     } catch (error) {
       const code = error instanceof SfuError ? error.code : "publish_failed";
@@ -304,7 +312,7 @@ export class Device extends DurableObject<Env> {
     row.wake_attempts = 0;
     row.last_error = null;
     this.save(row);
-    await this.notifyRooms(now);
+    void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
   }
 
@@ -320,7 +328,7 @@ export class Device extends DurableObject<Env> {
     this.resetPublication(row);
     row.last_error = this.hasWatchers(now) ? "device_stopped" : null;
     this.save(row);
-    await this.notifyRooms(now);
+    void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
   }
 
@@ -343,7 +351,8 @@ export class Device extends DurableObject<Env> {
     const ws = this.socket();
     if (row.state === "sleeping" && ws && this.isOnline(now)) {
       this.startWake(ws, now);
-      await this.notifyRooms(now, roomId);
+      // The asking room gets the new state in the reply.
+      void this.notifyRoomsSoon(roomId);
     }
     await this.scheduleAlarm(now);
     return { member: true, info: this.info(now) };
@@ -476,7 +485,7 @@ export class Device extends DurableObject<Env> {
       changed = true;
     }
 
-    if (changed) await this.notifyRooms(now);
+    if (changed) await this.notifyRoomsSoon();
 
     row = this.row()!;
     if (!this.socket() && now - row.last_seen > DEVICE_RETENTION_MS) {
@@ -604,6 +613,18 @@ export class Device extends DurableObject<Env> {
     row.last_error = null;
     this.save(row);
     send(ws, { action: "wake", message: { wakeId: row.wake_id } });
+    // The device needs a moment to build its offer. Create the SFU session meanwhile.
+    this.earlySession = {
+      wakeId: row.wake_id,
+      sessionId: new RealtimeSfu(this.env).createSession().catch(() => null),
+    };
+  }
+
+  /** The session started with this wake, or null when there is none (a retry, or the object restarted). */
+  private async takeEarlySession(wakeId: string): Promise<string | null> {
+    const early = this.earlySession;
+    this.earlySession = null;
+    return early?.wakeId === wakeId ? early.sessionId : null;
   }
 
   private startLinger(now: number): void {
@@ -658,6 +679,17 @@ export class Device extends DurableObject<Env> {
       tracks: online && row.state === "live" ? (JSON.parse(row.tracks) as string[]) : [],
       lastError: row.last_error,
     };
+  }
+
+  /**
+   * Tells the watching rooms about the current state without holding up the caller, so the
+   * device can go on with its offer while the rooms update. Updates go out one at a time and each
+   * reads the state when it starts, so every room ends on the latest state.
+   */
+  private notifyRoomsSoon(exceptRoom?: string): Promise<void> {
+    return this.queue.run("notify", async () => {
+      if (this.ready) await this.notifyRooms(Date.now(), exceptRoom);
+    });
   }
 
   /** Tells every watching room about the current state, except the room that asked. */
