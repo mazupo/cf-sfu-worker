@@ -1,4 +1,4 @@
-import type { IceServer } from "../proto/cloudflare";
+import type { DataChannel, IceServer } from "../proto/cloudflare";
 
 const SFU_BASE = "https://rtc.live.cloudflare.com/v1";
 const REQUEST_TIMEOUT_MS = 10_000;
@@ -34,6 +34,34 @@ export type TracksResponse = {
   sessionDescription?: SessionDescription;
   tracks?: Array<{ mid?: string; trackName?: string; sessionId?: string; errorCode?: string; errorDescription?: string }>;
 };
+
+/** The device's channels: pi-webrtc's IPC channels. Every endpoint uses the same settings. */
+export const DATA_CHANNELS = [
+  { dataChannelName: "_lossy", ordered: false, maxRetransmits: 0 },
+  { dataChannelName: "_reliable", ordered: true },
+] as const;
+
+export type DataChannelObject = {
+  location: "local" | "remote";
+  dataChannelName: string;
+  sessionId?: string;
+  ordered?: boolean;
+  maxRetransmits?: number;
+  canReply?: boolean;
+};
+
+type DataChannelsResponse = {
+  dataChannels?: Array<{ id?: number; dataChannelName?: string; errorCode?: string; errorDescription?: string }>;
+};
+
+/** The device's two channels as the SFU sees them: published by the device, or pulled from it. */
+export function deviceChannels(location: "local" | "remote", deviceSession?: string, canReply?: boolean): DataChannelObject[] {
+  return DATA_CHANNELS.map((channel) => ({
+    location,
+    ...channel,
+    ...(location === "remote" ? { sessionId: deviceSession, canReply: canReply ?? false } : {}),
+  }));
+}
 
 /**
  * The Realtime SFU API. The bearer token is the app secret, so this client only ever runs
@@ -78,6 +106,56 @@ export class RealtimeSfu {
     return this.request<TracksResponse>("PUT", `/sessions/${encodeURIComponent(sessionId)}/tracks/close`, {
       force: true,
       tracks: mids.map((mid) => ({ mid })),
+    });
+  }
+
+  /** Asks for an offer that adds the data channel transport to the session. */
+  async establishDataChannels(sessionId: string): Promise<SessionDescription> {
+    const body = await this.request<TracksResponse>(
+      "POST",
+      `/sessions/${encodeURIComponent(sessionId)}/datachannels/establish`,
+      { dataChannel: { location: "remote", dataChannelName: "server-events" } },
+    );
+    if (body.sessionDescription?.type !== "offer") {
+      throw new SfuError("sfu_offer_missing", "The SFU did not offer a data channel transport.", 502);
+    }
+    return body.sessionDescription;
+  }
+
+  /** Publishes or pulls channels and returns their ids in this session, in request order. */
+  async addDataChannels(sessionId: string, channels: DataChannelObject[]): Promise<DataChannel[]> {
+    const body = await this.request<DataChannelsResponse>(
+      "POST",
+      `/sessions/${encodeURIComponent(sessionId)}/datachannels/new`,
+      { dataChannels: channels },
+    );
+    return channels.map((channel, index) => {
+      const item = body.dataChannels?.[index];
+      if (!item || item.errorCode || typeof item.id !== "number") {
+        throw new SfuError(
+          item?.errorCode ?? "sfu_data_channel_failed",
+          item?.errorDescription ?? `The SFU did not open ${channel.dataChannelName}.`,
+          502,
+        );
+      }
+      return { label: channel.dataChannelName, id: item.id };
+    });
+  }
+
+  /** Grants or revokes canReply on pulled channels. */
+  async updateDataChannels(sessionId: string, channels: DataChannelObject[]): Promise<void> {
+    const body = await this.request<DataChannelsResponse>(
+      "PUT",
+      `/sessions/${encodeURIComponent(sessionId)}/datachannels/update`,
+      { dataChannels: channels },
+    );
+    const failed = body.dataChannels?.find((item) => item.errorCode);
+    if (failed) throw new SfuError(failed.errorCode!, failed.errorDescription ?? "The SFU did not update a channel.", 502);
+  }
+
+  async closeDataChannels(sessionId: string, ids: number[]): Promise<void> {
+    await this.request("PUT", `/sessions/${encodeURIComponent(sessionId)}/datachannels/close`, {
+      dataChannels: ids.map((id) => ({ id })),
     });
   }
 

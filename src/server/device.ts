@@ -5,12 +5,15 @@ import {
   DeviceRequest,
   DeviceState,
   ErrorCode,
+  type DataChannel,
   type DeviceInfo,
   type PublishOffer,
   type SignalError,
+  type ViewerRef,
 } from "../proto/cloudflare";
 import { debugInfo, errorName, publishOfferSchema, stateName, type Claims } from "../shared/protocol";
 import {
+  CONTROL_CONFIRM_MS,
   DEVICE_RETENTION_MS,
   DISCONNECT_GRACE_MS,
   PRESENCE_CHECK_MS,
@@ -19,7 +22,7 @@ import {
   settings,
   type Settings,
 } from "./config";
-import { iceServers, RealtimeSfu, SfuError } from "./realtime";
+import { deviceChannels, iceServers, RealtimeSfu, SfuError } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
 import {
   KeyedQueue,
@@ -45,6 +48,8 @@ type DeviceRow = {
   wake_attempts: number;
   sfu_session_id: string | null;
   tracks: string;
+  /** The device's _lossy and _reliable, as DataChannel[] JSON. */
+  channels: string;
   rooms: string;
   linger_until: number | null;
   last_error: ErrorCode;
@@ -58,8 +63,19 @@ type SocketAttachment = { connectedAt: number };
 export type WatchResult = { member: boolean; info: DeviceInfo };
 
 export type ResolveResult =
-  | { ok: true; sessionId: string; generation: number; tracks: string[] }
+  | { ok: true; sessionId: string; generation: number; tracks: string[]; dataChannels: boolean; canReply: boolean }
   | { ok: false; code: ErrorCode; message: string };
+
+export type ControlResult = { ok: true } | { ok: false; code: ErrorCode; message: string };
+
+/** Who may send to the device through its data channels. Survives new publications. */
+type ControlState = {
+  controller: ViewerRef | null;
+  /** Handed control; has until `deadline` to confirm with control_ready. */
+  handover: (ViewerRef & { deadline: number }) | null;
+  /** In line, first one next. */
+  waiting: ViewerRef[];
+};
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS device (
@@ -70,6 +86,7 @@ const SCHEMA = `
     wake_attempts INTEGER NOT NULL,
     sfu_session_id TEXT,
     tracks TEXT NOT NULL,
+    channels TEXT NOT NULL,
     rooms TEXT NOT NULL,
     linger_until INTEGER,
     last_error INTEGER NOT NULL,
@@ -83,6 +100,11 @@ const SCHEMA = `
     subscribers INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   ) WITHOUT ROWID;
+  -- Who controls the device through its data channels, who takes over, who waits (one row).
+  CREATE TABLE IF NOT EXISTS control (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    state TEXT NOT NULL
+  );
   -- Access tokens are single use.
   CREATE TABLE IF NOT EXISTS used_tokens (
     jti TEXT PRIMARY KEY,
@@ -158,7 +180,8 @@ export class Device extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ connectedAt: now } satisfies SocketAttachment);
 
-    const roomErrors = await this.updateRooms(row, claims, now);
+    const { errors: roomErrors, left } = await this.updateRooms(row, claims, now);
+    if (left.length > 0) await this.queue.run("control", () => this.removeFromControl((ref) => left.includes(ref.room)));
     row = this.row()!;
 
     // Keep the publication only when the same publisher reconnects its socket: it sends the
@@ -185,6 +208,11 @@ export class Device extends DurableObject<Env> {
       },
     });
     for (const error of roomErrors) sendDevice(server, { error });
+    // A device that reconnects while publishing may have missed changes.
+    const channels = JSON.parse(row.channels) as DataChannel[];
+    if (channels.length > 0) sendDevice(server, { channels: { channels } });
+    const { controller } = this.control();
+    if (controller) sendDevice(server, { control: { controller } });
     if (this.hasWatchers(now) && row.state === SLEEPING) this.startWake(server, now);
 
     void this.notifyRoomsSoon();
@@ -231,6 +259,7 @@ export class Device extends DurableObject<Env> {
       row.offline_notified = 1;
       this.save(row);
       this.sql.exec("DELETE FROM watching_rooms");
+      await this.queue.run("control", () => this.removeFromControl(() => true));
       await Promise.allSettled(rooms.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
     } else {
       this.save(row);
@@ -244,7 +273,7 @@ export class Device extends DurableObject<Env> {
       this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "The offer needs sdp and tracks.", "offer");
       return;
     }
-    const { sdp, tracks } = parsed.data;
+    const { sdp, tracks, dataChannels } = parsed.data;
     // Any offer while waking or live will do, even one sent before the latest wake: it comes
     // from the same device, which uses only the reply to its last offer.
     const before = this.row();
@@ -297,12 +326,34 @@ export class Device extends DurableObject<Env> {
       if (!this.hasWatchers(now)) this.startLinger(now);
       void this.notifyRoomsSoon();
       await this.scheduleAlarm(now);
+      // The SFU answers this once the device's PeerConnection is connected. The device's
+      // ready waits behind it in the queue, so the device goes live with its channels.
+      if (dataChannels) await this.openChannels(ws, sessionId);
     } catch (error) {
       const code = error instanceof SfuError ? error.code : "publish_failed";
       const text = error instanceof Error ? error.message : "Publishing failed.";
       console.log(JSON.stringify({ event: "publish_failed", deviceId: this.deviceId, code }));
       this.fail(ws, ErrorCode.ERROR_CODE_SFU, `${code}: ${text}`, "offer");
     }
+  }
+
+  /** Publishes _lossy and _reliable on the device's session and sends their ids. */
+  private async openChannels(ws: WebSocket, sessionId: string): Promise<void> {
+    let channels: DataChannel[];
+    try {
+      channels = await new RealtimeSfu(this.env).addDataChannels(sessionId, deviceChannels("local"));
+    } catch (error) {
+      const code = error instanceof SfuError ? error.code : "data_channels_failed";
+      console.log(JSON.stringify({ event: "data_channels_failed", deviceId: this.deviceId, code }));
+      this.fail(ws, ErrorCode.ERROR_CODE_NO_DATA_CHANNELS, `${code}: the data channels did not open. Video still works.`, "offer");
+      return;
+    }
+    const row = this.row();
+    if (!row || row.sfu_session_id !== sessionId) return;
+    row.channels = JSON.stringify(channels);
+    this.save(row);
+    sendDevice(ws, { channels: { channels } });
+    if (row.state === LIVE) void this.notifyRoomsSoon();
   }
 
   private async onReady(ws: WebSocket): Promise<void> {
@@ -362,7 +413,7 @@ export class Device extends DurableObject<Env> {
   }
 
   /** Gives a room what it needs to pull this device's tracks, if the viewer limit allows. */
-  async resolve(roomId: string, subscribers: number): Promise<ResolveResult> {
+  async resolve(roomId: string, subscribers: number, viewerId?: string): Promise<ResolveResult> {
     const now = Date.now();
     const row = this.row();
     if (!row || !this.rooms(row).includes(roomId)) {
@@ -386,7 +437,73 @@ export class Device extends DurableObject<Env> {
       };
     }
     this.setWatching(roomId, subscribers, now);
-    return { ok: true, sessionId: row.sfu_session_id, generation: row.generation, tracks: JSON.parse(row.tracks) };
+    const { controller, handover } = this.control();
+    const me = viewerId ? { room: roomId, viewerId } : null;
+    return {
+      ok: true,
+      sessionId: row.sfu_session_id,
+      generation: row.generation,
+      tracks: JSON.parse(row.tracks),
+      dataChannels: (JSON.parse(row.channels) as DataChannel[]).length > 0,
+      canReply: me !== null && (sameViewer(controller, me) || sameViewer(handover, me)),
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Control: one viewer at a time can send to the device (the SFU's canReply)
+  // -------------------------------------------------------------------------
+
+  /** Controls the device if nobody does, or waits in line. */
+  async takeControl(roomId: string, viewerId: string): Promise<ControlResult> {
+    return this.queue.run("control", async () => {
+      const row = this.row();
+      if (!row || !this.rooms(row).includes(roomId)) {
+        return { ok: false, code: ErrorCode.ERROR_CODE_NOT_MEMBER, message: `${this.deviceId} is not in room ${roomId}.` };
+      }
+      const control = this.control();
+      const me = { room: roomId, viewerId };
+      if ([control.controller, control.handover, ...control.waiting].some((ref) => sameViewer(ref, me))) {
+        return { ok: true };
+      }
+      if (control.controller || control.handover) control.waiting.push(me);
+      else control.handover = { ...me, deadline: Date.now() + CONTROL_CONFIRM_MS };
+      await this.saveControl(control);
+      return { ok: true };
+    });
+  }
+
+  /** Gives up control, a takeover or a place in line. The first one waiting takes over. */
+  async releaseControl(roomId: string, viewerId: string): Promise<ControlResult> {
+    return this.queue.run("control", async () => {
+      const found = await this.removeFromControl((ref) => sameViewer(ref, { room: roomId, viewerId }));
+      if (found) return { ok: true };
+      return { ok: false, code: ErrorCode.ERROR_CODE_NOT_CONTROLLER, message: `You do not control or wait for ${this.deviceId}.` };
+    });
+  }
+
+  /** The viewer handed control has canReply and open channels, so the takeover is done. */
+  async confirmControl(roomId: string, viewerId: string): Promise<ControlResult> {
+    return this.queue.run("control", async () => {
+      if (!this.ready) {
+        return { ok: false, code: ErrorCode.ERROR_CODE_NOT_CONTROLLER, message: `${this.deviceId} is not being handed to you.` };
+      }
+      const control = this.control();
+      const me = { room: roomId, viewerId };
+      if (sameViewer(control.controller, me)) return { ok: true };
+      if (!sameViewer(control.handover, me)) {
+        return { ok: false, code: ErrorCode.ERROR_CODE_NOT_CONTROLLER, message: `${this.deviceId} is not being handed to you.` };
+      }
+      control.controller = me;
+      control.handover = null;
+      await this.saveControl(control);
+      return { ok: true };
+    });
+  }
+
+  /** The viewer closed the device's channels or left its room. */
+  async controlGone(roomId: string, viewerId: string): Promise<void> {
+    if (!this.ready) return;
+    await this.queue.run("control", () => this.removeFromControl((ref) => sameViewer(ref, { room: roomId, viewerId })));
   }
 
   async getInfo(): Promise<DeviceInfo> {
@@ -408,9 +525,11 @@ export class Device extends DurableObject<Env> {
             state: stateName(row.state),
             last_error: row.last_error ? errorName(row.last_error) : null,
             tracks: JSON.parse(row.tracks) as string[],
+            channels: JSON.parse(row.channels) as DataChannel[],
             rooms: this.rooms(row),
           }
         : null,
+      control: this.ready ? this.control() : null,
       watchingRooms: this.ready
         ? this.sql
             .exec<{ room_id: string; subscribers: number; expires_at: number }>("SELECT * FROM watching_rooms ORDER BY room_id")
@@ -490,6 +609,14 @@ export class Device extends DurableObject<Env> {
 
     if (changed) await this.notifyRoomsSoon();
 
+    const expired = await this.queue.run("control", () => this.expireHandover(now));
+    // Outside the control queue: the room may be waiting on this object for the same viewer.
+    if (expired) {
+      void this.env.ROOMS.getByName(expired.room)
+        .revokeControl(this.deviceId, expired.viewerId, true)
+        .catch(() => undefined);
+    }
+
     row = this.row()!;
     if (!this.socket() && now - row.last_seen > DEVICE_RETENTION_MS) {
       await Promise.allSettled(this.rooms(row).map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
@@ -521,6 +648,7 @@ export class Device extends DurableObject<Env> {
       wake_attempts: 0,
       sfu_session_id: null,
       tracks: "[]",
+      channels: "[]",
       rooms: "[]",
       linger_until: null,
       last_error: ErrorCode.ERROR_CODE_UNSPECIFIED,
@@ -535,14 +663,15 @@ export class Device extends DurableObject<Env> {
   private save(row: DeviceRow): void {
     this.sql.exec(
       `INSERT OR REPLACE INTO device (id, state, generation, wake_deadline, wake_attempts,
-         sfu_session_id, tracks, rooms, linger_until, last_error, last_seen, disconnected_at, offline_notified)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         sfu_session_id, tracks, channels, rooms, linger_until, last_error, last_seen, disconnected_at, offline_notified)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.state,
       row.generation,
       row.wake_deadline,
       row.wake_attempts,
       row.sfu_session_id,
       row.tracks,
+      row.channels,
       row.rooms,
       row.linger_until,
       row.last_error,
@@ -557,7 +686,7 @@ export class Device extends DurableObject<Env> {
   }
 
   /** Joins the rooms in the token and leaves the rooms that are no longer in it. */
-  private async updateRooms(row: DeviceRow, claims: Claims, now: number) {
+  private async updateRooms(row: DeviceRow, claims: Claims, now: number): Promise<{ errors: SignalError[]; left: string[] }> {
     const wanted = [...new Set(claims.grant.rooms)];
     const previous = this.rooms(row);
     const errors: SignalError[] = [];
@@ -584,7 +713,7 @@ export class Device extends DurableObject<Env> {
 
     row.rooms = JSON.stringify(joined);
     this.save(row);
-    return errors;
+    return { errors, left };
   }
 
   private setWatching(roomId: string, subscribers: number, now: number): void {
@@ -645,6 +774,7 @@ export class Device extends DurableObject<Env> {
     row.wake_attempts = 0;
     row.sfu_session_id = null;
     row.tracks = "[]";
+    row.channels = "[]";
     row.linger_until = null;
     this.earlySession = null;
   }
@@ -678,16 +808,88 @@ export class Device extends DurableObject<Env> {
         generation: 0,
         tracks: [],
         lastError: ErrorCode.ERROR_CODE_UNSPECIFIED,
+        dataChannels: false,
+        controller: undefined,
+        handover: undefined,
+        waiting: [],
       };
     }
     const online = this.isOnline(now) || (row.disconnected_at !== null && !this.disconnectGraceOver(row, now));
+    const live = online && row.state === LIVE;
+    const control = this.control();
     return {
       deviceId: this.deviceId,
       state: online ? row.state : DeviceState.DEVICE_STATE_OFFLINE,
       generation: row.generation,
-      tracks: online && row.state === LIVE ? (JSON.parse(row.tracks) as string[]) : [],
+      tracks: live ? (JSON.parse(row.tracks) as string[]) : [],
       lastError: row.last_error,
+      dataChannels: live && (JSON.parse(row.channels) as DataChannel[]).length > 0,
+      controller: control.controller ?? undefined,
+      handover: control.handover ? { room: control.handover.room, viewerId: control.handover.viewerId } : undefined,
+      waiting: control.waiting,
     };
+  }
+
+  private control(): ControlState {
+    const state = this.sql.exec<{ state: string }>("SELECT state FROM control WHERE id = 1").toArray()[0]?.state;
+    return state ? (JSON.parse(state) as ControlState) : { controller: null, handover: null, waiting: [] };
+  }
+
+  /**
+   * Stores the control state, tells the device when the controller changed, and tells the rooms.
+   * A new handover asks the viewer's room to grant canReply, outside the control queue.
+   */
+  private async saveControl(control: ControlState): Promise<void> {
+    const before = this.control();
+    this.sql.exec("INSERT OR REPLACE INTO control (id, state) VALUES (1, ?)", JSON.stringify(control));
+    if (!sameViewer(before.controller, control.controller) && (before.controller || control.controller)) {
+      console.log(JSON.stringify({ event: "control_changed", deviceId: this.deviceId, controller: control.controller }));
+      const ws = this.socket();
+      if (ws) sendDevice(ws, { control: { controller: control.controller ?? undefined } });
+    }
+    if (control.handover && !sameViewer(before.handover, control.handover)) void this.offerControl(control.handover);
+    void this.notifyRoomsSoon();
+    await this.scheduleAlarm(Date.now());
+  }
+
+  /** Takes matching viewers out of the control state. The first one waiting takes over if needed. */
+  private async removeFromControl(match: (ref: ViewerRef) => boolean): Promise<boolean> {
+    if (!this.ready) return false;
+    const control = this.control();
+    const before = JSON.stringify(control);
+    control.waiting = control.waiting.filter((ref) => !match(ref));
+    if (control.controller && match(control.controller)) control.controller = null;
+    if (control.handover && match(control.handover)) control.handover = null;
+    if (JSON.stringify(control) === before) return false;
+    if (!control.controller && !control.handover) this.handOverToNext(control);
+    await this.saveControl(control);
+    return true;
+  }
+
+  private handOverToNext(control: ControlState): void {
+    const next = control.waiting.shift();
+    if (next) control.handover = { ...next, deadline: Date.now() + CONTROL_CONFIRM_MS };
+  }
+
+  /** Asks the viewer's room to grant canReply. A viewer that cannot take it is skipped at once. */
+  private async offerControl(to: ViewerRef): Promise<void> {
+    const granted = await this.env.ROOMS.getByName(to.room)
+      .grantControl(this.deviceId, to.viewerId)
+      .catch(() => false);
+    if (granted) return;
+    await this.queue.run("control", () => this.removeFromControl((ref) => sameViewer(ref, to)));
+  }
+
+  /** A handover that was not confirmed in time goes to the next one waiting. Returns who timed out. */
+  private async expireHandover(now: number): Promise<ViewerRef | null> {
+    const control = this.control();
+    const handover = control.handover;
+    if (!handover || handover.deadline > now) return null;
+    console.log(JSON.stringify({ event: "control_timeout", deviceId: this.deviceId, viewer: handover }));
+    control.handover = null;
+    this.handOverToNext(control);
+    await this.saveControl(control);
+    return { room: handover.room, viewerId: handover.viewerId };
   }
 
   /**
@@ -721,6 +923,8 @@ export class Device extends DurableObject<Env> {
     const candidates: number[] = [];
     if (row.wake_deadline !== null) candidates.push(row.wake_deadline);
     if (row.linger_until !== null) candidates.push(row.linger_until);
+    const { handover } = this.control();
+    if (handover) candidates.push(handover.deadline);
     if (this.hasWatchers(now)) {
       // Check again when the last ping turns stale, so a silent device shows offline about
       // DEVICE_STALE_SECONDS after its last ping instead of up to a full check interval later.
@@ -744,4 +948,8 @@ export class Device extends DurableObject<Env> {
     }
     await this.ctx.storage.setAlarm(Math.max(Math.min(...candidates), now + 1000));
   }
+}
+
+function sameViewer(a: ViewerRef | null | undefined, b: ViewerRef | null | undefined): boolean {
+  return !!a && !!b && a.room === b.room && a.viewerId === b.viewerId;
 }

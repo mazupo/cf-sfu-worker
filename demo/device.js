@@ -1,16 +1,21 @@
 // Demo device: waits on the socket, publishes after "wake", stops after "sleep".
-// This is what pi-webrtc does on a real device.
+// This is what pi-webrtc does on a real device. With Enable IPC it also opens _lossy and
+// _reliable, like pi-webrtc's --enable-ipc.
 import {
   CLOSE_REPLACED,
   DeviceState,
   ErrorCode,
   backoff,
   createLog,
+  decodeIpc,
   deviceProtocol as protocol,
+  encodeIpc,
+  openChannel,
   openSocket,
   persistForm,
   requestToken,
   stateName,
+  viewerName,
 } from "./common.js";
 import { startDebugPanel } from "./debug.js";
 
@@ -19,6 +24,11 @@ const connectButton = document.getElementById("connect");
 const disconnectButton = document.getElementById("disconnect");
 const statusEl = document.getElementById("status");
 const preview = document.getElementById("preview");
+const ipcInput = document.getElementById("ipc");
+const ipcPanel = document.getElementById("ipc-panel");
+const ipcControl = document.getElementById("ipc-controller");
+const ipcForm = document.getElementById("ipc-form");
+const ipcLog = document.getElementById("ipc-log");
 const log = createLog(document.getElementById("log"));
 
 document.getElementById("worker-url").value = location.origin;
@@ -42,6 +52,10 @@ let offered = false;
 let stopped = true;
 let attempt = 0;
 let stopPattern = null;
+/** This connection publishes data channels. Fixed until the next connect. */
+let ipc = false;
+const channels = new Map(); // label -> RTCDataChannel
+let controller = null; // { room, viewerId } of the viewer that can send to this device
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -53,9 +67,12 @@ async function connect() {
   dropSocket();
   const seq = ++connectSeq;
   const data = new FormData(form);
+  if (stopped) ipc = ipcInput.checked;
   stopped = false;
   connectButton.disabled = true;
   disconnectButton.disabled = false;
+  ipcInput.disabled = true;
+  ipcPanel.hidden = !ipc;
   const rooms = String(data.get("rooms")).split(",").map((room) => room.trim()).filter(Boolean);
   try {
     // While publishing, send the generation of our answer so a reconnect keeps the stream.
@@ -94,8 +111,11 @@ function disconnect() {
   reconnectTimer = null;
   dropSocket();
   stopPublishing();
+  controller = null;
   connectButton.disabled = false;
   disconnectButton.disabled = true;
+  ipcInput.disabled = false;
+  ipcPanel.hidden = true;
   setStatus("Disconnected.");
 }
 
@@ -156,8 +176,17 @@ async function handle(frame) {
       stopPublishing();
       setStatus("Sleeping. Nobody is watching.");
       break;
+    case "channels":
+      if (pc && generation && unanswered === 0) openChannels(message.channels);
+      break;
+    case "control":
+      controller = message.controller ?? null;
+      ipcLine("note", "", controller ? `${viewerName(controller)} controls this device` : "Nobody controls this device");
+      renderIpc();
+      break;
     case "error":
-      if (message.request === "offer") {
+      // Data channels that did not open leave the video running, and come after the answer.
+      if (message.request === "offer" && message.code !== ErrorCode.ERROR_CODE_NO_DATA_CHANNELS) {
         unanswered = Math.max(0, unanswered - 1);
         if (!offered || unanswered > 0) break;
         if (message.code === ErrorCode.ERROR_CODE_WAKE_STALE) {
@@ -190,6 +219,8 @@ async function startPublishing() {
   const peer = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
   pc = peer;
   for (const track of stream.getTracks()) peer.addTransceiver(track, { direction: "sendonly" });
+  // Any channel puts an m=application section in the offer. The worker sends the real ids.
+  if (ipc) peer.createDataChannel("server-events", { negotiated: true, id: 0 });
   peer.addEventListener("connectionstatechange", () => {
     if (peer !== pc) return;
     log(`peer ${peer.connectionState}`);
@@ -209,13 +240,49 @@ async function startPublishing() {
   if (publication !== mine || socket?.readyState !== WebSocket.OPEN) return;
   unanswered += 1;
   offered = true;
-  protocol.send(socket, "offer", { sdp: offer.sdp, tracks });
+  protocol.send(socket, "offer", { sdp: offer.sdp, tracks, dataChannels: ipc });
+}
+
+/** Opens _lossy and _reliable with the ids the worker sent. Both send and receive. */
+function openChannels(list) {
+  for (const spec of list) {
+    const current = channels.get(spec.label);
+    if (current?.id === spec.id && current.readyState !== "closed") continue;
+    current?.close();
+    const channel = openChannel(pc, spec);
+    // Only the viewer in control can send here, so a message comes from the controller.
+    channel.addEventListener("message", (event) =>
+      ipcLine("in", spec.label, `${decodeIpc(event.data)}${controller ? `  (${viewerName(controller)})` : ""}`),
+    );
+    channel.addEventListener("open", renderIpc);
+    channel.addEventListener("close", renderIpc);
+    channels.set(spec.label, channel);
+  }
+  renderIpc();
+}
+
+function renderIpc() {
+  ipcControl.textContent = controller ? `Controlled by ${viewerName(controller)}` : "Nobody controls this device.";
+  const open = channels.get("_reliable")?.readyState === "open";
+  for (const element of ipcForm.elements) element.disabled = !open;
+}
+
+function ipcLine(direction, label, text) {
+  const item = document.createElement("li");
+  item.className = direction;
+  const arrow = direction === "out" ? "→" : direction === "in" ? "←" : "·";
+  item.textContent = `${new Date().toLocaleTimeString()} ${arrow} ${label ? `${label.slice(1)} ` : ""}${text}`;
+  ipcLog.prepend(item);
+  while (ipcLog.children.length > 100) ipcLog.lastElementChild.remove();
 }
 
 function stopPublishing() {
   publication += 1;
   generation = 0;
   offered = false;
+  for (const channel of channels.values()) channel.close();
+  channels.clear();
+  renderIpc();
   pc?.close();
   pc = null;
   stopPattern?.();
@@ -270,6 +337,18 @@ form.addEventListener("submit", (event) => {
   connect();
 });
 disconnectButton.addEventListener("click", disconnect);
+ipcForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const label = ipcForm.elements.label.value;
+  const text = ipcForm.elements.text.value;
+  const channel = channels.get(label);
+  if (!text || channel?.readyState !== "open") return;
+  // The SFU copies it to every viewer that opened this device's channels.
+  channel.send(encodeIpc(text));
+  ipcLine("out", label, text);
+  ipcForm.elements.text.value = "";
+});
+renderIpc();
 
 startDebugPanel({
   panel: document.getElementById("debug-panel"),

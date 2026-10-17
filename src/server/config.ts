@@ -22,6 +22,8 @@ export const DISCONNECT_GRACE_MS = 10_000;
 export const DEVICE_RETENTION_MS = 30 * 24 * 60 * 60_000;
 /** How many times a wake is sent before the device is marked as not responding. */
 export const WAKE_ATTEMPTS = 2;
+/** A viewer handed control of a device has this long to confirm with control_ready. */
+export const CONTROL_CONFIRM_MS = 5_000;
 
 export function settings(env: Env): Settings {
   const seconds = (value: unknown, fallback: number) => positive(value, fallback) * 1000;

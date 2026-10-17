@@ -5,16 +5,28 @@ import {
   DeviceState,
   ErrorCode,
   ViewerRequest,
+  type ControlReady,
+  type DataChannel,
+  type DataSubscription,
   type DeviceInfo,
+  type ReleaseControl,
   type Subscribe,
   type SubscribeAnswer,
+  type Subscribed,
   type Subscription,
+  type TakeControl,
   type Unsubscribe,
   type ViewerResponse,
 } from "../proto/cloudflare";
-import { debugInfo, subscribeAnswerSchema, subscribeSchema, unsubscribeSchema } from "../shared/protocol";
+import {
+  debugInfo,
+  deviceIdMessageSchema,
+  subscribeAnswerSchema,
+  subscribeSchema,
+  unsubscribeSchema,
+} from "../shared/protocol";
 import { PRESENCE_CHECK_MS, WATCH_RENEW_MS, settings, type Settings } from "./config";
-import { iceServers, RealtimeSfu, SfuError, type TrackObject, type TracksResponse } from "./realtime";
+import { deviceChannels, iceServers, RealtimeSfu, SfuError, type TrackObject, type TracksResponse } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
 import {
   KeyedQueue,
@@ -29,6 +41,11 @@ import {
 /** A viewer that sends leave gets a normal close. */
 const CLOSE_LEFT = 1000;
 
+/** The data channel transport of a viewer's session. */
+const DATA_NONE = 0;
+const DATA_OFFERED = 1;
+const DATA_READY = 2;
+
 type ViewerRow = {
   viewer_id: string;
   sfu_session_id: string | null;
@@ -36,6 +53,19 @@ type ViewerRow = {
   pending_offer: string | null;
   created_at: number;
   socket_closed_at: number | null;
+  /** The token asked for data_channels. */
+  data_channels: number;
+  data_transport: typeof DATA_NONE | typeof DATA_OFFERED | typeof DATA_READY;
+};
+
+type DataSubscriptionRow = {
+  viewer_id: string;
+  device_id: string;
+  generation: number;
+  /** The device's session the channels were pulled from, needed to change canReply. */
+  device_session: string;
+  channels: string;
+  can_reply: number;
 };
 
 type SubscriptionRow = {
@@ -67,7 +97,9 @@ const SCHEMA = `
     negotiating INTEGER NOT NULL,
     pending_offer TEXT,
     created_at INTEGER NOT NULL,
-    socket_closed_at INTEGER
+    socket_closed_at INTEGER,
+    data_channels INTEGER NOT NULL,
+    data_transport INTEGER NOT NULL
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS subscriptions (
     viewer_id TEXT NOT NULL,
@@ -76,6 +108,16 @@ const SCHEMA = `
     track_name TEXT NOT NULL,
     generation INTEGER NOT NULL,
     PRIMARY KEY (viewer_id, mid)
+  ) WITHOUT ROWID;
+  -- Devices whose _lossy and _reliable a viewer pulled into its session.
+  CREATE TABLE IF NOT EXISTS data_subscriptions (
+    viewer_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    device_session TEXT NOT NULL,
+    channels TEXT NOT NULL,
+    can_reply INTEGER NOT NULL,
+    PRIMARY KEY (viewer_id, device_id)
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS used_tokens (
     jti TEXT PRIMARY KEY,
@@ -158,10 +200,46 @@ export class Room extends DurableObject<Env> {
 
   async removeMember(deviceId: string): Promise<void> {
     if (!this.ready) return;
-    this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
-    this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
+    this.forgetDevice(deviceId);
     if (this.viewerCount() > 0) this.broadcast({ members: { devices: this.memberInfos() } });
     await this.deleteIfEmpty();
+  }
+
+  /** The device hands its control to this viewer. Returns false when the viewer cannot take it. */
+  async grantControl(deviceId: string, viewerId: string): Promise<boolean> {
+    if (!this.ready) return false;
+    return this.queue.run(viewerId, async () => {
+      const sub = this.dataSubscription(viewerId, deviceId);
+      if (!this.viewer(viewerId) || !sub) return false;
+      try {
+        await this.setCanReply(viewerId, sub, true);
+        return true;
+      } catch (error) {
+        const code = error instanceof SfuError ? error.code : "internal";
+        console.log(JSON.stringify({ event: "grant_control_failed", room: this.roomId, deviceId, viewerId, code }));
+        return false;
+      }
+    });
+  }
+
+  /** Takes canReply back, e.g. when the viewer did not confirm control in time. */
+  async revokeControl(deviceId: string, viewerId: string, timedOut: boolean): Promise<void> {
+    if (!this.ready) return;
+    await this.queue.run(viewerId, async () => {
+      const sub = this.dataSubscription(viewerId, deviceId);
+      if (!sub) return;
+      if (sub.can_reply) await this.setCanReply(viewerId, sub, false).catch(() => undefined);
+      if (timedOut) {
+        this.sendTo(viewerId, {
+          error: signalError({
+            code: ErrorCode.ERROR_CODE_CONTROL_TIMEOUT,
+            message: `You did not confirm control of ${deviceId} in time. Take control again.`,
+            request: "control_ready",
+            deviceId,
+          }),
+        });
+      }
+    });
   }
 
   /** Returns whether this room still wants updates from the device. */
@@ -216,10 +294,13 @@ export class Room extends DurableObject<Env> {
       this.sql.exec("UPDATE viewers SET socket_closed_at = NULL WHERE viewer_id = ?", viewerId);
     } else {
       this.sql.exec(
-        `INSERT INTO viewers (viewer_id, sfu_session_id, negotiating, pending_offer, created_at, socket_closed_at)
-         VALUES (?, NULL, 0, NULL, ?, NULL)`,
+        `INSERT INTO viewers (viewer_id, sfu_session_id, negotiating, pending_offer, created_at, socket_closed_at,
+           data_channels, data_transport)
+         VALUES (?, NULL, 0, NULL, ?, NULL, ?, ?)`,
         viewerId,
         now,
+        claims.grant.dataChannels ? 1 : 0,
+        DATA_NONE,
       );
     }
     // Devices are waking now. Create the receive session meanwhile, so the first subscribe
@@ -242,6 +323,7 @@ export class Room extends DurableObject<Env> {
         iceServers: await iceServers(this.env),
         devices: this.memberInfos(),
         subscriptions: resumed ? this.subscriptions(viewerId) : [],
+        data: resumed ? this.dataSubscriptions(viewerId) : [],
       },
     });
     // A viewer that dropped while an offer was pending gets the same offer again.
@@ -249,6 +331,12 @@ export class Room extends DurableObject<Env> {
       sendViewer(server, {
         offer: { sdp: viewer.pending_offer, tracks: this.subscriptions(viewerId), sessionReset: false },
       });
+    }
+    // A viewer with data channels gets the transport offer right away, so its PeerConnection
+    // connects while the devices wake.
+    const current = this.viewer(viewerId)!;
+    if (current.data_channels && current.data_transport === DATA_NONE && !current.negotiating) {
+      void this.queue.run(viewerId, () => this.establishData(server, viewerId));
     }
     await this.scheduleAlarm(now);
     return new Response(null, { status: 101, webSocket: client });
@@ -280,7 +368,7 @@ export class Room extends DurableObject<Env> {
           this.fail(ws, sfu ? ErrorCode.ERROR_CODE_SFU : ErrorCode.ERROR_CODE_INTERNAL, message, name);
         }
       });
-    const { subscribe, answer, unsubscribe, leave } = request;
+    const { subscribe, answer, unsubscribe, leave, takeControl, releaseControl, controlReady } = request;
     if (subscribe) {
       await run(() => this.onSubscribe(ws, viewerId, subscribe));
     } else if (answer) {
@@ -292,6 +380,12 @@ export class Room extends DurableObject<Env> {
         await this.dropViewer(viewerId);
         closeSocket(ws, CLOSE_LEFT, "Left the room.");
       });
+    } else if (takeControl) {
+      await run(() => this.onTakeControl(ws, viewerId, takeControl));
+    } else if (releaseControl) {
+      await run(() => this.onReleaseControl(ws, viewerId, releaseControl));
+    } else if (controlReady) {
+      await run(() => this.onControlReady(ws, viewerId, controlReady));
     }
   }
 
@@ -322,12 +416,18 @@ export class Room extends DurableObject<Env> {
   private async onSubscribe(ws: WebSocket, viewerId: string, message: Subscribe): Promise<void> {
     const parsed = subscribeSchema.safeParse(message);
     if (!parsed.success) {
-      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "subscribe needs tracks [{deviceId, trackName}].", "subscribe");
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "subscribe needs tracks [{deviceId, trackName}] or data [deviceId].", "subscribe");
       return;
     }
     const viewer = this.viewer(viewerId)!;
     if (viewer.negotiating) {
       this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Send the answer for the last offer first.", "subscribe");
+      return;
+    }
+    // Data channels need no SDP, so they go first and the media offer comes last.
+    if (parsed.data.data.length > 0) await this.subscribeData(ws, viewer, parsed.data.data);
+    if (parsed.data.tracks.length === 0) {
+      sendViewer(ws, { subscribed: this.subscribed(viewerId) });
       return;
     }
 
@@ -349,8 +449,7 @@ export class Room extends DurableObject<Env> {
     const remote: TrackObject[] = [];
     const wanted: Array<{ deviceId: string; trackName: string; generation: number }> = [];
     for (const [deviceId, names] of byDevice) {
-      const subscribed = current.some((sub) => sub.deviceId === deviceId);
-      const count = this.subscriberCount(deviceId) + (subscribed ? 0 : 1);
+      const count = this.subscriberCount(deviceId) + (this.isSubscribedTo(viewerId, deviceId) ? 0 : 1);
       const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, count);
       if (!resolved.ok) {
         this.failTrack(ws, {
@@ -380,7 +479,7 @@ export class Room extends DurableObject<Env> {
       }
     }
     if (remote.length === 0) {
-      sendViewer(ws, { subscribed: { tracks: this.subscriptions(viewerId) } });
+      sendViewer(ws, { subscribed: this.subscribed(viewerId) });
       return;
     }
 
@@ -401,6 +500,8 @@ export class Room extends DurableObject<Env> {
       // The session expired, e.g. it was made at join time and nothing was live for a long
       // time. The viewer has to start a new PeerConnection for the new one.
       this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
+      await this.dropData(viewerId);
+      this.sql.exec("UPDATE viewers SET data_transport = ? WHERE viewer_id = ?", DATA_NONE, viewerId);
       sessionId = await this.newSession(sfu, viewerId);
       sessionReset = true;
       result = await sfu.addTracks(sessionId, remote);
@@ -445,14 +546,194 @@ export class Room extends DurableObject<Env> {
       return;
     }
     await new RealtimeSfu(this.env).renegotiate(viewer.sfu_session_id, parsed.data.sdp);
-    this.sql.exec("UPDATE viewers SET negotiating = 0, pending_offer = NULL WHERE viewer_id = ?", viewerId);
-    sendViewer(ws, { subscribed: { tracks: this.subscriptions(viewerId) } });
+    this.sql.exec(
+      "UPDATE viewers SET negotiating = 0, pending_offer = NULL, data_transport = ? WHERE viewer_id = ?",
+      viewer.data_transport === DATA_OFFERED ? DATA_READY : viewer.data_transport,
+      viewerId,
+    );
+    sendViewer(ws, { subscribed: this.subscribed(viewerId) });
+    // A new session (after an expired one) needs the data channel transport again.
+    await this.establishData(ws, viewerId);
+  }
+
+  /** Adds the data channel transport to the viewer's session and sends the SFU's offer. */
+  private async establishData(ws: WebSocket, viewerId: string): Promise<void> {
+    const viewer = this.viewer(viewerId);
+    if (!viewer?.data_channels || viewer.data_transport !== DATA_NONE || viewer.negotiating) return;
+    const sfu = new RealtimeSfu(this.env);
+    try {
+      let sessionId = viewer.sfu_session_id;
+      if (!sessionId) {
+        const early = this.earlySessions.get(viewerId);
+        this.earlySessions.delete(viewerId);
+        sessionId = (early && (await early)) || (await sfu.createSession());
+        this.sql.exec("UPDATE viewers SET sfu_session_id = ? WHERE viewer_id = ?", sessionId, viewerId);
+      }
+      const offer = await sfu.establishDataChannels(sessionId);
+      this.sql.exec(
+        "UPDATE viewers SET negotiating = 1, pending_offer = ?, data_transport = ? WHERE viewer_id = ?",
+        offer.sdp,
+        DATA_OFFERED,
+        viewerId,
+      );
+      sendViewer(ws, { offer: { sdp: offer.sdp, tracks: this.subscriptions(viewerId), sessionReset: false } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "The data channels could not be set up.";
+      console.log(JSON.stringify({ event: "establish_failed", room: this.roomId, viewerId, code: error instanceof SfuError ? error.code : "internal" }));
+      this.fail(ws, ErrorCode.ERROR_CODE_SFU, `Data channels: ${message}`, "subscribe");
+    }
+  }
+
+  /** Pulls each device's _lossy and _reliable into the viewer's session. No SDP needed. */
+  private async subscribeData(ws: WebSocket, viewer: ViewerRow, deviceIds: string[]): Promise<void> {
+    const viewerId = viewer.viewer_id;
+    if (!viewer.data_channels) {
+      this.fail(ws, ErrorCode.ERROR_CODE_DATA_CHANNELS_OFF, "Ask for data_channels in the token to open data channels.", "subscribe");
+      return;
+    }
+    const sessionId = viewer.sfu_session_id;
+    if (viewer.data_transport !== DATA_READY || !sessionId) {
+      this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Answer the data channel offer first.", "subscribe");
+      return;
+    }
+    const sfu = new RealtimeSfu(this.env);
+    for (const deviceId of new Set(deviceIds)) {
+      if (!this.isMember(deviceId)) {
+        this.failTrack(ws, { code: ErrorCode.ERROR_CODE_NOT_MEMBER, message: `${deviceId} is not in this room.`, deviceId });
+        continue;
+      }
+      const count = this.subscriberCount(deviceId) + (this.isSubscribedTo(viewerId, deviceId) ? 0 : 1);
+      const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, count, viewerId);
+      if (!resolved.ok) {
+        this.failTrack(ws, {
+          code: resolved.code,
+          message: resolved.message,
+          deviceId,
+          retryable: resolved.code === ErrorCode.ERROR_CODE_NOT_LIVE,
+        });
+        continue;
+      }
+      if (!resolved.dataChannels) {
+        this.failTrack(ws, { code: ErrorCode.ERROR_CODE_NO_DATA_CHANNELS, message: `${deviceId} has no data channels.`, deviceId });
+        continue;
+      }
+      const current = this.dataSubscription(viewerId, deviceId);
+      if (current?.generation === resolved.generation) continue;
+      // The device published again: its old channels went with its old session.
+      if (current) await this.closeData(sfu, sessionId, current);
+      try {
+        const channels = await sfu.addDataChannels(sessionId, deviceChannels("remote", resolved.sessionId, resolved.canReply));
+        this.sql.exec(
+          `INSERT OR REPLACE INTO data_subscriptions (viewer_id, device_id, generation, device_session, channels, can_reply)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          viewerId,
+          deviceId,
+          resolved.generation,
+          resolved.sessionId,
+          JSON.stringify(channels),
+          resolved.canReply ? 1 : 0,
+        );
+      } catch (error) {
+        this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ? AND device_id = ?", viewerId, deviceId);
+        this.failTrack(ws, {
+          code: ErrorCode.ERROR_CODE_SFU,
+          message: error instanceof Error ? error.message : `Could not open ${deviceId}'s data channels.`,
+          deviceId,
+          retryable: true,
+        });
+      }
+    }
+  }
+
+  /** Closes the viewer's channels to these devices. A controller gives up its control. */
+  private async unsubscribeData(viewer: ViewerRow, deviceIds: string[]): Promise<void> {
+    const sfu = new RealtimeSfu(this.env);
+    for (const deviceId of new Set(deviceIds)) {
+      const sub = this.dataSubscription(viewer.viewer_id, deviceId);
+      if (!sub) continue;
+      if (viewer.sfu_session_id) await this.closeData(sfu, viewer.sfu_session_id, sub);
+      this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ? AND device_id = ?", viewer.viewer_id, deviceId);
+      await this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewer.viewer_id).catch(() => undefined);
+    }
+    await this.updateCounts(new Set(deviceIds));
+  }
+
+  private async closeData(sfu: RealtimeSfu, sessionId: string, sub: DataSubscriptionRow): Promise<void> {
+    const ids = (JSON.parse(sub.channels) as DataChannel[]).map((channel) => channel.id);
+    await sfu.closeDataChannels(sessionId, ids).catch(() => undefined);
+  }
+
+  private async onTakeControl(ws: WebSocket, viewerId: string, message: TakeControl): Promise<void> {
+    const parsed = deviceIdMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "take_control needs a deviceId.", "take_control");
+      return;
+    }
+    const { deviceId } = parsed.data;
+    if (!this.viewer(viewerId)!.data_channels) {
+      this.failControl(ws, ErrorCode.ERROR_CODE_DATA_CHANNELS_OFF, "Ask for data_channels in the token to take control.", deviceId, "take_control");
+      return;
+    }
+    if (!this.dataSubscription(viewerId, deviceId)) {
+      this.failControl(ws, ErrorCode.ERROR_CODE_NO_DATA_CHANNELS, `Open ${deviceId}'s data channels first.`, deviceId, "take_control");
+      return;
+    }
+    const result = await this.env.DEVICES.getByName(deviceId).takeControl(this.roomId, viewerId);
+    if (!result.ok) this.failControl(ws, result.code, result.message, deviceId, "take_control");
+  }
+
+  private async onReleaseControl(ws: WebSocket, viewerId: string, message: ReleaseControl): Promise<void> {
+    const parsed = deviceIdMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "release_control needs a deviceId.", "release_control");
+      return;
+    }
+    const { deviceId } = parsed.data;
+    const sub = this.dataSubscription(viewerId, deviceId);
+    // Stop this viewer's messages before the next one takes over. If the SFU fails, give up the
+    // control anyway, so the viewers waiting are not stuck behind it.
+    if (sub?.can_reply) {
+      await this.setCanReply(viewerId, sub, false).catch((error) => {
+        console.log(JSON.stringify({ event: "revoke_failed", room: this.roomId, deviceId, code: error instanceof SfuError ? error.code : "internal" }));
+      });
+    }
+    const result = await this.env.DEVICES.getByName(deviceId).releaseControl(this.roomId, viewerId);
+    if (!result.ok) this.failControl(ws, result.code, result.message, deviceId, "release_control");
+  }
+
+  private async onControlReady(ws: WebSocket, viewerId: string, message: ControlReady): Promise<void> {
+    const parsed = deviceIdMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "control_ready needs a deviceId.", "control_ready");
+      return;
+    }
+    const { deviceId } = parsed.data;
+    if (!this.dataSubscription(viewerId, deviceId)?.can_reply) {
+      this.failControl(ws, ErrorCode.ERROR_CODE_NOT_CONTROLLER, `${deviceId} was not handed to you.`, deviceId, "control_ready");
+      return;
+    }
+    const result = await this.env.DEVICES.getByName(deviceId).confirmControl(this.roomId, viewerId);
+    if (!result.ok) this.failControl(ws, result.code, result.message, deviceId, "control_ready");
+  }
+
+  /** Grants or revokes canReply on the viewer's two channels to the device, and tells the viewer. */
+  private async setCanReply(viewerId: string, sub: DataSubscriptionRow, canReply: boolean): Promise<void> {
+    const sessionId = this.viewer(viewerId)?.sfu_session_id;
+    if (!sessionId) throw new Error("The viewer has no session.");
+    await new RealtimeSfu(this.env).updateDataChannels(sessionId, deviceChannels("remote", sub.device_session, canReply));
+    this.sql.exec(
+      "UPDATE data_subscriptions SET can_reply = ? WHERE viewer_id = ? AND device_id = ?",
+      canReply ? 1 : 0,
+      viewerId,
+      sub.device_id,
+    );
+    this.sendTo(viewerId, { subscribed: this.subscribed(viewerId) });
   }
 
   private async onUnsubscribe(ws: WebSocket, viewerId: string, message: Unsubscribe): Promise<void> {
     const parsed = unsubscribeSchema.safeParse(message);
     if (!parsed.success) {
-      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "unsubscribe needs mids.", "unsubscribe");
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "unsubscribe needs mids or data.", "unsubscribe");
       return;
     }
     const viewer = this.viewer(viewerId)!;
@@ -460,9 +741,10 @@ export class Room extends DurableObject<Env> {
       this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Send the answer for the last offer first.", "unsubscribe");
       return;
     }
+    if (parsed.data.data.length > 0) await this.unsubscribeData(viewer, parsed.data.data);
     const closing = this.subscriptions(viewerId).filter((sub) => parsed.data.mids.includes(sub.mid));
     if (closing.length === 0 || !viewer.sfu_session_id) {
-      sendViewer(ws, { subscribed: { tracks: this.subscriptions(viewerId) } });
+      sendViewer(ws, { subscribed: this.subscribed(viewerId) });
       return;
     }
 
@@ -494,7 +776,7 @@ export class Room extends DurableObject<Env> {
       sendViewer(ws, { offer: { sdp: result.sessionDescription.sdp, tracks, sessionReset } });
       return;
     }
-    sendViewer(ws, { subscribed: { tracks } });
+    sendViewer(ws, { subscribed: this.subscribed(viewerId) });
   }
 
   private async newSession(sfu: RealtimeSfu, viewerId: string): Promise<string> {
@@ -592,6 +874,9 @@ export class Room extends DurableObject<Env> {
           lastPing: this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? null,
         })),
         subscriptions: this.subscriptions(viewer.viewer_id),
+        dataChannels: Boolean(viewer.data_channels),
+        dataTransport: ["none", "offered", "ready"][viewer.data_transport] ?? null,
+        data: this.dataSubscriptions(viewer.viewer_id),
       })),
       alarm: await this.ctx.storage.getAlarm(),
     };
@@ -626,11 +911,70 @@ export class Room extends DurableObject<Env> {
       .map((row) => ({ deviceId: row.device_id, trackName: row.track_name, mid: row.mid, generation: row.generation }));
   }
 
-  /** How many viewers in this room receive at least one track from the device. */
+  private dataSubscription(viewerId: string, deviceId: string): DataSubscriptionRow | null {
+    return (
+      this.sql
+        .exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ? AND device_id = ?", viewerId, deviceId)
+        .toArray()[0] ?? null
+    );
+  }
+
+  private dataSubscriptions(viewerId: string): DataSubscription[] {
+    return this.sql
+      .exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ? ORDER BY device_id", viewerId)
+      .toArray()
+      .map((row) => ({
+        deviceId: row.device_id,
+        generation: row.generation,
+        channels: JSON.parse(row.channels) as DataChannel[],
+        canReply: Boolean(row.can_reply),
+      }));
+  }
+
+  private subscribed(viewerId: string): Subscribed {
+    return { tracks: this.subscriptions(viewerId), data: this.dataSubscriptions(viewerId) };
+  }
+
+  /** How many viewers in this room receive a track or the data channels of the device. */
   private subscriberCount(deviceId: string): number {
     return this.sql
-      .exec<{ n: number }>("SELECT COUNT(DISTINCT viewer_id) AS n FROM subscriptions WHERE device_id = ?", deviceId)
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM (SELECT viewer_id FROM subscriptions WHERE device_id = ?
+         UNION SELECT viewer_id FROM data_subscriptions WHERE device_id = ?)`,
+        deviceId,
+        deviceId,
+      )
       .one().n;
+  }
+
+  private isSubscribedTo(viewerId: string, deviceId: string): boolean {
+    return (
+      this.sql
+        .exec(
+          `SELECT 1 FROM subscriptions WHERE viewer_id = ? AND device_id = ?
+           UNION SELECT 1 FROM data_subscriptions WHERE viewer_id = ? AND device_id = ?`,
+          viewerId,
+          deviceId,
+          viewerId,
+          deviceId,
+        )
+        .toArray().length > 0
+    );
+  }
+
+  /** Forgets a device that left the room. Its own object drops this room's control state. */
+  private forgetDevice(deviceId: string): void {
+    this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
+    this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
+    this.sql.exec("DELETE FROM data_subscriptions WHERE device_id = ?", deviceId);
+  }
+
+  /** Forgets the viewer's data channels; each device drops it from its control state. */
+  private async dropData(viewerId: string): Promise<string[]> {
+    const deviceIds = this.dataSubscriptions(viewerId).map((sub) => sub.deviceId);
+    this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
+    await Promise.allSettled(deviceIds.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
+    return deviceIds;
   }
 
   private async watchAll(now: number): Promise<void> {
@@ -644,8 +988,7 @@ export class Room extends DurableObject<Env> {
   private async watchDevice(deviceId: string, now: number): Promise<void> {
     const result = await this.env.DEVICES.getByName(deviceId).watch(this.roomId, this.subscriberCount(deviceId));
     if (!result.member) {
-      this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
-      this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
+      this.forgetDevice(deviceId);
       if (this.viewerCount() > 0) this.broadcast({ members: { devices: this.memberInfos() } });
       return;
     }
@@ -673,6 +1016,7 @@ export class Room extends DurableObject<Env> {
   private async dropViewer(viewerId: string): Promise<void> {
     this.earlySessions.delete(viewerId);
     const affected = new Set(this.subscriptions(viewerId).map((sub) => sub.deviceId));
+    for (const deviceId of await this.dropData(viewerId)) affected.add(deviceId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);
     if (this.viewerCount() > 0) {
@@ -688,6 +1032,13 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("DELETE FROM devices");
   }
 
+  /** Sends to the viewer's open sockets; there is one unless a replaced one is still closing. */
+  private sendTo(viewerId: string, message: ViewerResponse): void {
+    for (const ws of this.ctx.getWebSockets(viewerId)) {
+      if (ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
+    }
+  }
+
   private broadcast(message: ViewerResponse): void {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
@@ -696,6 +1047,10 @@ export class Room extends DurableObject<Env> {
 
   private fail(ws: WebSocket, code: ErrorCode, message: string, request: string): void {
     sendViewer(ws, { error: signalError({ code, message, request }) });
+  }
+
+  private failControl(ws: WebSocket, code: ErrorCode, message: string, deviceId: string, request: string): void {
+    sendViewer(ws, { error: signalError({ code, message, request, deviceId }) });
   }
 
   /** An error for one device or track of a subscribe. The rest of the request goes on. */
@@ -746,5 +1101,9 @@ function offlineInfo(deviceId: string): DeviceInfo {
     generation: 0,
     tracks: [],
     lastError: ErrorCode.ERROR_CODE_UNSPECIFIED,
+    dataChannels: false,
+    controller: undefined,
+    handover: undefined,
+    waiting: [],
   };
 }

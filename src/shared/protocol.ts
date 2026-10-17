@@ -45,6 +45,8 @@ export const viewerTokenRequestSchema = z.object({
   viewer_id: viewerIdSchema,
   room_id: idSchema,
   can_subscribe: z.literal(true),
+  /** Lets the viewer open devices' data channels and take control of a device. */
+  data_channels: z.boolean().optional(),
 });
 
 export const tokenRequestSchema = z.union([deviceTokenRequestSchema, viewerTokenRequestSchema]);
@@ -62,6 +64,7 @@ export const grantSchema = z.object({
   canPublish: z.boolean(),
   canSubscribe: z.boolean(),
   generation: generationSchema.optional(),
+  dataChannels: z.boolean().optional(),
 });
 export type Grant = z.infer<typeof grantSchema>;
 
@@ -85,15 +88,23 @@ export type Role = "device" | "viewer";
 export const publishOfferSchema = z.object({
   sdp: sdpSchema,
   tracks: z.array(z.object({ mid: midSchema, trackName: trackNameSchema })).min(1).max(16),
+  dataChannels: z.boolean(),
 });
 
-export const subscribeSchema = z.object({
-  tracks: z.array(z.object({ deviceId: idSchema, trackName: trackNameSchema })).min(1).max(64),
-});
+export const subscribeSchema = z
+  .object({
+    tracks: z.array(z.object({ deviceId: idSchema, trackName: trackNameSchema })).max(64),
+    data: z.array(idSchema).max(16),
+  })
+  .refine((message) => message.tracks.length > 0 || message.data.length > 0);
 
 export const subscribeAnswerSchema = z.object({ sdp: sdpSchema });
 
-export const unsubscribeSchema = z.object({ mids: z.array(midSchema).min(1).max(64) });
+export const unsubscribeSchema = z
+  .object({ mids: z.array(midSchema).max(64), data: z.array(idSchema).max(16) })
+  .refine((message) => message.mids.length > 0 || message.data.length > 0);
+
+export const deviceIdMessageSchema = z.object({ deviceId: idSchema });
 
 /** DEVICE_STATE_LIVE → "live", for logs and the debug view. */
 export function stateName(state: DeviceState): string {

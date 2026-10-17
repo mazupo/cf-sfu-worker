@@ -71,7 +71,12 @@ app.post(TOKEN_PATH, async (c) => {
     let grant: Grant;
     if (body.can_subscribe) {
       sub = body.viewer_id;
-      grant = { rooms: [body.room_id], canPublish: false, canSubscribe: true };
+      grant = {
+        rooms: [body.room_id],
+        canPublish: false,
+        canSubscribe: true,
+        ...(body.data_channels ? { dataChannels: true } : {}),
+      };
     } else {
       const rooms = [...new Set(body.room_ids)];
       if (rooms.length > config.maxRoomsPerDevice) {

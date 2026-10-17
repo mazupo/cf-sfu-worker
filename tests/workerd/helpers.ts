@@ -33,8 +33,13 @@ export async function deviceToken(deviceId: string, rooms: string[], generation?
   return (await response.json<{ token: string }>()).token;
 }
 
-export async function viewerToken(viewerId: string, room: string): Promise<string> {
-  const response = await requestToken(VIEWER_PUBLIC_KEY, { viewer_id: viewerId, room_id: room, can_subscribe: true });
+export async function viewerToken(viewerId: string, room: string, dataChannels = false): Promise<string> {
+  const response = await requestToken(VIEWER_PUBLIC_KEY, {
+    viewer_id: viewerId,
+    room_id: room,
+    can_subscribe: true,
+    ...(dataChannels ? { data_channels: true } : {}),
+  });
   expect(response.status).toBe(200);
   return (await response.json<{ token: string }>()).token;
 }
@@ -173,6 +178,8 @@ export function mockSfu(options: { missingTrack?: string; expireFirstPublish?: b
   let sessions = 0;
   let mids = 100;
   let publishes = 0;
+  // Like the real SFU: channel ids per session, even for published ones and odd for pulled ones.
+  const channelIds = new Map<string, { local: number; remote: number }>();
   const record = async (request: { method: string; url: string; text(): Promise<string>; headers: Headers }) => {
     const text = await request.text();
     const call = { method: request.method, path: new URL(request.url).pathname, body: text ? JSON.parse(text) : null };
@@ -216,6 +223,34 @@ export function mockSfu(options: { missingTrack?: string; expireFirstPublish?: b
     http.put(`${SFU}/sessions/:sessionId/renegotiate`, async ({ request }) => {
       await record(request);
       return new HttpResponse(null, { status: 200 });
+    }),
+    http.post(`${SFU}/sessions/:sessionId/datachannels/establish`, async ({ request }) => {
+      await record(request);
+      return HttpResponse.json({
+        requiresImmediateRenegotiation: true,
+        dataChannel: { dataChannelName: "server-events", id: 0 },
+        sessionDescription: { type: "offer", sdp: "v=0 datachannel-offer" },
+      });
+    }),
+    http.post(`${SFU}/sessions/:sessionId/datachannels/new`, async ({ request, params }) => {
+      const call = await record(request);
+      const next = channelIds.get(String(params.sessionId)) ?? { local: 2, remote: 1 };
+      channelIds.set(String(params.sessionId), next);
+      return HttpResponse.json({
+        dataChannels: call.body.dataChannels.map((channel: { location: "local" | "remote" }) => {
+          const id = next[channel.location];
+          next[channel.location] += 2;
+          return { ...channel, id };
+        }),
+      });
+    }),
+    http.put(`${SFU}/sessions/:sessionId/datachannels/update`, async ({ request }) => {
+      const call = await record(request);
+      return HttpResponse.json({ dataChannels: call.body.dataChannels });
+    }),
+    http.put(`${SFU}/sessions/:sessionId/datachannels/close`, async ({ request }) => {
+      const call = await record(request);
+      return HttpResponse.json({ dataChannels: call.body.dataChannels });
     }),
     http.put(`${SFU}/sessions/:sessionId/tracks/close`, async ({ request }) => {
       const call = await record(request);

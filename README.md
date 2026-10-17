@@ -13,6 +13,7 @@ Devices wait on a WebSocket and publish video only while someone watches.
 - When the first viewer joins a room, each device in the room gets `wake`. The device opens a PeerConnection and sends an `offer`. The worker publishes it to the SFU and sends back the `answer`. When the PeerConnection is connected, the device sends `ready`, and viewers can pull its tracks.
 - To make the first video appear sooner, the worker creates SFU sessions early: a device's session when it sends `wake`, and a viewer's session when the viewer joins. Rooms learn about state changes in the background, so updates to rooms never hold up a device.
 - 30 seconds after the last viewer leaves, the device gets `sleep` and stops publishing.
+- A device can also open two data channels, `_lossy` and `_reliable`, the ones of pi-webrtc's `--enable-ipc`. Its messages reach every viewer that opened them. Only one viewer at a time controls the device, and only that viewer's messages reach it.
 - The SFU secret stays in the Worker. Viewers never see a device's SFU session ID.
 
 ## Run it locally
@@ -41,6 +42,8 @@ Then open two browser tabs:
 
 The simulator starts publishing when the viewer joins, and stops 30 seconds after the viewer leaves.
 
+To try the data channels, check **Enable IPC** on both pages before you connect. On the viewer, click **Take control** on the device's tile, then send a message. It shows up in the simulator's **IPC messages**. Messages the simulator sends show up on every viewer with IPC.
+
 Both pages ping from a Web Worker, so they stay online in a background tab.
 
 Open **Server state** on either page to see what the Durable Objects hold, refreshed every 2 seconds: each device's state, generation, socket and last ping, which rooms watch it, and each viewer's subscriptions. The debug routes behind it (`GET /cloudflare/debug/rooms/:roomId` and `GET /cloudflare/debug/devices/:deviceId`) answer only on `localhost`, or when the worker has `DEBUG_STATE=true`. They show SFU session IDs, so keep them off in production.
@@ -57,7 +60,7 @@ Content-Type: application/json
 { "device_id": "cam-1", "room_ids": ["lab-a"], "can_subscribe": false }
 ```
 
-A viewer sends `{ "viewer_id": "7f3a9c2e", "room_id": "lab-a", "can_subscribe": true }` with the viewer public key.
+A viewer sends `{ "viewer_id": "7f3a9c2e", "room_id": "lab-a", "can_subscribe": true }` with the viewer public key. Add `"data_channels": true` to let the viewer open the devices' data channels and take control of a device. A viewer without it only watches.
 
 The answer is `{ "token": "...", "expires_in": 30, "url": "wss://.../cloudflare/rtc" }`. The token works once and only for 30 seconds.
 
@@ -78,18 +81,23 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | --- | --- | --- |
 | Worker → device | `joined` | `deviceId`, `state`, `generation`, `rooms`, `iceServers` |
 | Worker → device | `wake` | Nothing. Publish from the start: close any PeerConnection, create a new one and send an offer. |
-| Device → worker | `offer` | `sdp`, `tracks: [{ mid, trackName }]` |
+| Device → worker | `offer` | `sdp`, `tracks: [{ mid, trackName }]`, `dataChannels` |
 | Worker → device | `answer` | `generation`, `sdp` |
+| Worker → device | `channels` | `channels: [{ label, id }]`: the device's `_lossy` and `_reliable` |
+| Worker → device | `control` | `controller`: who controls the device now. Only for the log. |
 | Device → worker | `ready` | Nothing. Send it when the PeerConnection is connected. Viewers can subscribe only after it. |
 | Worker → device | `sleep` | Nothing. Close the PeerConnection. |
-| Worker → viewer | `joined` | `viewerId`, `room`, `resumed`, `iceServers`, `devices`, `subscriptions` |
-| Worker → viewer | `device` | One device's new state |
+| Worker → viewer | `joined` | `viewerId`, `room`, `resumed`, `iceServers`, `devices`, `subscriptions`, `data` |
+| Worker → viewer | `device` | One device's new state, with `dataChannels`, `controller`, `handover` and `waiting` |
 | Worker → viewer | `members` | The room's devices changed |
-| Viewer → worker | `subscribe` | `tracks: [{ deviceId, trackName }]` |
+| Viewer → worker | `subscribe` | `tracks: [{ deviceId, trackName }]`, `data: [deviceId]` |
 | Worker → viewer | `offer` | `sdp`, `tracks`, `sessionReset` |
 | Viewer → worker | `answer` | `sdp` |
-| Worker → viewer | `subscribed` | `tracks` |
-| Viewer → worker | `unsubscribe` | `mids` |
+| Worker → viewer | `subscribed` | `tracks`, `data: [{ deviceId, generation, channels, canReply }]` |
+| Viewer → worker | `unsubscribe` | `mids`, `data: [deviceId]` |
+| Viewer → worker | `take_control` | `deviceId` |
+| Viewer → worker | `release_control` | `deviceId` |
+| Viewer → worker | `control_ready` | `deviceId` |
 | Viewer → worker | `leave` | |
 | Worker → both | `error` | `code`, `message`, `request`, `deviceId`, `trackName`, `retryable` |
 
@@ -103,6 +111,35 @@ The worker replies to each offer, in order, with `answer` or an `error` for `off
 
 A device that reconnects while it publishes adds `"generation"` from its last `answer` to the token request, so the stream continues. Otherwise the worker starts over: `joined` says `sleeping`, and a new `wake` follows if someone watches.
 A viewer that reconnects with the same `viewer_id` within 30 seconds keeps its subscriptions.
+
+### 3. Data channels
+
+Realtime SFU sends each data channel one way, from the device to every viewer that opens it. One viewer at a time can also send back to the device. The worker decides who, with the SFU's `canReply`.
+
+| Label | Ordered | Retransmits | Use it for |
+| --- | --- | --- | --- |
+| `_lossy` | no | 0 | Data where old values can be dropped, such as sensor values |
+| `_reliable` | yes | until it arrives | Data that must arrive, such as commands |
+
+Create each channel with `negotiated: true`, the `id` from the worker, and the settings above. The ids differ between the device and each viewer.
+
+On the device:
+
+1. Before the offer, create a negotiated channel `server-events` with id 0. Any channel puts an `m=application` section in the offer.
+2. Send the offer with `dataChannels: true`.
+3. After the answer, the worker sends `channels` with the ids of `_lossy` and `_reliable`. Create them.
+
+On a viewer whose token has `data_channels`:
+
+1. Right after `joined`, the worker sends an `offer` that sets up the data channel transport. Answer it like any offer. The PeerConnection connects while the devices wake.
+2. When a device is live with `dataChannels`, send `subscribe` with `data: [deviceId]`. `subscribed` lists its two channels.
+3. To send to the device, send `take_control`. If somebody else controls it, you wait in line.
+4. When the worker hands you control, `subscribed` has `canReply: true` for the device. Once its channels are open, send `control_ready`. If you do not do this within 5 seconds, the next viewer in line gets control.
+5. Send `release_control` to give up control or your place in line. Leaving the room or closing the device's channels does the same.
+
+Control belongs to the device, not to a room. A device in two rooms has one line for viewers of both rooms. Control stays with the viewer when the device publishes again.
+
+The worker does not read the messages. pi-webrtc expects `protocol.Packet` from [`packet.proto`](https://github.com/mazupo/protocol/blob/main/protos/packet.proto), with the text in `raw`. The demo pages do the same.
 
 ## Tests
 

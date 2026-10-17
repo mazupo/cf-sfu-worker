@@ -50,9 +50,10 @@ export function decodeFrame<T>(codec: MessageFns<T>, data: string | ArrayBuffer)
   }
 }
 
-/** The oneof field that is set, e.g. "offer". Errors name the request they answer. */
+/** The oneof field that is set, as named in the proto, e.g. "take_control". Errors name the request they answer. */
 export function requestName(request: DeviceRequest | ViewerRequest): string {
-  return Object.entries(request).find(([, value]) => value !== undefined)?.[0] ?? "";
+  const name = Object.entries(request).find(([, value]) => value !== undefined)?.[0] ?? "";
+  return name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
 }
 
 /** Runs tasks for one key one at a time, in arrival order. Lives only in memory. */

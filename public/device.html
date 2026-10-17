@@ -36,6 +36,9 @@
           <option value="camera">Camera</option>
         </select>
       </label>
+      <label class="check" title="Publish _lossy and _reliable, like pi-webrtc's --enable-ipc. Choose before you connect.">
+        <input type="checkbox" name="ipc" id="ipc"> Enable IPC
+      </label>
       <div>
         <button type="submit" id="connect">Connect</button>
         <button type="button" class="secondary" id="disconnect" disabled>Disconnect</button>
@@ -45,6 +48,21 @@
     <p class="status" id="status">Not connected.</p>
     <section class="panel preview">
       <video id="preview" autoplay playsinline muted></video>
+    </section>
+    <section class="panel ipc" id="ipc-panel" hidden>
+      <div class="ipc-head">
+        <h2>IPC messages</h2>
+        <span class="control" id="ipc-controller"></span>
+      </div>
+      <form class="ipc-send" id="ipc-form">
+        <select name="label" aria-label="Channel">
+          <option value="_reliable">reliable</option>
+          <option value="_lossy">lossy</option>
+        </select>
+        <input name="text" autocomplete="off" aria-label="Message" placeholder="Message to every viewer with IPC">
+        <button type="submit" class="small">Send</button>
+      </form>
+      <ol class="ipc-log" id="ipc-log" aria-live="polite"></ol>
     </section>
     <details class="panel debug" id="debug-panel">
       <summary>Server state <span class="status" id="debug-updated"></span></summary>

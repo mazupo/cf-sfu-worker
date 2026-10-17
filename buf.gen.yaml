@@ -5,6 +5,7 @@ inputs:
   - directory: external/protocol/protos
     paths:
       - external/protocol/protos/cloudflare.proto
+      - external/protocol/protos/packet.proto
 plugins:
   - local: protoc-gen-ts_proto
     out: src/proto
