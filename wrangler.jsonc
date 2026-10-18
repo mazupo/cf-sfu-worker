@@ -8,7 +8,7 @@
   // Generates src/proto from the protocol submodule, then bundles the demo pages into public/js.
   "build": {
     "command": "npm run proto && npm run build:demo",
-    "watch_dir": ["demo", "external/protocol/protos"]
+    "watch_dir": ["src", "demo", "external/protocol/protos"]
   },
   "assets": {
     "directory": "./public",
