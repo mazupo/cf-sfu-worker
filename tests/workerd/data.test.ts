@@ -333,3 +333,47 @@ describe("control", () => {
     expect(pulled.body.dataChannels.map((channel: { canReply: boolean }) => channel.canReply)).toEqual([true, true]);
   });
 });
+
+describe("recovery", () => {
+  test("device channels that did not open after the answer open when the device is ready", async () => {
+    mockSfu({ failDeviceChannels: [0] });
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    const v1 = await dataViewer("v1");
+    await device.next("wake");
+    device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS, dataChannels: true });
+    await device.next("answer");
+    device.send("ready", {});
+    expect(await device.next("channels")).toEqual({
+      channels: [
+        { label: "_lossy", id: 2 },
+        { label: "_reliable", id: 4 },
+      ],
+    });
+    expect(device.has("error")).toBe(false);
+    expect(await info(v1, (device) => device.state === state_("live"))).toMatchObject({ dataChannels: true });
+  });
+
+  test("a device that publishes again has no channels until the new ones open", async () => {
+    mockSfu({ failDeviceChannels: [1] });
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await info(v1, (device) => device.state === state_("live") && device.dataChannels);
+
+    // Its PeerConnection failed while the SFU was out of reach: the channels of its new session
+    // did not open after the answer.
+    device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS, dataChannels: true });
+    expect(await device.next("answer")).toMatchObject({ generation: 2 });
+    expect(await info(v1, (device) => device.generation === 2)).toMatchObject({ dataChannels: false });
+    device.send("ready", {});
+    expect(await device.next("channels")).toEqual({
+      channels: [
+        { label: "_lossy", id: 2 },
+        { label: "_reliable", id: 4 },
+      ],
+    });
+    expect(await info(v1, (device) => device.state === state_("live"))).toMatchObject({ generation: 2, dataChannels: true });
+  });
+});

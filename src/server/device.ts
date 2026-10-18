@@ -52,6 +52,8 @@ type DeviceRow = {
   tracks: string;
   /** The device's _lossy and _reliable, as DataChannel[] JSON. */
   channels: string;
+  /** The offer asked for data channels. */
+  data_channels: number;
   rooms: string;
   linger_until: number | null;
   last_error: ErrorCode;
@@ -89,6 +91,7 @@ const SCHEMA = `
     sfu_session_id TEXT,
     tracks TEXT NOT NULL,
     channels TEXT NOT NULL,
+    data_channels INTEGER NOT NULL,
     rooms TEXT NOT NULL,
     linger_until INTEGER,
     last_error INTEGER NOT NULL,
@@ -336,6 +339,9 @@ export class Device extends DurableObject<Env> {
       row.generation += 1;
       row.sfu_session_id = sessionId;
       row.tracks = JSON.stringify(tracks.map((track) => track.trackName));
+      // A new session: the last publication's channels are gone with its session.
+      row.channels = "[]";
+      row.data_channels = dataChannels ? 1 : 0;
       row.wake_deadline = now + this.config.wakeTimeoutMs;
       row.last_error = ErrorCode.ERROR_CODE_UNSPECIFIED;
       row.last_seen = now;
@@ -346,8 +352,9 @@ export class Device extends DurableObject<Env> {
       void this.notifyRoomsSoon();
       await this.scheduleAlarm(now);
       // The SFU answers this once the device's PeerConnection is connected. The device's
-      // ready waits behind it in the queue, so the device goes live with its channels.
-      if (dataChannels) await this.openChannels(ws, sessionId);
+      // ready waits behind it in the queue, so the device goes live with its channels. If it
+      // takes too long, e.g. the SFU is out of reach for a while, ready tries again.
+      if (dataChannels) await this.openChannels(ws, sessionId, false);
     } catch (error) {
       const code = error instanceof SfuError ? error.code : "publish_failed";
       const text = error instanceof Error ? error.message : "Publishing failed.";
@@ -356,15 +363,20 @@ export class Device extends DurableObject<Env> {
     }
   }
 
-  /** Publishes _lossy and _reliable on the device's session and sends their ids. */
-  private async openChannels(ws: WebSocket, sessionId: string): Promise<void> {
+  /**
+   * Publishes _lossy and _reliable on the device's session and sends their ids. Only the `last`
+   * try tells the device when it fails.
+   */
+  private async openChannels(ws: WebSocket, sessionId: string, last: boolean): Promise<void> {
     let channels: DataChannel[];
     try {
       channels = await new RealtimeSfu(this.env).addDataChannels(sessionId, deviceChannels("local"));
     } catch (error) {
       const code = error instanceof SfuError ? error.code : "data_channels_failed";
-      console.log(JSON.stringify({ event: "data_channels_failed", deviceId: this.deviceId, code }));
-      this.fail(ws, ErrorCode.ERROR_CODE_NO_DATA_CHANNELS, `${code}: the data channels did not open. Video still works.`, "offer");
+      console.log(JSON.stringify({ event: "data_channels_failed", deviceId: this.deviceId, code, last }));
+      if (last) {
+        this.fail(ws, ErrorCode.ERROR_CODE_NO_DATA_CHANNELS, `${code}: the data channels did not open. Video still works.`, "offer");
+      }
       return;
     }
     const row = this.row();
@@ -385,6 +397,16 @@ export class Device extends DurableObject<Env> {
     }
     // Waking with no answer yet: the wake went out after this ready, and the device starts over.
     if (!row.sfu_session_id || row.state === LIVE) return;
+    if (row.data_channels && (JSON.parse(row.channels) as DataChannel[]).length === 0) {
+      // They did not open after the answer. The PeerConnection is connected now, so the SFU answers at once.
+      await this.openChannels(ws, row.sfu_session_id, true);
+    }
+    await this.goLive();
+  }
+
+  private async goLive(): Promise<void> {
+    const row = this.row();
+    if (!row || !row.sfu_session_id || row.state === LIVE || row.state === SLEEPING) return;
     const now = Date.now();
     row.state = LIVE;
     row.wake_deadline = null;
@@ -703,6 +725,7 @@ export class Device extends DurableObject<Env> {
       sfu_session_id: null,
       tracks: "[]",
       channels: "[]",
+      data_channels: 0,
       rooms: "[]",
       linger_until: null,
       last_error: ErrorCode.ERROR_CODE_UNSPECIFIED,
@@ -717,8 +740,9 @@ export class Device extends DurableObject<Env> {
   private save(row: DeviceRow): void {
     this.sql.exec(
       `INSERT OR REPLACE INTO device (id, state, generation, wake_deadline, wake_attempts,
-         sfu_session_id, tracks, channels, rooms, linger_until, last_error, last_seen, disconnected_at, offline_notified)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         sfu_session_id, tracks, channels, data_channels, rooms, linger_until, last_error, last_seen, disconnected_at,
+         offline_notified)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.state,
       row.generation,
       row.wake_deadline,
@@ -726,6 +750,7 @@ export class Device extends DurableObject<Env> {
       row.sfu_session_id,
       row.tracks,
       row.channels,
+      row.data_channels,
       row.rooms,
       row.linger_until,
       row.last_error,
@@ -845,6 +870,7 @@ export class Device extends DurableObject<Env> {
     row.sfu_session_id = null;
     row.tracks = "[]";
     row.channels = "[]";
+    row.data_channels = 0;
     row.linger_until = null;
     this.earlySession = null;
   }

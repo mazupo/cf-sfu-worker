@@ -173,11 +173,14 @@ export class TestSocket {
 export type SfuCall = { method: string; path: string; body: any };
 
 /** Fakes the Realtime SFU API and records every call. */
-export function mockSfu(options: { missingTrack?: string; expireFirstPublish?: boolean } = {}): SfuCall[] {
+export function mockSfu(
+  options: { missingTrack?: string; expireFirstPublish?: boolean; failDeviceChannels?: number[] } = {},
+): SfuCall[] {
   const calls: SfuCall[] = [];
   let sessions = 0;
   let mids = 100;
   let publishes = 0;
+  let deviceChannels = 0;
   // Like the real SFU: channel ids per session, even for published ones and odd for pulled ones.
   const channelIds = new Map<string, { local: number; remote: number }>();
   const record = async (request: { method: string; url: string; text(): Promise<string>; headers: Headers }) => {
@@ -234,6 +237,10 @@ export function mockSfu(options: { missingTrack?: string; expireFirstPublish?: b
     }),
     http.post(`${SFU}/sessions/:sessionId/datachannels/new`, async ({ request, params }) => {
       const call = await record(request);
+      // The real SFU holds this until the device's PeerConnection is connected, and the worker gives up.
+      if (call.body.dataChannels[0]?.location === "local" && options.failDeviceChannels?.includes(deviceChannels++)) {
+        return HttpResponse.json({ errorCode: "sfu_timeout", errorDescription: "Timed out." }, { status: 504 });
+      }
       const next = channelIds.get(String(params.sessionId)) ?? { local: 2, remote: 1 };
       channelIds.set(String(params.sessionId), next);
       return HttpResponse.json({
