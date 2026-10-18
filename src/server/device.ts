@@ -15,9 +15,10 @@ import { debugInfo, errorName, publishOfferSchema, stateName, type Claims } from
 import {
   CONTROL_CONFIRM_MS,
   COUNT_GRACE_MS,
-  DEVICE_RETENTION_MS,
+  DEVICE_GONE_MS,
   DISCONNECT_GRACE_MS,
   PRESENCE_CHECK_MS,
+  UNWATCHED_CHECK_MS,
   WAKE_ATTEMPTS,
   WATCH_LEASE_MS,
   settings,
@@ -127,7 +128,7 @@ const SCHEMA = `
 export class Device extends DurableObject<Env> {
   private readonly config: Settings;
   private readonly queue = new KeyedQueue();
-  /** Tables exist from the first connection until the device is forgotten. */
+  /** Tables exist from the first connection until the device has left every room and is forgotten. */
   private ready: boolean;
   /** The SFU session started together with `wake`, so the offer needs one SFU call instead of two. */
   private earlySession: Promise<string | null> | null = null;
@@ -143,6 +144,9 @@ export class Device extends DurableObject<Env> {
     // time to reconnect before viewers see it offline.
     if (this.ready && ctx.getWebSockets().length === 0) {
       ctx.storage.sql.exec("UPDATE device SET disconnected_at = ? WHERE disconnected_at IS NULL", Date.now());
+      // No alarm may be set, e.g. it was connected and nobody watched it. Without one it would
+      // never go offline or leave its rooms.
+      void ctx.blockConcurrencyWhile(() => this.scheduleAlarm(Date.now()));
     }
   }
 
@@ -256,22 +260,30 @@ export class Device extends DurableObject<Env> {
     const row = this.row();
     if (!row) return;
     const now = Date.now();
-    row.disconnected_at = now;
+    // A heartbeat timeout already set it to the last ping.
+    row.disconnected_at ??= now;
     if (code === 1000 || code === 1001) {
-      // The device closed on purpose, e.g. it shut down or changed its ID. It leaves its rooms,
-      // so viewers do not keep an offline tile for it. It joins them again when it reconnects.
-      const rooms = this.rooms(row);
-      this.resetPublication(row);
-      row.rooms = "[]";
-      row.offline_notified = 1;
-      this.save(row);
-      this.forgetWatch();
-      await this.queue.run("control", () => this.removeFromControl(() => true));
-      await Promise.allSettled(rooms.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
+      // The device closed on purpose, e.g. it shut down or changed its ID.
+      await this.leaveRooms(row);
     } else {
       this.save(row);
     }
     await this.scheduleAlarm(now);
+  }
+
+  /**
+   * The device closed its socket on purpose, or sent nothing for DEVICE_GONE_MS. It leaves its
+   * rooms, so viewers do not keep an offline tile for it. It joins them again when it reconnects.
+   */
+  private async leaveRooms(row: DeviceRow): Promise<void> {
+    const rooms = this.rooms(row);
+    this.resetPublication(row);
+    row.rooms = "[]";
+    row.offline_notified = 1;
+    this.save(row);
+    this.forgetWatch();
+    await this.queue.run("control", () => this.removeFromControl(() => true));
+    await Promise.allSettled(rooms.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
   }
 
   private async onOffer(ws: WebSocket, message: PublishOffer): Promise<void> {
@@ -609,6 +621,12 @@ export class Device extends DurableObject<Env> {
       changed = true;
     }
 
+    // Dropped without a close, e.g. the process was killed, and not back within a minute.
+    if (!this.socket() && row.disconnected_at !== null && now - row.disconnected_at >= DEVICE_GONE_MS && this.rooms(row).length > 0) {
+      console.log(JSON.stringify({ event: "device_gone", deviceId: this.deviceId, silentMs: now - row.disconnected_at }));
+      await this.leaveRooms(row);
+    }
+
     if (row.state === WAKING && row.wake_deadline !== null && row.wake_deadline <= now) {
       const current = this.socket();
       if (online && current && row.wake_attempts < WAKE_ATTEMPTS) {
@@ -654,8 +672,8 @@ export class Device extends DurableObject<Env> {
     }
 
     row = this.row()!;
-    if (!this.socket() && now - row.last_seen > DEVICE_RETENTION_MS) {
-      await Promise.allSettled(this.rooms(row).map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
+    // Gone from every room: nothing here is needed any more, once no used token can come back.
+    if (!this.socket() && this.rooms(row).length === 0 && this.tokensExpireAt() === null) {
       await this.ctx.storage.deleteAll();
       this.ready = false;
       return;
@@ -842,6 +860,11 @@ export class Device extends DurableObject<Env> {
     return Math.max(pong, attachment?.connectedAt ?? 0);
   }
 
+  /** When the last used token may be forgotten, or null when none is kept. */
+  private tokensExpireAt(): number | null {
+    return this.sql.exec<{ at: number | null }>("SELECT MAX(expires_at) AS at FROM used_tokens").one().at;
+  }
+
   private isOnline(now: number): boolean {
     const ws = this.socket();
     return ws !== null && now - this.lastSeen(ws) <= this.config.deviceStaleMs;
@@ -977,22 +1000,29 @@ export class Device extends DurableObject<Env> {
     if (row.linger_until !== null) candidates.push(row.linger_until);
     const { handover } = this.control();
     if (handover) candidates.push(handover.deadline);
+    const ws = this.socket();
     if (this.hasWatchers(now)) {
       // Check again when the last ping turns stale, so a silent device shows offline about
       // DEVICE_STALE_SECONDS after its last ping instead of up to a full check interval later.
-      const ws = this.socket();
       const stale = ws ? this.lastSeen(ws) + this.config.deviceStaleMs + 1000 : Infinity;
       candidates.push(Math.min(now + PRESENCE_CHECK_MS, stale));
+    } else if (ws) {
+      candidates.push(now + UNWATCHED_CHECK_MS);
     }
     const lease = this.sql
       .exec<{ next: number | null }>("SELECT MIN(expires_at) AS next FROM watching_rooms")
       .one().next;
     if (lease !== null) candidates.push(lease);
-    if (!this.socket()) {
+    if (!ws) {
       if (row.disconnected_at !== null && !row.offline_notified) {
         candidates.push(row.disconnected_at + DISCONNECT_GRACE_MS);
       }
-      candidates.push(row.last_seen + DEVICE_RETENTION_MS);
+      if (this.rooms(row).length > 0) {
+        if (row.disconnected_at !== null) candidates.push(row.disconnected_at + DEVICE_GONE_MS);
+      } else {
+        // Forget the device once the tokens it used have expired.
+        candidates.push(this.tokensExpireAt() ?? now);
+      }
     }
     if (candidates.length === 0) {
       await this.ctx.storage.deleteAlarm();

@@ -330,6 +330,50 @@ describe("watching", () => {
     device.close();
   });
 
+  test("a device that left every room is forgotten, and its new tracks are pulled when it comes back", async () => {
+    const { calls, device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
+    const { subscribed } = await subscribeAll(viewer, "cam-1");
+    device.ws.close(1000, "bye");
+    expect((await viewer.next("members")).devices).toEqual([]);
+
+    // Its tracks stay, so the viewer can still unsubscribe them and the SFU closes them.
+    const room = env.ROOMS.getByName("lab-a");
+    const generations = await runInDurableObject(room, async (_instance, state) =>
+      state.storage.sql.exec<{ generation: number }>("SELECT generation FROM subscriptions").toArray(),
+    );
+    expect(generations.map((row) => row.generation)).toEqual([0, 0]);
+
+    // Once the tokens it used have expired, the Device DO keeps nothing.
+    const stub = env.DEVICES.getByName("cam-1");
+    await runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("UPDATE used_tokens SET expires_at = 0"));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const tables = await runInDurableObject(stub, async (_instance, state) =>
+      state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_cf_%'").toArray(),
+    );
+    expect(tables).toEqual([]);
+
+    // Back with generation 1 again. The old rows have 0, so its tracks are pulled anew.
+    const back = await connect(await deviceToken("cam-1", ["lab-a"]));
+    expect(await back.next("joined")).toMatchObject({ generation: 0, rooms: ["lab-a"] });
+    await back.next("wake");
+    back.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS });
+    expect(await back.next("answer")).toMatchObject({ generation: 1 });
+    back.send("ready", {});
+    await viewer.device("cam-1", "live");
+    const before = calls.filter((call) => call.path.endsWith("/tracks/new")).length;
+    viewer.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
+    await viewer.next("offer");
+    viewer.send("answer", { sdp: "v=0 viewer-answer-2" });
+    await viewer.next("subscribed");
+    expect(calls.filter((call) => call.path.endsWith("/tracks/new")).length).toBe(before + 1);
+
+    viewer.send("unsubscribe", { mids: subscribed.tracks.map((track: { mid: string }) => track.mid) });
+    await viewer.next("offer");
+    const closed = calls.filter((call) => call.path.endsWith("/tracks/close")).at(-1)!;
+    expect(closed.body.tracks).toHaveLength(2);
+    for (const socket of [viewer, back]) socket.close();
+  });
+
   test("a restarted device without a generation starts a new publication", async () => {
     const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
     const restarted = await connect(await deviceToken("cam-1", ["lab-a"]));

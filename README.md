@@ -9,6 +9,7 @@ Devices wait on a WebSocket and publish video only while someone watches.
 
 - Each device has one Durable Object (`Device`). Each room has one Durable Object (`Room`). Viewers live in their room's object.
 - A device connects and waits. Its Durable Object hibernates. The device sends `ping` every 15 seconds, and the runtime answers `pong` without waking the object. While someone watches, a device that sends no ping for 45 seconds shows as offline.
+- A device that closes its socket normally (1000 or 1001) leaves its rooms right away. One that drops without closing, for example when its process is killed, shows as offline after 10 seconds and leaves its rooms after a minute with no ping. It joins them again when it reconnects. A device that left every room forgets its state, and its `generation` starts again from 1.
 - A deploy closes every socket. Devices and viewers connect again with the same IDs and keep their streams and subscriptions.
 - When the first viewer joins a room, each device in the room gets `wake`. The device opens a PeerConnection and sends an `offer`. The worker publishes it to the SFU and sends back the `answer`. When the PeerConnection is connected, the device sends `ready`, and viewers can pull its tracks.
 - To make the first video appear sooner, the worker creates SFU sessions early: a device's session when it sends `wake`, and a viewer's session when the viewer joins. Rooms learn about state changes in the background, so updates to rooms never hold up a device.

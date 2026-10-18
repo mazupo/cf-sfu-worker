@@ -198,7 +198,7 @@ describe("rooms", () => {
       .poll(() => runInDurableObject(stub, (_instance, state) => state.storage.sql.exec("SELECT disconnected_at FROM device").one().disconnected_at))
       .not.toBeNull();
     await runInDurableObject(stub, (_instance, state) => {
-      state.storage.sql.exec("UPDATE device SET disconnected_at = ?", Date.now() - 60_000);
+      state.storage.sql.exec("UPDATE device SET disconnected_at = ?", Date.now() - 30_000);
     });
     expect(await runDurableObjectAlarm(stub)).toBe(true);
     expect(await viewer.device("cam-1", "offline")).toMatchObject({ tracks: [] });

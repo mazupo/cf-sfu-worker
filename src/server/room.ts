@@ -971,6 +971,10 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
     this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
     this.sql.exec("DELETE FROM data_subscriptions WHERE device_id = ?", deviceId);
+    // Its tracks stay until each viewer unsubscribes them, so the SFU closes them too. The device
+    // forgets its generation once it has left, so mark them with 0, which no publication has:
+    // when it comes back, they never pass for its new tracks.
+    this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE device_id = ?", deviceId);
   }
 
   /** Forgets the viewer's data channels; each device drops it from its control state. */

@@ -226,6 +226,10 @@ async function handle(frame) {
       const next = new Map(message.devices.map((info) => [info.deviceId, devices.get(info.deviceId) ?? info]));
       devices.clear();
       for (const [id, info] of next) devices.set(id, info);
+      // A device that left counts its generations from 1 again when it comes back.
+      for (const list of [refused, retries, dataRetries]) {
+        for (const id of list.keys()) if (!devices.has(id)) list.delete(id);
+      }
       renderTiles();
       sync();
       break;
