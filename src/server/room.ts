@@ -488,11 +488,9 @@ export class Room extends DurableObject<Env> {
     } catch (error) {
       if (!(error instanceof SfuError && error.sessionGone)) throw error;
       // The session expired, e.g. it was made at join time and nothing was live for a long
-      // time. The viewer has to start a new PeerConnection for the new one.
-      this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
-      // The new PeerConnection has no data channel transport either. The viewer sends its offer again.
-      await this.dropData(viewerId);
-      this.sql.exec("UPDATE viewers SET data_transport = ? WHERE viewer_id = ?", DATA_NONE, viewerId);
+      // time. The viewer has to start a new PeerConnection for the new one, and send its own
+      // offer again for the data channel transport.
+      await this.forgetSession(viewerId);
       sessionId = await this.newSession(sfu, viewerId);
       sessionReset = true;
       result = await sfu.addTracks(sessionId, remote);
@@ -552,10 +550,13 @@ export class Room extends DurableObject<Env> {
       this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "offer needs an sdp.", "offer");
       return;
     }
-    const viewer = this.viewer(viewerId)!;
-    if (viewer.negotiating) {
-      this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Send the answer for the last offer first.", "offer");
-      return;
+    let viewer = this.viewer(viewerId)!;
+    if (viewer.data_transport === DATA_READY || viewer.negotiating) {
+      // A new PeerConnection: the last one failed, e.g. the SFU was out of reach for a while or
+      // did not take its answer. Viewers send their own offer only from a new one. It gets a new
+      // session and subscribes again. Whatever the old one was negotiating is void.
+      await this.forgetSession(viewerId);
+      viewer = this.viewer(viewerId)!;
     }
     const sfu = new RealtimeSfu(this.env);
     let sessionId = viewer.sfu_session_id;
@@ -986,10 +987,10 @@ export class Room extends DurableObject<Env> {
   }
 
   /**
-   * Closes and forgets the viewer's data channels. Each device then drops it from its control
-   * state, and the next one waiting takes over.
+   * Closes and forgets the viewer's data channels. Unless `keepControl`, each device then drops it
+   * from its control state, and the next one waiting takes over.
    */
-  private async dropData(viewerId: string): Promise<string[]> {
+  private async dropData(viewerId: string, keepControl = false): Promise<string[]> {
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
     const sessionId = this.viewer(viewerId)?.sfu_session_id;
     if (sessionId) {
@@ -997,8 +998,25 @@ export class Room extends DurableObject<Env> {
       await Promise.allSettled(subs.map((sub) => this.closeData(sfu, sessionId, sub)));
     }
     this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
-    await Promise.allSettled(subs.map((sub) => this.env.DEVICES.getByName(sub.device_id).controlGone(this.roomId, viewerId)));
+    if (!keepControl) {
+      await Promise.allSettled(subs.map((sub) => this.env.DEVICES.getByName(sub.device_id).controlGone(this.roomId, viewerId)));
+    }
     return subs.map((sub) => sub.device_id);
+  }
+
+  /**
+   * The viewer's PeerConnection and SFU session are done with: its tracks and channels go with
+   * them. It keeps its control and its place in the devices' counts, because it subscribes again
+   * on the next session, which its next offer starts.
+   */
+  private async forgetSession(viewerId: string): Promise<void> {
+    await this.dropData(viewerId, true);
+    this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
+    this.sql.exec(
+      "UPDATE viewers SET sfu_session_id = NULL, negotiating = 0, pending_offer = NULL, data_transport = ? WHERE viewer_id = ?",
+      DATA_NONE,
+      viewerId,
+    );
   }
 
   private async watchAll(now: number): Promise<void> {
@@ -1033,19 +1051,25 @@ export class Room extends DurableObject<Env> {
 
   private async dropViewer(viewerId: string): Promise<void> {
     this.earlySessions.delete(viewerId);
+    const licensed = Boolean(this.viewer(viewerId)?.data_channels);
     const affected = new Set(this.subscriptions(viewerId).map((sub) => sub.deviceId));
-    for (const deviceId of await this.dropData(viewerId)) affected.add(deviceId);
+    for (const deviceId of await this.dropData(viewerId, true)) affected.add(deviceId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);
+    const members = this.sql
+      .exec<{ device_id: string }>("SELECT device_id FROM members")
+      .toArray()
+      .map((row) => row.device_id);
+    // Every device takes it out of its control state: between PeerConnections it has no channels,
+    // yet it may still control a device. Its channels closed first, so the next one gets canReply fast.
+    if (licensed) {
+      await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
+    }
     if (this.viewerCount() > 0) {
       await this.releaseViewer(viewerId, affected);
       return;
     }
     // Nobody is watching any more. Each device sleeps after its linger time.
-    const members = this.sql
-      .exec<{ device_id: string }>("SELECT device_id FROM members")
-      .toArray()
-      .map((row) => row.device_id);
     await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).unwatch(this.roomId)));
     this.sql.exec("DELETE FROM devices");
   }

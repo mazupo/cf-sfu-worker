@@ -99,7 +99,7 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | Viewer → worker | `take_control` | `deviceId` |
 | Viewer → worker | `release_control` | `deviceId` |
 | Viewer → worker | `control_ready` | `deviceId` |
-| Viewer → worker | `offer` | `sdp`: the viewer's own offer, right after `joined` |
+| Viewer → worker | `offer` | `sdp`: the viewer's own offer, right after `joined`, and again from a new PeerConnection when the last one failed |
 | Worker → viewer | `answer` | `sdp`: the SFU's answer to it |
 | Viewer → worker | `leave` | |
 | Worker → both | `error` | `code`, `message`, `request`, `deviceId`, `trackName`, `retryable` |
@@ -133,6 +133,10 @@ On the device:
 3. After the answer, the worker sends `channels` with the ids of `_lossy` and `_reliable`. Create them.
 
 Every viewer can send its own offer right after `joined`, and the demo viewer always does: create a negotiated channel `server-events` with id 0, then send your offer as `offer`. Apply the `answer`. The PeerConnection connects while the devices wake, so the first video shows sooner. Tracks still come with the SFU's offers. Do this again after an `offer` with `sessionReset`.
+
+When the PeerConnection's state becomes `failed`, for example because the SFU was out of reach for a while, or when your `answer` gets an `error`, create a new one and send its own offer the same way. The worker gives it a new SFU session and forgets your tracks and channels, so subscribe again after the `answer`. You keep control of the devices you controlled. Until that `answer`, ignore any `offer` and `subscribed`: they belong to the old PeerConnection.
+
+Subscribe only while the PeerConnection is connected: the SFU holds a subscribe until then, and the worker handles your requests one at a time, so a stuck one would hold up a new offer. A PeerConnection made while the SFU was out of reach may never connect, even after the SFU is back. When a device turns live, the SFU is reachable: if your PeerConnection is not connected 4 seconds later, start over the same way.
 
 On a viewer whose token has `data_channels`:
 

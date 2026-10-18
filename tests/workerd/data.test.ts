@@ -370,6 +370,67 @@ describe("control", () => {
 });
 
 describe("recovery", () => {
+  test("a viewer that offers again gets a new session, keeps control and subscribes again", async () => {
+    const { calls, device } = await setup();
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await openData(v1);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    const old = sessionOf(calls.filter((call) => call.path.endsWith("/datachannels/establish")).at(-1)!);
+
+    // Its PeerConnection failed, e.g. the SFU was out of reach: a new one sends its own offer.
+    v1.messages.splice(0);
+    v1.send("offer", { sdp: "v=0 viewer-offer-2" });
+    expect(await v1.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    const establish = calls.filter((call) => call.path.endsWith("/datachannels/establish")).at(-1)!;
+    expect(sessionOf(establish)).not.toBe(old);
+    expect(canReplyUpdates(calls)).toContainEqual([old, false]);
+    const rows = await runInDurableObject(env.ROOMS.getByName("lab-a"), async (_instance, state) =>
+      state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM data_subscriptions").one().n,
+    );
+    expect(rows).toBe(0);
+
+    // Still in control: its new channels come with canReply.
+    v1.send("subscribe", { data: ["cam-1"] });
+    const subscribed = await v1.next("subscribed");
+    expect(subscribed.data).toEqual([expect.objectContaining({ deviceId: "cam-1", canReply: true })]);
+    expect(device.has("control")).toBe(false);
+  });
+
+  test("a viewer that leaves between PeerConnections gives up its control", async () => {
+    const { device } = await setup();
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await openData(v1);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    v1.send("offer", { sdp: "v=0 viewer-offer-2" });
+    await v1.next("answer");
+
+    // It leaves before it opens its channels again.
+    v1.send("leave");
+    expect(await device.next("control")).toEqual({ controller: undefined });
+  });
+
+  test("an own offer while an SFU offer waits for its answer starts over instead of failing", async () => {
+    const { device } = await setup();
+    const v1 = await earlyViewer("v1", "lab-a", false);
+    await publishWithData(device);
+    await v1.device("cam-1", "live");
+    v1.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
+    await v1.next("offer");
+    // The PeerConnection that should answer it failed. The new one offers instead.
+    v1.send("offer", { sdp: "v=0 viewer-offer-2" });
+    expect(await v1.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    expect(v1.has("error")).toBe(false);
+
+    v1.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
+    await v1.next("offer");
+    v1.send("answer", { sdp: "v=0 viewer-answer" });
+    expect((await v1.next("subscribed")).tracks).toHaveLength(1);
+  });
+
   test("device channels that did not open after the answer open when the device is ready", async () => {
     mockSfu({ failDeviceChannels: [0] });
     const device = await connect(await deviceToken("cam-1", ["lab-a"]));

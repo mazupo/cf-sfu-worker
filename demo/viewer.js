@@ -71,8 +71,17 @@ let pending = "tracks";
 let busyFailures = 0;
 /** This connection asked for data channels. Fixed until the next join. */
 let ipc = false;
-/** From sending our own offer until the answer. Subscribing before it gets busy. */
-let transportPending = false;
+/**
+ * Our own offers without an answer yet. Only the answer to the last one applies, and subscribing
+ * waits until then.
+ */
+let ownOffers = 0;
+/** Own offers in a row the server could not take, for the backoff. */
+let offerFailures = 0;
+let rebuildTimer = null;
+/** Once a device is live the SFU is reachable, and the PeerConnection gets this long to connect. */
+const CONNECT_GRACE_MS = 4_000;
+let connectCheck = null;
 /** A new PeerConnection after a session reset sends its own offer again. */
 let offerDue = false;
 /** Who this tab is in the room: { room, viewerId }. */
@@ -155,7 +164,12 @@ function leave() {
   connectSeq++;
   clearTimeout(reconnectTimer);
   clearTimeout(syncTimer);
+  clearTimeout(rebuildTimer);
+  clearTimeout(connectCheck);
+  connectCheck = null;
   reconnectTimer = null;
+  ownOffers = 0;
+  offerFailures = 0;
   protocol.send(socket, "leave");
   dropSocket();
   resetPeer(false);
@@ -203,7 +217,9 @@ async function handle(frame) {
       attempt = 0;
       iceServers = message.iceServers;
       me = { room: message.room, viewerId: message.viewerId };
-      if (!message.resumed || !pc) {
+      // An answer to an offer sent on the old socket is lost. Without it, start over.
+      if (!message.resumed || !pc || ownOffers > 0) {
+        ownOffers = 0;
         resetPeer(true);
         connectEarly();
       } else {
@@ -220,6 +236,7 @@ async function handle(frame) {
     case "device":
       devices.set(message.deviceId, message);
       renderTiles();
+      if (message.state === LIVE) checkConnects();
       sync();
       break;
     case "members": {
@@ -238,11 +255,16 @@ async function handle(frame) {
       await onOffer(message);
       break;
     case "answer":
+      ownOffers = Math.max(0, ownOffers - 1);
+      // The answer to an offer from a PeerConnection we have replaced since.
+      if (ownOffers > 0 || !pc) break;
+      offerFailures = 0;
       await pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
-      transportPending = false;
       sync();
       break;
     case "subscribed":
+      // About the session our pending offer replaces.
+      if (ownOffers > 0) break;
       setSubscriptions(message.tracks);
       setData(message.data);
       for (const sub of message.tracks) retries.delete(sub.deviceId);
@@ -285,15 +307,30 @@ function onError(error) {
     ipcNote(error.deviceId, `${errorName(error.code)}: ${error.message}`);
     return;
   }
-  if (["subscribe", "unsubscribe", "answer", "offer"].includes(error.request)) {
+  if (error.request === "offer") {
+    ownOffers = Math.max(0, ownOffers - 1);
+    if (ownOffers > 0) return;
+    // The server could not take our offer, e.g. the SFU did not answer. Start over in a moment.
+    offerFailures++;
+    clearTimeout(rebuildTimer);
+    rebuildTimer = setTimeout(rebuildPeer, Math.min(10_000, 1000 * 2 ** offerFailures));
+    return;
+  }
+  if (error.request === "answer" && error.code !== ErrorCode.ERROR_CODE_NO_OFFER) {
+    // The SFU did not take our answer, so its session and our PeerConnection disagree. Start over.
+    rebuildPeer();
+    return;
+  }
+  if (["subscribe", "unsubscribe", "answer"].includes(error.request)) {
     busy = false;
-    transportPending = false;
     busyFailures++;
     scheduleSync(Math.min(10_000, 1000 * 2 ** busyFailures));
   }
 }
 
 async function onOffer(message) {
+  // For the PeerConnection our pending offer replaces.
+  if (ownOffers > 0) return;
   if (message.sessionReset) {
     resetPeer(true);
     offerDue = true;
@@ -312,10 +349,49 @@ async function onOffer(message) {
  * devices wake, and tracks come later with the SFU's offers. Data channels need it too.
  */
 async function connectEarly() {
-  transportPending = true;
-  pc.createDataChannel("server-events", { negotiated: true, id: 0 });
-  await pc.setLocalDescription(await pc.createOffer());
-  protocol.send(socket, "offer", { sdp: pc.localDescription.sdp });
+  const peer = pc;
+  ownOffers += 1;
+  peer.createDataChannel("server-events", { negotiated: true, id: 0 });
+  await peer.setLocalDescription(await peer.createOffer());
+  if (peer !== pc || socket?.readyState !== WebSocket.OPEN) {
+    ownOffers = Math.max(0, ownOffers - 1); // replaced or disconnected meanwhile: not sent
+    return;
+  }
+  protocol.send(socket, "offer", { sdp: peer.localDescription.sdp });
+}
+
+/**
+ * A device went live, so the SFU is reachable. A PeerConnection made during an SFU outage may never
+ * connect, even while its ICE checks go on, and would only fail after about 15 s. Give it a few
+ * seconds, then start over.
+ */
+function checkConnects() {
+  if (connectCheck || !pc || pc.connectionState === "connected") return;
+  const peer = pc;
+  connectCheck = setTimeout(() => {
+    connectCheck = null;
+    if (peer === pc && ownOffers === 0 && peer.connectionState !== "connected") rebuildPeer();
+  }, CONNECT_GRACE_MS);
+}
+
+/**
+ * Starts over with a new PeerConnection after the last one failed, e.g. the SFU was out of reach
+ * for a while. Our offer gets it a new SFU session; requests for the old one are void, and we
+ * subscribe again once it is answered. Control of devices stays with us.
+ */
+function rebuildPeer() {
+  clearTimeout(rebuildTimer);
+  clearTimeout(connectCheck);
+  connectCheck = null;
+  busy = false;
+  offerDue = false;
+  if (socket?.readyState !== WebSocket.OPEN) {
+    resetPeer(false); // joined starts over
+    return;
+  }
+  log("starting over with a new PeerConnection");
+  resetPeer(true);
+  connectEarly();
 }
 
 function scheduleSync(delay) {
@@ -325,7 +401,9 @@ function scheduleSync(delay) {
 
 /** Brings the subscriptions in line with the devices that are live. One request at a time. */
 function sync() {
-  if (busy || transportPending || socket?.readyState !== WebSocket.OPEN) return;
+  // The SFU holds a subscribe until the PeerConnection is connected, and the server answers our
+  // requests one at a time. So wait: a request stuck there would hold up a new offer.
+  if (busy || ownOffers > 0 || pc?.connectionState !== "connected" || socket?.readyState !== WebSocket.OPEN) return;
 
   // Tracks from a publication that ended: the device slept, restarted or left.
   const stale = [...subscriptions].filter(([, sub]) => {
@@ -451,7 +529,11 @@ function resetPeer(create) {
   pc = peer;
   peer.addEventListener("track", attachTracks);
   peer.addEventListener("connectionstatechange", () => {
-    if (peer === pc) log(`peer ${peer.connectionState}`);
+    if (peer !== pc) return;
+    log(`peer ${peer.connectionState}`);
+    if (peer.connectionState === "connected") sync();
+    // ICE gave up. "disconnected" may still recover on its own; "failed" does not.
+    if (peer.connectionState === "failed") rebuildPeer();
   });
 }
 
