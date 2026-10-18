@@ -204,4 +204,34 @@ describe("rooms", () => {
     expect(await viewer.device("cam-1", "offline")).toMatchObject({ tracks: [] });
     viewer.close();
   });
+
+  test("viewers see who else watches the room", async () => {
+    const alice = await connect(await viewerToken("Alice", "lab-viewers"));
+    expect((await alice.next("joined")).viewers).toEqual([{ viewerId: "Alice", dataChannels: false, away: false }]);
+
+    const bob = await connect(await viewerToken("Bob Lee", "lab-viewers", true));
+    const bobJoined = await bob.next("joined");
+    expect(bobJoined.viewers.map((viewer: { viewerId: string }) => viewer.viewerId)).toEqual(["Alice", "Bob Lee"]);
+    expect(await alice.next("viewers")).toEqual({
+      viewers: [
+        { viewerId: "Alice", dataChannels: false, away: false },
+        { viewerId: "Bob Lee", dataChannels: true, away: false },
+      ],
+    });
+    // Its joined has the list already.
+    expect(bob.has("viewers")).toBe(false);
+
+    const carol = await connect(await viewerToken("carol", "lab-viewers"));
+    await carol.next("joined");
+    expect((await alice.next("viewers")).viewers).toHaveLength(3);
+
+    // A dropped socket may come back, so it stays in the list as away.
+    bob.close();
+    expect((await alice.next("viewers")).viewers[1]).toEqual({ viewerId: "Bob Lee", dataChannels: true, away: true });
+
+    carol.send("leave");
+    await carol.closed();
+    expect((await alice.next("viewers")).viewers.map((viewer: { viewerId: string }) => viewer.viewerId)).toEqual(["Alice", "Bob Lee"]);
+    alice.close();
+  });
 });

@@ -88,9 +88,10 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | Worker → device | `control` | `controller`: who controls the device now. Only for the log. |
 | Device → worker | `ready` | Nothing. Send it when the PeerConnection is connected. Viewers can subscribe only after it. |
 | Worker → device | `sleep` | Nothing. Close the PeerConnection. |
-| Worker → viewer | `joined` | `viewerId`, `room`, `resumed`, `iceServers`, `devices`, `subscriptions`, `data` |
+| Worker → viewer | `joined` | `viewerId`, `room`, `resumed`, `iceServers`, `devices`, `subscriptions`, `data`, `viewers` |
 | Worker → viewer | `device` | One device's new state, with `dataChannels`, `controller`, `handover` and `waiting` |
 | Worker → viewer | `members` | The room's devices changed |
+| Worker → viewer | `viewers` | The room's viewers changed: each has `viewerId`, `dataChannels` and `away` (the socket closed, and it may come back) |
 | Viewer → worker | `subscribe` | `tracks: [{ deviceId, trackName }]`, `data: [deviceId]` |
 | Worker → viewer | `offer` | `sdp`, `tracks`, `sessionReset` |
 | Viewer → worker | `answer` | `sdp` |

@@ -17,6 +17,7 @@ import {
   type Subscription,
   type TakeControl,
   type Unsubscribe,
+  type ViewerInfo,
   type ViewerResponse,
 } from "../proto/cloudflare";
 import { debugInfo, deviceIdMessageSchema, sdpMessageSchema, subscribeSchema, unsubscribeSchema } from "../shared/protocol";
@@ -266,26 +267,35 @@ export class Room extends DurableObject<Env> {
       return jsonError(401, "token_used", "The access token was already used. Request a new one.");
     }
 
+    // First, while nothing has changed yet: once the old socket is closed, this must not wait.
+    const ice = await iceServers(this.env);
+
     const viewerId = claims.sub;
-    const oldSockets = this.ctx.getWebSockets(viewerId);
     let viewer = this.viewer(viewerId);
-    let resumed = false;
     if (viewer) {
       const resumable =
-        oldSockets.length > 0 ||
+        this.ctx.getWebSockets(viewerId).length > 0 ||
         (viewer.socket_closed_at !== null && now - viewer.socket_closed_at <= this.config.viewerResumeMs);
-      if (resumable) {
-        resumed = true;
-      } else {
+      if (!resumable) {
         await this.dropViewer(viewerId);
-        viewer = null;
+      } else if (viewer.data_channels && !claims.grant.dataChannels) {
+        // Resumed without data channels: it closes them and gives up its control.
+        await this.dropData(viewerId);
       }
+      viewer = this.viewer(viewerId);
     }
-    for (const old of oldSockets) closeSocket(old, CloseCode.CLOSE_CODE_REPLACED, "Another connection uses the same viewer_id.");
+    const resumed = viewer !== null;
+    for (const old of this.ctx.getWebSockets(viewerId)) {
+      closeSocket(old, CloseCode.CLOSE_CODE_REPLACED, "Another connection uses the same viewer_id.");
+    }
 
     const wasEmpty = this.viewerCount() === 0;
     if (viewer) {
-      this.sql.exec("UPDATE viewers SET socket_closed_at = NULL WHERE viewer_id = ?", viewerId);
+      this.sql.exec(
+        "UPDATE viewers SET socket_closed_at = NULL, data_channels = ? WHERE viewer_id = ?",
+        claims.grant.dataChannels ? 1 : 0,
+        viewerId,
+      );
     } else {
       this.sql.exec(
         `INSERT INTO viewers (viewer_id, sfu_session_id, negotiating, pending_offer, created_at, socket_closed_at,
@@ -314,12 +324,14 @@ export class Room extends DurableObject<Env> {
         viewerId,
         room: this.roomId,
         resumed,
-        iceServers: await iceServers(this.env),
+        iceServers: ice,
         devices: this.memberInfos(),
         subscriptions: resumed ? this.subscriptions(viewerId) : [],
         data: resumed ? this.dataSubscriptions(viewerId) : [],
+        viewers: this.viewerInfos(),
       },
     });
+    this.broadcastViewers(server);
     // A viewer that dropped while an offer was pending gets the same offer again.
     if (resumed && viewer?.negotiating && viewer.pending_offer) {
       sendViewer(server, {
@@ -401,6 +413,7 @@ export class Room extends DurableObject<Env> {
       now,
       attachment.viewerId,
     );
+    this.broadcastViewers();
     await this.scheduleAlarm(now);
   }
 
@@ -797,6 +810,7 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("DELETE FROM used_tokens WHERE expires_at <= ?", now);
 
     // Half-open sockets: the socket exists but pings stopped.
+    let wentAway = false;
     for (const ws of this.ctx.getWebSockets()) {
       if (ws.readyState !== WebSocket.OPEN || now - this.lastSeen(ws) <= this.config.viewerStaleMs) continue;
       const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
@@ -808,8 +822,10 @@ export class Room extends DurableObject<Env> {
           now,
           attachment.viewerId,
         );
+        wentAway = true;
       }
     }
+    if (wentAway) this.broadcastViewers();
 
     // Viewers that did not come back in time.
     const expired = this.sql
@@ -1056,6 +1072,7 @@ export class Room extends DurableObject<Env> {
     for (const deviceId of await this.dropData(viewerId, true)) affected.add(deviceId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);
+    this.broadcastViewers();
     const members = this.sql
       .exec<{ device_id: string }>("SELECT device_id FROM members")
       .toArray()
@@ -1081,10 +1098,25 @@ export class Room extends DurableObject<Env> {
     }
   }
 
-  private broadcast(message: ViewerResponse): void {
+  private broadcast(message: ViewerResponse, except?: WebSocket): void {
     for (const ws of this.ctx.getWebSockets()) {
-      if (ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
+      if (ws !== except && ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
     }
+  }
+
+  /** Everyone in the room, oldest first, as the viewers see them. */
+  private viewerInfos(): ViewerInfo[] {
+    return this.sql
+      .exec<{ viewer_id: string; data_channels: number; socket_closed_at: number | null }>(
+        "SELECT viewer_id, data_channels, socket_closed_at FROM viewers ORDER BY created_at, viewer_id",
+      )
+      .toArray()
+      .map((row) => ({ viewerId: row.viewer_id, dataChannels: Boolean(row.data_channels), away: row.socket_closed_at !== null }));
+  }
+
+  /** Tells the viewers who is in the room now. `except` already has it, e.g. in its joined. */
+  private broadcastViewers(except?: WebSocket): void {
+    this.broadcast({ viewers: { viewers: this.viewerInfos() } }, except);
   }
 
   private fail(ws: WebSocket, code: ErrorCode, message: string, request: string): void {
