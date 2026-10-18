@@ -26,6 +26,9 @@
       <label>Room
         <input name="room" id="room" required pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,63}" value="lab-a">
       </label>
+      <label title="Leave it empty for a random ID. Kept for this tab only, so two tabs do not share one ID.">Viewer ID
+        <input id="viewer-id" maxlength="64" placeholder="random" autocomplete="off">
+      </label>
       <label class="check" title="Open the devices' data channels and take control of a device. Choose before you join.">
         <input type="checkbox" name="ipc" id="ipc"> Enable IPC
       </label>

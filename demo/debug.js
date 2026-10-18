@@ -117,22 +117,38 @@ function deviceTable(devices) {
 function viewerTable(room) {
   const now = room.now;
   return table(
-    ["Viewer", "Socket", "Last ping", "Socket closed", "SFU session", "Offer pending", "Subscriptions"],
+    ["Viewer", "State", "SFU session", "IPC", "Socket", "Last ping", "Subscriptions"],
     room.viewers.map((viewer) => {
       const open = viewer.sockets.find((socket) => socket.readyState === 1);
       return [
         short(viewer.viewerId),
+        chip(viewer.state),
+        short(viewer.sfuSessionId),
+        viewer.dataChannels ? "yes" : "no",
         viewer.sockets.length
           ? viewer.sockets.map((socket) => `${SOCKET_STATES[socket.readyState] ?? socket.readyState}, ${ago(socket.connectedAt, now)}`).join("; ")
           : "none",
         open ? ago(open.lastPing ?? open.connectedAt, now) : "—",
-        viewer.socketClosedAt ? ago(viewer.socketClosedAt, now) : "",
-        short(viewer.sfuSessionId),
-        viewer.negotiating ? "yes" : "",
-        viewer.subscriptions.map((sub) => `${sub.deviceId}/${sub.trackName} g${sub.generation} mid ${sub.mid}`).join("\n"),
+        subscriptionList(viewer),
       ];
     }),
   );
+}
+
+/** One line per track, then one per device whose data channels the viewer has, marked when it controls that device. */
+function subscriptionList(viewer) {
+  const list = document.createElement("div");
+  for (const sub of viewer.subscriptions) list.append(line(`${sub.deviceId}/${sub.trackName} mid ${sub.mid}`));
+  for (const data of viewer.data) {
+    const item = line(`${data.deviceId} ${data.channels.map((channel) => `${channel.label} id ${channel.id}`).join(", ")} `);
+    if (data.canReply) item.append(chip("control"));
+    list.append(item);
+  }
+  return list;
+}
+
+function line(text) {
+  return Object.assign(document.createElement("div"), { textContent: text });
 }
 
 function table(headers, rows) {
@@ -171,8 +187,11 @@ function note(text) {
   return Object.assign(document.createElement("p"), { className: "empty", textContent: text });
 }
 
+/** Long IDs, such as SFU sessions and random viewer IDs, show their first 8 characters. */
 function short(id) {
-  return id ? `${String(id).slice(0, 8)}…` : "—";
+  if (!id) return "—";
+  const text = String(id);
+  return text.length > 12 ? `${text.slice(0, 8)}…` : text;
 }
 
 function ago(timestamp, now) {

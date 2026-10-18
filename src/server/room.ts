@@ -857,6 +857,7 @@ export class Room extends DurableObject<Env> {
         })),
       viewers: viewers.map((viewer) => ({
         viewerId: viewer.viewer_id,
+        state: viewerState(viewer),
         sfuSessionId: viewer.sfu_session_id,
         negotiating: Boolean(viewer.negotiating),
         pendingOfferBytes: viewer.pending_offer?.length ?? 0,
@@ -1086,6 +1087,16 @@ export class Room extends DurableObject<Env> {
     this.ready = false;
     return true;
   }
+}
+
+/**
+ * For the debug view. away: the socket closed and the viewer may still resume. joined: no SFU
+ * session yet. ready: it has one.
+ */
+function viewerState(viewer: ViewerRow): "away" | "negotiating" | "joined" | "ready" {
+  if (viewer.socket_closed_at !== null) return "away";
+  if (viewer.negotiating) return "negotiating";
+  return viewer.sfu_session_id ? "ready" : "joined";
 }
 
 function offlineInfo(deviceId: string): DeviceInfo {

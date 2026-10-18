@@ -22,7 +22,9 @@ test("the debug view shows the room, its viewers and its devices", async () => {
   expect(response.status).toBe(200);
   const body = await response.json<any>();
   expect(body.room.members).toEqual([expect.objectContaining({ device_id: "cam-1" })]);
-  expect(body.room.viewers).toEqual([expect.objectContaining({ viewerId: "v1", sockets: [expect.objectContaining({ readyState: 1 })] })]);
+  expect(body.room.viewers).toEqual([
+    expect.objectContaining({ viewerId: "v1", state: "joined", sockets: [expect.objectContaining({ readyState: 1 })] }),
+  ]);
   expect(body.devices[0]).toMatchObject({
     deviceId: "cam-1",
     online: true,

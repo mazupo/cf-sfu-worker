@@ -34,12 +34,26 @@ const form = document.getElementById("join-form");
 const joinButton = document.getElementById("join");
 const leaveButton = document.getElementById("leave");
 const ipcInput = document.getElementById("ipc");
+// It has no name, so persistForm does not share it between tabs. Each tab keeps its own.
+const viewerIdInput = document.getElementById("viewer-id");
 const statusEl = document.getElementById("status");
 const tilesEl = document.getElementById("tiles");
 const log = createLog(document.getElementById("log"));
 
 document.getElementById("worker-url").value = location.origin;
 persistForm(form, "cf-sfu-worker.viewer");
+try {
+  viewerIdInput.value = sessionStorage.getItem("cf-sfu-worker.viewerIdInput") ?? "";
+} catch {
+  // ignore
+}
+viewerIdInput.addEventListener("input", () => {
+  try {
+    sessionStorage.setItem("cf-sfu-worker.viewerIdInput", viewerIdInput.value);
+  } catch {
+    // ignore
+  }
+});
 
 /** The one socket this tab uses. Events from any older socket are ignored. */
 let socket = null;
@@ -72,6 +86,8 @@ const dataRetries = new Map(); // deviceId -> { generation, count, at }
 const tiles = new Map(); // deviceId -> { root, video, chip, note, ipc }
 
 function viewerId() {
+  const typed = viewerIdInput.value.trim();
+  if (typed) return typed;
   // One ID per tab, so a reload resumes instead of joining again.
   try {
     let id = sessionStorage.getItem("cf-sfu-worker.viewerId");
@@ -101,6 +117,7 @@ async function join() {
   joinButton.disabled = true;
   leaveButton.disabled = false;
   ipcInput.disabled = true;
+  viewerIdInput.disabled = true;
   setStatus("Requesting a token…");
   try {
     const { token, url } = await requestToken(data.get("workerUrl"), data.get("viewerKey"), {
@@ -150,6 +167,7 @@ function leave() {
   joinButton.disabled = false;
   leaveButton.disabled = true;
   ipcInput.disabled = false;
+  viewerIdInput.disabled = false;
   setStatus("Left the room.");
 }
 

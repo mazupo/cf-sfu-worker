@@ -76,6 +76,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 .chip.waking { color: var(--warn); }
 .chip.sleeping { color: var(--muted); }
 .chip.offline { color: var(--bad); }
+.chip.ready, .chip.control { color: var(--ok); }
+.chip.negotiating { color: var(--warn); }
+.chip.joined { color: var(--muted); }
+.chip.away { color: var(--bad); }
 .empty { color: var(--muted); }
 pre.log {
   margin: 0;
