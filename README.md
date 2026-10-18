@@ -98,6 +98,8 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | Viewer → worker | `take_control` | `deviceId` |
 | Viewer → worker | `release_control` | `deviceId` |
 | Viewer → worker | `control_ready` | `deviceId` |
+| Viewer → worker | `offer` | `sdp`: the viewer's own offer, right after `joined` |
+| Worker → viewer | `answer` | `sdp`: the SFU's answer to it |
 | Viewer → worker | `leave` | |
 | Worker → both | `error` | `code`, `message`, `request`, `deviceId`, `trackName`, `retryable` |
 
@@ -129,9 +131,11 @@ On the device:
 2. Send the offer with `dataChannels: true`.
 3. After the answer, the worker sends `channels` with the ids of `_lossy` and `_reliable`. Create them.
 
+Every viewer can send its own offer right after `joined`, and the demo viewer always does: create a negotiated channel `server-events` with id 0, then send your offer as `offer`. Apply the `answer`. The PeerConnection connects while the devices wake, so the first video shows sooner. Tracks still come with the SFU's offers. Do this again after an `offer` with `sessionReset`.
+
 On a viewer whose token has `data_channels`:
 
-1. Right after `joined`, the worker sends an `offer` that sets up the data channel transport. Answer it like any offer. The PeerConnection connects while the devices wake.
+1. Send your own offer as above. Data channels need it.
 2. When a device is live with `dataChannels`, send `subscribe` with `data: [deviceId]`. `subscribed` lists its two channels.
 3. To send to the device, send `take_control`. If somebody else controls it, you wait in line.
 4. When the worker hands you control, `subscribed` has `canReply: true` for the device. Once its channels are open, send `control_ready`. If you do not do this within 5 seconds, the next viewer in line gets control.

@@ -26,15 +26,17 @@ async function setup(rooms = ["lab-a"]) {
   return { calls, device };
 }
 
-/** A viewer whose token asks for data channels. It answers the transport offer sent at join. */
-async function dataViewer(viewerId: string, room = "lab-a"): Promise<TestSocket> {
-  const viewer = await connect(await viewerToken(viewerId, room, true));
+/** Joins and sends its own offer, as every viewer page does. */
+async function earlyViewer(viewerId: string, room = "lab-a", dataChannels = true): Promise<TestSocket> {
+  const viewer = await connect(await viewerToken(viewerId, room, dataChannels));
   expect(await viewer.next("joined")).toMatchObject({ viewerId, room });
-  expect(await viewer.next("offer")).toEqual({ sdp: "v=0 datachannel-offer", tracks: [], sessionReset: false });
-  viewer.send("answer", { sdp: "v=0 viewer-answer" });
-  expect(await viewer.next("subscribed")).toEqual({ tracks: [], data: [] });
+  viewer.send("offer", { sdp: "v=0 viewer-offer" });
+  expect(await viewer.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
   return viewer;
 }
+
+/** A viewer whose token asks for data channels. */
+const dataViewer = (viewerId: string, room = "lab-a") => earlyViewer(viewerId, room, true);
 
 /** Answers the wake with an offer that has data channels, then goes live. */
 async function publishWithData(device: TestSocket) {
@@ -107,7 +109,7 @@ describe("data channels", () => {
     expect(await viewer.device("cam-1", "live")).toMatchObject({ dataChannels: true });
   });
 
-  test("a viewer with data_channels gets the transport offer at join and opens a device's channels", async () => {
+  test("a viewer with data_channels sends its own offer and opens a device's channels", async () => {
     const { calls, device } = await setup();
     const viewer = await dataViewer("v1");
     await publishWithData(device);
@@ -121,6 +123,12 @@ describe("data channels", () => {
       canReply: false,
     });
     const establish = calls.find((call) => call.path.endsWith("/datachannels/establish"))!;
+    expect(establish.body).toEqual({
+      dataChannel: { location: "remote", dataChannelName: "server-events" },
+      sessionDescription: { type: "offer", sdp: "v=0 viewer-offer" },
+    });
+    // The SFU answered the viewer's offer, so there is nothing to renegotiate.
+    expect(calls.some((call) => call.path.endsWith("/renegotiate"))).toBe(false);
     const pulled = calls.filter((call) => call.path.endsWith("/datachannels/new")).at(-1)!;
     expect(sessionOf(pulled)).toBe(sessionOf(establish));
     const deviceSession = publisherSessions(calls)[0];
@@ -130,13 +138,20 @@ describe("data channels", () => {
     ]);
   });
 
-  test("a viewer without data_channels gets no transport offer and cannot open channels or take control", async () => {
-    const { device } = await setup();
-    const viewer = await connect(await viewerToken("v1", "lab-a"));
-    await viewer.next("joined");
+  test("a viewer without data_channels can send its own offer, but cannot open channels or take control", async () => {
+    const { calls, device } = await setup();
+    const viewer = await earlyViewer("v1", "lab-a", false);
     await publishWithData(device);
     await viewer.device("cam-1", "live");
-    expect(viewer.has("offer")).toBe(false);
+
+    // Its tracks come with the SFU's offer on the session its own offer set up.
+    viewer.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
+    await viewer.next("offer");
+    viewer.send("answer", { sdp: "v=0 viewer-answer" });
+    expect((await viewer.next("subscribed")).tracks).toHaveLength(1);
+    const establish = calls.find((call) => call.path.endsWith("/datachannels/establish"))!;
+    const pulled = calls.filter((call) => call.path.endsWith("/tracks/new")).at(-1)!;
+    expect(sessionOf(pulled)).toBe(sessionOf(establish));
 
     viewer.send("subscribe", { data: ["cam-1"] });
     expect(await viewer.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_DATA_CHANNELS_OFF, request: "subscribe" });
@@ -146,6 +161,16 @@ describe("data channels", () => {
       request: "take_control",
       deviceId: "cam-1",
     });
+  });
+
+  test("opening a device's channels needs the data transport first", async () => {
+    const { device } = await setup();
+    const viewer = await connect(await viewerToken("v1", "lab-a", true));
+    await viewer.next("joined");
+    await publishWithData(device);
+    await viewer.device("cam-1", "live");
+    viewer.send("subscribe", { data: ["cam-1"] });
+    expect(await viewer.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_BUSY, request: "subscribe" });
   });
 
   test("taking control needs the device's channels open first", async () => {

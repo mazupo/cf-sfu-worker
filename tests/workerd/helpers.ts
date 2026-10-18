@@ -227,9 +227,9 @@ export function mockSfu(options: { missingTrack?: string; expireFirstPublish?: b
     http.post(`${SFU}/sessions/:sessionId/datachannels/establish`, async ({ request }) => {
       await record(request);
       return HttpResponse.json({
-        requiresImmediateRenegotiation: true,
+        requiresImmediateRenegotiation: false,
         dataChannel: { dataChannelName: "server-events", id: 0 },
-        sessionDescription: { type: "offer", sdp: "v=0 datachannel-offer" },
+        sessionDescription: { type: "answer", sdp: "v=0 datachannel-answer" },
       });
     }),
     http.post(`${SFU}/sessions/:sessionId/datachannels/new`, async ({ request, params }) => {

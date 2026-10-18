@@ -98,7 +98,8 @@ export const subscribeSchema = z
   })
   .refine((message) => message.tracks.length > 0 || message.data.length > 0);
 
-export const subscribeAnswerSchema = z.object({ sdp: sdpSchema });
+/** An answer or an offer from a viewer. */
+export const sdpMessageSchema = z.object({ sdp: sdpSchema });
 
 export const unsubscribeSchema = z
   .object({ mids: z.array(midSchema).max(64), data: z.array(idSchema).max(16) })

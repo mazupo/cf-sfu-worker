@@ -57,8 +57,10 @@ let pending = "tracks";
 let busyFailures = 0;
 /** This connection asked for data channels. Fixed until the next join. */
 let ipc = false;
-/** Waiting for the data channel offer the server sends right after joined. */
+/** From sending our own offer until the answer. Subscribing before it gets busy. */
 let transportPending = false;
+/** A new PeerConnection after a session reset sends its own offer again. */
+let offerDue = false;
 /** Who this tab is in the room: { room, viewerId }. */
 let me = null;
 const devices = new Map(); // deviceId -> DeviceInfo
@@ -185,8 +187,7 @@ async function handle(frame) {
       me = { room: message.room, viewerId: message.viewerId };
       if (!message.resumed || !pc) {
         resetPeer(true);
-        // The server sends the data channel offer next. Subscribing before it is answered gets busy.
-        transportPending = ipc;
+        connectEarly();
       } else {
         setSubscriptions(message.subscriptions);
         setData(message.data);
@@ -214,15 +215,23 @@ async function handle(frame) {
     case "offer":
       await onOffer(message);
       break;
+    case "answer":
+      await pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
+      transportPending = false;
+      sync();
+      break;
     case "subscribed":
       setSubscriptions(message.tracks);
       setData(message.data);
       for (const sub of message.tracks) retries.delete(sub.deviceId);
       for (const sub of message.data) dataRetries.delete(sub.deviceId);
       busy = false;
-      transportPending = false;
       busyFailures = 0;
       attachTracks();
+      if (offerDue) {
+        offerDue = false;
+        connectEarly();
+      }
       sync();
       break;
     case "error":
@@ -254,7 +263,7 @@ function onError(error) {
     ipcNote(error.deviceId, `${errorName(error.code)}: ${error.message}`);
     return;
   }
-  if (["subscribe", "unsubscribe", "answer"].includes(error.request)) {
+  if (["subscribe", "unsubscribe", "answer", "offer"].includes(error.request)) {
     busy = false;
     transportPending = false;
     busyFailures++;
@@ -263,13 +272,28 @@ function onError(error) {
 }
 
 async function onOffer(message) {
-  if (message.sessionReset) resetPeer(true);
+  if (message.sessionReset) {
+    resetPeer(true);
+    offerDue = true;
+  }
   setSubscriptions(message.tracks);
   await pc.setRemoteDescription({ type: "offer", sdp: message.sdp });
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
   protocol.send(socket, "answer", { sdp: answer.sdp });
   attachTracks();
+}
+
+/**
+ * Connects the PeerConnection with our own offer, like pi-webrtc does: any channel puts an
+ * m=application section in it. The SFU answers at once, so the PeerConnection connects while the
+ * devices wake, and tracks come later with the SFU's offers. Data channels need it too.
+ */
+async function connectEarly() {
+  transportPending = true;
+  pc.createDataChannel("server-events", { negotiated: true, id: 0 });
+  await pc.setLocalDescription(await pc.createOffer());
+  protocol.send(socket, "offer", { sdp: pc.localDescription.sdp });
 }
 
 function scheduleSync(delay) {
@@ -407,8 +431,6 @@ function resetPeer(create) {
   peer.addEventListener("connectionstatechange", () => {
     if (peer === pc) log(`peer ${peer.connectionState}`);
   });
-  // The SFU opens "server-events" itself when the data channel transport is set up.
-  peer.addEventListener("datachannel", (event) => log(`data channel ${event.channel.label} opened by the SFU`));
 }
 
 /** Puts each received track on the tile of the device it came from, matched by mid. */

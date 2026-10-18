@@ -109,15 +109,18 @@ export class RealtimeSfu {
     });
   }
 
-  /** Asks for an offer that adds the data channel transport to the session. */
-  async establishDataChannels(sessionId: string): Promise<SessionDescription> {
+  /** Answers a viewer's own offer: it adds the data channel transport to the session. */
+  async establishDataChannels(sessionId: string, sdp: string): Promise<SessionDescription> {
     const body = await this.request<TracksResponse>(
       "POST",
       `/sessions/${encodeURIComponent(sessionId)}/datachannels/establish`,
-      { dataChannel: { location: "remote", dataChannelName: "server-events" } },
+      {
+        dataChannel: { location: "remote", dataChannelName: "server-events" },
+        sessionDescription: { type: "offer", sdp },
+      },
     );
-    if (body.sessionDescription?.type !== "offer") {
-      throw new SfuError("sfu_offer_missing", "The SFU did not offer a data channel transport.", 502);
+    if (body.sessionDescription?.type !== "answer") {
+      throw new SfuError("sfu_answer_missing", "The SFU did not answer the data channel offer.", 502);
     }
     return body.sessionDescription;
   }

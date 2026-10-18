@@ -12,19 +12,14 @@ import {
   type ReleaseControl,
   type Subscribe,
   type SubscribeAnswer,
+  type SubscribeOffer,
   type Subscribed,
   type Subscription,
   type TakeControl,
   type Unsubscribe,
   type ViewerResponse,
 } from "../proto/cloudflare";
-import {
-  debugInfo,
-  deviceIdMessageSchema,
-  subscribeAnswerSchema,
-  subscribeSchema,
-  unsubscribeSchema,
-} from "../shared/protocol";
+import { debugInfo, deviceIdMessageSchema, sdpMessageSchema, subscribeSchema, unsubscribeSchema } from "../shared/protocol";
 import { PRESENCE_CHECK_MS, WATCH_RENEW_MS, settings, type Settings } from "./config";
 import { deviceChannels, iceServers, RealtimeSfu, SfuError, type TrackObject, type TracksResponse } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
@@ -43,8 +38,7 @@ const CLOSE_LEFT = 1000;
 
 /** The data channel transport of a viewer's session. */
 const DATA_NONE = 0;
-const DATA_OFFERED = 1;
-const DATA_READY = 2;
+const DATA_READY = 1;
 
 type ViewerRow = {
   viewer_id: string;
@@ -55,7 +49,7 @@ type ViewerRow = {
   socket_closed_at: number | null;
   /** The token asked for data_channels. */
   data_channels: number;
-  data_transport: typeof DATA_NONE | typeof DATA_OFFERED | typeof DATA_READY;
+  data_transport: typeof DATA_NONE | typeof DATA_READY;
 };
 
 type DataSubscriptionRow = {
@@ -332,12 +326,6 @@ export class Room extends DurableObject<Env> {
         offer: { sdp: viewer.pending_offer, tracks: this.subscriptions(viewerId), sessionReset: false },
       });
     }
-    // A viewer with data channels gets the transport offer right away, so its PeerConnection
-    // connects while the devices wake.
-    const current = this.viewer(viewerId)!;
-    if (current.data_channels && current.data_transport === DATA_NONE && !current.negotiating) {
-      void this.queue.run(viewerId, () => this.establishData(server, viewerId));
-    }
     await this.scheduleAlarm(now);
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -368,7 +356,7 @@ export class Room extends DurableObject<Env> {
           this.fail(ws, sfu ? ErrorCode.ERROR_CODE_SFU : ErrorCode.ERROR_CODE_INTERNAL, message, name);
         }
       });
-    const { subscribe, answer, unsubscribe, leave, takeControl, releaseControl, controlReady } = request;
+    const { subscribe, answer, unsubscribe, leave, takeControl, releaseControl, controlReady, offer } = request;
     if (subscribe) {
       await run(() => this.onSubscribe(ws, viewerId, subscribe));
     } else if (answer) {
@@ -386,6 +374,8 @@ export class Room extends DurableObject<Env> {
       await run(() => this.onReleaseControl(ws, viewerId, releaseControl));
     } else if (controlReady) {
       await run(() => this.onControlReady(ws, viewerId, controlReady));
+    } else if (offer) {
+      await run(() => this.onViewerOffer(ws, viewerId, offer));
     }
   }
 
@@ -500,6 +490,7 @@ export class Room extends DurableObject<Env> {
       // The session expired, e.g. it was made at join time and nothing was live for a long
       // time. The viewer has to start a new PeerConnection for the new one.
       this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
+      // The new PeerConnection has no data channel transport either. The viewer sends its offer again.
       await this.dropData(viewerId);
       this.sql.exec("UPDATE viewers SET data_transport = ? WHERE viewer_id = ?", DATA_NONE, viewerId);
       sessionId = await this.newSession(sfu, viewerId);
@@ -535,7 +526,7 @@ export class Room extends DurableObject<Env> {
   }
 
   private async onAnswer(ws: WebSocket, viewerId: string, message: SubscribeAnswer): Promise<void> {
-    const parsed = subscribeAnswerSchema.safeParse(message);
+    const parsed = sdpMessageSchema.safeParse(message);
     if (!parsed.success) {
       this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "answer needs an sdp.", "answer");
       return;
@@ -546,42 +537,45 @@ export class Room extends DurableObject<Env> {
       return;
     }
     await new RealtimeSfu(this.env).renegotiate(viewer.sfu_session_id, parsed.data.sdp);
-    this.sql.exec(
-      "UPDATE viewers SET negotiating = 0, pending_offer = NULL, data_transport = ? WHERE viewer_id = ?",
-      viewer.data_transport === DATA_OFFERED ? DATA_READY : viewer.data_transport,
-      viewerId,
-    );
+    this.sql.exec("UPDATE viewers SET negotiating = 0, pending_offer = NULL WHERE viewer_id = ?", viewerId);
     sendViewer(ws, { subscribed: this.subscribed(viewerId) });
-    // A new session (after an expired one) needs the data channel transport again.
-    await this.establishData(ws, viewerId);
   }
 
-  /** Adds the data channel transport to the viewer's session and sends the SFU's offer. */
-  private async establishData(ws: WebSocket, viewerId: string): Promise<void> {
-    const viewer = this.viewer(viewerId);
-    if (!viewer?.data_channels || viewer.data_transport !== DATA_NONE || viewer.negotiating) return;
-    const sfu = new RealtimeSfu(this.env);
-    try {
-      let sessionId = viewer.sfu_session_id;
-      if (!sessionId) {
-        const early = this.earlySessions.get(viewerId);
-        this.earlySessions.delete(viewerId);
-        sessionId = (early && (await early)) || (await sfu.createSession());
-        this.sql.exec("UPDATE viewers SET sfu_session_id = ? WHERE viewer_id = ?", sessionId, viewerId);
-      }
-      const offer = await sfu.establishDataChannels(sessionId);
-      this.sql.exec(
-        "UPDATE viewers SET negotiating = 1, pending_offer = ?, data_transport = ? WHERE viewer_id = ?",
-        offer.sdp,
-        DATA_OFFERED,
-        viewerId,
-      );
-      sendViewer(ws, { offer: { sdp: offer.sdp, tracks: this.subscriptions(viewerId), sessionReset: false } });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "The data channels could not be set up.";
-      console.log(JSON.stringify({ event: "establish_failed", room: this.roomId, viewerId, code: error instanceof SfuError ? error.code : "internal" }));
-      this.fail(ws, ErrorCode.ERROR_CODE_SFU, `Data channels: ${message}`, "subscribe");
+  /**
+   * The viewer's own offer, with only an m=application section. The SFU answers it at once: one SFU
+   * call, no renegotiate. The viewer connects only once the SFU has the whole exchange, which avoids
+   * most DTLS waits, and it connects while the devices wake. Data channels need this transport.
+   */
+  private async onViewerOffer(ws: WebSocket, viewerId: string, message: SubscribeOffer): Promise<void> {
+    const parsed = sdpMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "offer needs an sdp.", "offer");
+      return;
     }
+    const viewer = this.viewer(viewerId)!;
+    if (viewer.negotiating) {
+      this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Send the answer for the last offer first.", "offer");
+      return;
+    }
+    const sfu = new RealtimeSfu(this.env);
+    let sessionId = viewer.sfu_session_id;
+    if (!sessionId) {
+      const early = this.earlySessions.get(viewerId);
+      this.earlySessions.delete(viewerId);
+      sessionId = (early && (await early)) || (await sfu.createSession());
+      this.sql.exec("UPDATE viewers SET sfu_session_id = ? WHERE viewer_id = ?", sessionId, viewerId);
+    }
+    let answer;
+    try {
+      answer = await sfu.establishDataChannels(sessionId, parsed.data.sdp);
+    } catch (error) {
+      // A session made at join time can expire before the offer. One with tracks cannot be replaced here.
+      if (!(error instanceof SfuError && error.sessionGone) || this.subscriptions(viewerId).length > 0) throw error;
+      sessionId = await this.newSession(sfu, viewerId);
+      answer = await sfu.establishDataChannels(sessionId, parsed.data.sdp);
+    }
+    this.sql.exec("UPDATE viewers SET data_transport = ? WHERE viewer_id = ?", DATA_READY, viewerId);
+    sendViewer(ws, { answer: { sdp: answer.sdp } });
   }
 
   /** Pulls each device's _lossy and _reliable into the viewer's session. No SDP needed. */
@@ -593,7 +587,7 @@ export class Room extends DurableObject<Env> {
     }
     const sessionId = viewer.sfu_session_id;
     if (viewer.data_transport !== DATA_READY || !sessionId) {
-      this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Answer the data channel offer first.", "subscribe");
+      this.fail(ws, ErrorCode.ERROR_CODE_BUSY, "Send your own offer first.", "subscribe");
       return;
     }
     const sfu = new RealtimeSfu(this.env);
@@ -875,7 +869,7 @@ export class Room extends DurableObject<Env> {
         })),
         subscriptions: this.subscriptions(viewer.viewer_id),
         dataChannels: Boolean(viewer.data_channels),
-        dataTransport: ["none", "offered", "ready"][viewer.data_transport] ?? null,
+        dataTransport: viewer.data_transport === DATA_READY ? "ready" : "none",
         data: this.dataSubscriptions(viewer.viewer_id),
       })),
       alarm: await this.ctx.storage.getAlarm(),
