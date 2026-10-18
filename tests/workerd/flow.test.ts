@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { ErrorCode, ViewerRequest } from "../../src/proto/cloudflare";
 import {
@@ -190,6 +190,65 @@ describe("watching", () => {
     third.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
     expect(await third.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_VIEWER_LIMIT, request: "subscribe" });
     for (const socket of [viewer, second, third, device]) socket.close();
+  });
+
+  test("viewers who subscribe at the same time all count toward the limit", async () => {
+    const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
+    const viewers = [viewer];
+    for (const viewerId of ["v2", "v3"]) {
+      const other = await connect(await viewerToken(viewerId, "lab-a"));
+      await other.next("joined");
+      viewers.push(other);
+    }
+    for (const socket of viewers) socket.send("subscribe", { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] });
+    const outcomes = await Promise.all(
+      viewers.map((socket) =>
+        vi.waitFor(() => {
+          const message = socket.messages.find((item) => item.offer || item.error);
+          if (!message) throw new Error("no reply yet");
+          return message.offer ? "offer" : message.error.code;
+        }),
+      ),
+    );
+    expect(outcomes.filter((outcome) => outcome === "offer")).toHaveLength(2);
+    expect(outcomes.filter((outcome) => outcome === ErrorCode.ERROR_CODE_VIEWER_LIMIT)).toHaveLength(1);
+
+    const counted = await runInDurableObject(env.DEVICES.getByName("cam-1"), async (_instance, state) =>
+      state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM room_viewers WHERE room_id = 'lab-a'").one(),
+    );
+    expect(counted.n).toBe(2);
+    for (const socket of [...viewers, device]) socket.close();
+  });
+
+  test("a viewer stops counting once it leaves, and a renewal drops viewers the room no longer has", async () => {
+    const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
+    await subscribeAll(viewer, "cam-1");
+    const second = await connect(await viewerToken("v2", "lab-a"));
+    await second.next("joined");
+    await subscribeAll(second, "cam-1");
+    second.send("leave");
+    await second.closed();
+
+    const third = await connect(await viewerToken("v3", "lab-a"));
+    await third.next("joined");
+    await subscribeAll(third, "cam-1");
+
+    // A row the room lost track of, e.g. a subscribe cut short by a deploy, goes with the next renewal.
+    const deviceStub = env.DEVICES.getByName("cam-1");
+    await runInDurableObject(deviceStub, (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM room_viewers WHERE viewer_id = 'v3'");
+      state.storage.sql.exec("INSERT INTO room_viewers VALUES ('lab-a', 'ghost', ?)", Date.now() - 120_000);
+      state.storage.sql.exec("INSERT INTO room_viewers VALUES ('lab-a', 'v3', ?)", Date.now() - 120_000);
+    });
+    await runInDurableObject(env.ROOMS.getByName("lab-a"), (_instance, state) => {
+      state.storage.sql.exec("UPDATE devices SET lease_renewed_at = 0");
+    });
+    await runDurableObjectAlarm(env.ROOMS.getByName("lab-a"));
+    const viewers = await runInDurableObject(deviceStub, async (_instance, state) =>
+      state.storage.sql.exec<{ viewer_id: string }>("SELECT viewer_id FROM room_viewers ORDER BY viewer_id").toArray(),
+    );
+    expect(viewers.map((row) => row.viewer_id)).toEqual(["v1", "v3"]);
+    for (const socket of [viewer, third, device]) socket.close();
   });
 
   test("a wake that gets no offer is sent again, then reported", async () => {

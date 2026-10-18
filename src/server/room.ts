@@ -358,7 +358,8 @@ export class Room extends DurableObject<Env> {
       });
     const { subscribe, answer, unsubscribe, leave, takeControl, releaseControl, controlReady, offer } = request;
     if (subscribe) {
-      await run(() => this.onSubscribe(ws, viewerId, subscribe));
+      const asked = [...subscribe.tracks.map((track) => track.deviceId), ...subscribe.data];
+      await run(() => this.onSubscribe(ws, viewerId, subscribe).finally(() => this.releaseViewer(viewerId, asked)));
     } else if (answer) {
       await run(() => this.onAnswer(ws, viewerId, answer));
     } else if (unsubscribe) {
@@ -439,8 +440,7 @@ export class Room extends DurableObject<Env> {
     const remote: TrackObject[] = [];
     const wanted: Array<{ deviceId: string; trackName: string; generation: number }> = [];
     for (const [deviceId, names] of byDevice) {
-      const count = this.subscriberCount(deviceId) + (this.isSubscribedTo(viewerId, deviceId) ? 0 : 1);
-      const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, count);
+      const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, viewerId);
       if (!resolved.ok) {
         this.failTrack(ws, {
           code: resolved.code,
@@ -596,8 +596,7 @@ export class Room extends DurableObject<Env> {
         this.failTrack(ws, { code: ErrorCode.ERROR_CODE_NOT_MEMBER, message: `${deviceId} is not in this room.`, deviceId });
         continue;
       }
-      const count = this.subscriberCount(deviceId) + (this.isSubscribedTo(viewerId, deviceId) ? 0 : 1);
-      const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, count, viewerId);
+      const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, viewerId);
       if (!resolved.ok) {
         this.failTrack(ws, {
           code: resolved.code,
@@ -649,7 +648,7 @@ export class Room extends DurableObject<Env> {
       this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ? AND device_id = ?", viewer.viewer_id, deviceId);
       await this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewer.viewer_id).catch(() => undefined);
     }
-    await this.updateCounts(new Set(deviceIds));
+    await this.releaseViewer(viewer.viewer_id, deviceIds);
   }
 
   private async closeData(sfu: RealtimeSfu, sessionId: string, sub: DataSubscriptionRow): Promise<void> {
@@ -754,7 +753,7 @@ export class Room extends DurableObject<Env> {
     for (const sub of closing) {
       this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ? AND mid = ?", viewerId, sub.mid);
     }
-    await this.updateCounts(new Set(closing.map((sub) => sub.deviceId)));
+    await this.releaseViewer(viewerId, closing.map((sub) => sub.deviceId));
     this.finishNegotiation(ws, viewerId, result, false);
   }
 
@@ -930,16 +929,26 @@ export class Room extends DurableObject<Env> {
     return { tracks: this.subscriptions(viewerId), data: this.dataSubscriptions(viewerId) };
   }
 
-  /** How many viewers in this room receive a track or the data channels of the device. */
-  private subscriberCount(deviceId: string): number {
+  /** Viewers in this room that receive a track or the data channels of the device. */
+  private subscribedViewers(deviceId: string): string[] {
     return this.sql
-      .exec<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM (SELECT viewer_id FROM subscriptions WHERE device_id = ?
-         UNION SELECT viewer_id FROM data_subscriptions WHERE device_id = ?)`,
+      .exec<{ viewer_id: string }>(
+        `SELECT viewer_id FROM subscriptions WHERE device_id = ?
+         UNION SELECT viewer_id FROM data_subscriptions WHERE device_id = ?`,
         deviceId,
         deviceId,
       )
-      .one().n;
+      .toArray()
+      .map((row) => row.viewer_id);
+  }
+
+  /**
+   * The device counts a viewer from its first successful resolve. Once the viewer gets nothing from
+   * the device (it unsubscribed, left, or its subscribe failed), the device stops counting it.
+   */
+  private async releaseViewer(viewerId: string, deviceIds: Iterable<string>): Promise<void> {
+    const done = [...new Set(deviceIds)].filter((deviceId) => !this.isSubscribedTo(viewerId, deviceId));
+    await Promise.allSettled(done.map((deviceId) => this.env.DEVICES.getByName(deviceId).release(this.roomId, viewerId)));
   }
 
   private isSubscribedTo(viewerId: string, deviceId: string): boolean {
@@ -981,7 +990,7 @@ export class Room extends DurableObject<Env> {
   }
 
   private async watchDevice(deviceId: string, now: number): Promise<void> {
-    const result = await this.env.DEVICES.getByName(deviceId).watch(this.roomId, this.subscriberCount(deviceId));
+    const result = await this.env.DEVICES.getByName(deviceId).watch(this.roomId, this.subscribedViewers(deviceId));
     if (!result.member) {
       this.forgetDevice(deviceId);
       if (this.viewerCount() > 0) this.broadcast({ members: { devices: this.memberInfos() } });
@@ -1002,12 +1011,6 @@ export class Room extends DurableObject<Env> {
     );
   }
 
-  /** Reports new subscriber counts so each device can enforce its viewer limit. */
-  private async updateCounts(deviceIds: Set<string>): Promise<void> {
-    const now = Date.now();
-    await Promise.allSettled([...deviceIds].map((deviceId) => this.watchDevice(deviceId, now)));
-  }
-
   private async dropViewer(viewerId: string): Promise<void> {
     this.earlySessions.delete(viewerId);
     const affected = new Set(this.subscriptions(viewerId).map((sub) => sub.deviceId));
@@ -1015,7 +1018,7 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);
     if (this.viewerCount() > 0) {
-      await this.updateCounts(affected);
+      await this.releaseViewer(viewerId, affected);
       return;
     }
     // Nobody is watching any more. Each device sleeps after its linger time.

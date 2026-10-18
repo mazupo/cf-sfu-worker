@@ -14,6 +14,7 @@ import {
 import { debugInfo, errorName, publishOfferSchema, stateName, type Claims } from "../shared/protocol";
 import {
   CONTROL_CONFIRM_MS,
+  COUNT_GRACE_MS,
   DEVICE_RETENTION_MS,
   DISCONNECT_GRACE_MS,
   PRESENCE_CHECK_MS,
@@ -97,8 +98,14 @@ const SCHEMA = `
   -- Rooms that have viewers interested in this device. A room renews its row while it has viewers.
   CREATE TABLE IF NOT EXISTS watching_rooms (
     room_id TEXT PRIMARY KEY,
-    subscribers INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
+  ) WITHOUT ROWID;
+  -- Viewers that receive the device's tracks or data channels. The viewer limit counts these rows.
+  CREATE TABLE IF NOT EXISTS room_viewers (
+    room_id TEXT NOT NULL,
+    viewer_id TEXT NOT NULL,
+    counted_at INTEGER NOT NULL,
+    PRIMARY KEY (room_id, viewer_id)
   ) WITHOUT ROWID;
   -- Who controls the device through its data channels, who takes over, who waits (one row).
   CREATE TABLE IF NOT EXISTS control (
@@ -258,7 +265,7 @@ export class Device extends DurableObject<Env> {
       row.rooms = "[]";
       row.offline_notified = 1;
       this.save(row);
-      this.sql.exec("DELETE FROM watching_rooms");
+      this.forgetWatch();
       await this.queue.run("control", () => this.removeFromControl(() => true));
       await Promise.allSettled(rooms.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
     } else {
@@ -380,14 +387,24 @@ export class Device extends DurableObject<Env> {
   // RPC from Room
   // -------------------------------------------------------------------------
 
-  /** A room has viewers. Records the interest, wakes the device and returns its state. */
-  async watch(roomId: string, subscribers: number): Promise<WatchResult> {
+  /**
+   * A room has viewers. Records the interest, wakes the device and returns its state. `viewers`
+   * are the room's viewers that receive this device. Rows of other viewers are removed, unless
+   * they were counted so recently that their subscribe may still be running.
+   */
+  async watch(roomId: string, viewers: string[]): Promise<WatchResult> {
     const now = Date.now();
     const row = this.row();
     if (!row || !this.rooms(row).includes(roomId)) {
       return { member: false, info: this.info(now) };
     }
-    this.setWatching(roomId, subscribers, now);
+    this.setWatching(roomId, now);
+    this.sql.exec(
+      "DELETE FROM room_viewers WHERE room_id = ? AND counted_at < ? AND viewer_id NOT IN (SELECT value FROM json_each(?))",
+      roomId,
+      now - COUNT_GRACE_MS,
+      JSON.stringify(viewers),
+    );
     if (row.linger_until !== null) {
       row.linger_until = null;
       this.save(row);
@@ -406,14 +423,23 @@ export class Device extends DurableObject<Env> {
   async unwatch(roomId: string): Promise<void> {
     if (!this.ready) return;
     const now = Date.now();
-    this.sql.exec("DELETE FROM watching_rooms WHERE room_id = ?", roomId);
+    this.forgetWatch(roomId);
     const row = this.row();
     if (row && row.state !== SLEEPING && !this.hasWatchers(now)) this.startLinger(now);
     await this.scheduleAlarm(now);
   }
 
-  /** Gives a room what it needs to pull this device's tracks, if the viewer limit allows. */
-  async resolve(roomId: string, subscribers: number, viewerId?: string): Promise<ResolveResult> {
+  /** A viewer gets nothing from this device any more, so it stops counting toward the limit. */
+  async release(roomId: string, viewerId: string): Promise<void> {
+    if (!this.ready) return;
+    this.sql.exec("DELETE FROM room_viewers WHERE room_id = ? AND viewer_id = ?", roomId, viewerId);
+  }
+
+  /**
+   * Gives a room what it needs to pull this device's tracks, if the viewer limit allows, and counts
+   * the viewer. The check and the count happen in one step, so viewers asking at once queue here.
+   */
+  async resolve(roomId: string, viewerId: string): Promise<ResolveResult> {
     const now = Date.now();
     const row = this.row();
     if (!row || !this.rooms(row).includes(roomId)) {
@@ -422,30 +448,32 @@ export class Device extends DurableObject<Env> {
     if (row.state !== LIVE || !row.sfu_session_id || !this.isOnline(now)) {
       return { ok: false, code: ErrorCode.ERROR_CODE_NOT_LIVE, message: `${this.deviceId} is not publishing.` };
     }
-    const others = this.sql
-      .exec<{ total: number | null }>(
-        "SELECT SUM(subscribers) AS total FROM watching_rooms WHERE room_id != ? AND expires_at > ?",
-        roomId,
-        now,
-      )
-      .one().total ?? 0;
-    if (others + subscribers > this.config.maxViewersPerDevice) {
+    const counted = this.sql
+      .exec("SELECT 1 FROM room_viewers WHERE room_id = ? AND viewer_id = ?", roomId, viewerId)
+      .toArray().length > 0;
+    if (!counted && this.viewerTotal(now) >= this.config.maxViewersPerDevice) {
       return {
         ok: false,
         code: ErrorCode.ERROR_CODE_VIEWER_LIMIT,
         message: `${this.deviceId} already has ${this.config.maxViewersPerDevice} viewers.`,
       };
     }
-    this.setWatching(roomId, subscribers, now);
+    this.setWatching(roomId, now);
+    this.sql.exec(
+      "INSERT OR REPLACE INTO room_viewers (room_id, viewer_id, counted_at) VALUES (?, ?, ?)",
+      roomId,
+      viewerId,
+      now,
+    );
     const { controller, handover } = this.control();
-    const me = viewerId ? { room: roomId, viewerId } : null;
+    const me = { room: roomId, viewerId };
     return {
       ok: true,
       sessionId: row.sfu_session_id,
       generation: row.generation,
       tracks: JSON.parse(row.tracks),
       dataChannels: (JSON.parse(row.channels) as DataChannel[]).length > 0,
-      canReply: me !== null && (sameViewer(controller, me) || sameViewer(handover, me)),
+      canReply: sameViewer(controller, me) || sameViewer(handover, me),
     };
   }
 
@@ -532,8 +560,15 @@ export class Device extends DurableObject<Env> {
       control: this.ready ? this.control() : null,
       watchingRooms: this.ready
         ? this.sql
-            .exec<{ room_id: string; subscribers: number; expires_at: number }>("SELECT * FROM watching_rooms ORDER BY room_id")
+            .exec<{ room_id: string; expires_at: number }>("SELECT * FROM watching_rooms ORDER BY room_id")
             .toArray()
+            .map((room) => ({
+              ...room,
+              viewers: this.sql
+                .exec<{ viewer_id: string }>("SELECT viewer_id FROM room_viewers WHERE room_id = ? ORDER BY counted_at", room.room_id)
+                .toArray()
+                .map((viewer) => viewer.viewer_id),
+            }))
         : [],
       sockets: this.ctx.getWebSockets().map((ws) => ({
         readyState: ws.readyState,
@@ -553,6 +588,7 @@ export class Device extends DurableObject<Env> {
     let row = this.row();
     if (!row) return;
     this.sql.exec("DELETE FROM watching_rooms WHERE expires_at <= ?", now);
+    this.sql.exec("DELETE FROM room_viewers WHERE room_id NOT IN (SELECT room_id FROM watching_rooms)");
     this.sql.exec("DELETE FROM used_tokens WHERE expires_at <= ?", now);
 
     const ws = this.socket();
@@ -699,7 +735,7 @@ export class Device extends DurableObject<Env> {
       const room = wanted[index]!;
       if (result.status === "fulfilled" && result.value.ok) {
         joined.push(room);
-        if (result.value.viewers > 0) this.setWatching(room, 0, now);
+        if (result.value.viewers > 0) this.setWatching(room, now);
       } else if (result.status === "fulfilled" && !result.value.ok) {
         errors.push(signalError({ code: result.value.code, message: result.value.message }));
       } else {
@@ -709,20 +745,36 @@ export class Device extends DurableObject<Env> {
 
     const left = previous.filter((room) => !joined.includes(room));
     await Promise.allSettled(left.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
-    for (const room of left) this.sql.exec("DELETE FROM watching_rooms WHERE room_id = ?", room);
+    for (const room of left) this.forgetWatch(room);
 
     row.rooms = JSON.stringify(joined);
     this.save(row);
     return { errors, left };
   }
 
-  private setWatching(roomId: string, subscribers: number, now: number): void {
-    this.sql.exec(
-      "INSERT OR REPLACE INTO watching_rooms (room_id, subscribers, expires_at) VALUES (?, ?, ?)",
-      roomId,
-      subscribers,
-      now + WATCH_LEASE_MS,
-    );
+  private setWatching(roomId: string, now: number): void {
+    this.sql.exec("INSERT OR REPLACE INTO watching_rooms (room_id, expires_at) VALUES (?, ?)", roomId, now + WATCH_LEASE_MS);
+  }
+
+  /** Forgets one room's interest and its viewers, or every room's. */
+  private forgetWatch(roomId?: string): void {
+    if (roomId === undefined) {
+      this.sql.exec("DELETE FROM watching_rooms");
+      this.sql.exec("DELETE FROM room_viewers");
+    } else {
+      this.sql.exec("DELETE FROM watching_rooms WHERE room_id = ?", roomId);
+      this.sql.exec("DELETE FROM room_viewers WHERE room_id = ?", roomId);
+    }
+  }
+
+  /** Viewers counted across every room that still watches. */
+  private viewerTotal(now: number): number {
+    return this.sql
+      .exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM room_viewers WHERE room_id IN (SELECT room_id FROM watching_rooms WHERE expires_at > ?)",
+        now,
+      )
+      .one().n;
   }
 
   private watchingRooms(now: number): string[] {
@@ -912,7 +964,7 @@ export class Device extends DurableObject<Env> {
     );
     results.forEach((result, index) => {
       if (result.status === "fulfilled" && !result.value.watching) {
-        this.sql.exec("DELETE FROM watching_rooms WHERE room_id = ?", rooms[index]!);
+        this.forgetWatch(rooms[index]!);
       }
     });
   }

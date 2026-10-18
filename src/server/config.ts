@@ -16,6 +16,8 @@ export const PRESENCE_CHECK_MS = 60_000;
 /** How long a room's interest in a device lasts, and how often the room renews it. */
 export const WATCH_LEASE_MS = 10 * 60_000;
 export const WATCH_RENEW_MS = 5 * 60_000;
+/** A renewal leaves alone viewers counted this recently: their subscribe may still be running. */
+export const COUNT_GRACE_MS = 60_000;
 /** A device that dropped its socket shows as offline only after this grace period. */
 export const DISCONNECT_GRACE_MS = 10_000;
 /** A device that stays offline this long forgets its state and leaves its rooms. */

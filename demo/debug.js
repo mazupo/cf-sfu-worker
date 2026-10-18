@@ -89,7 +89,7 @@ function render(json, raw) {
 
 function deviceTable(devices) {
   return table(
-    ["Device", "State", "Stored", "Gen", "SFU session", "Socket", "Last ping", "Watched by", "Alarm", "Error"],
+    ["Device", "State", "Gen", "SFU session", "Socket", "Last ping", "Watched by", "Alarm", "Error"],
     devices.map((device) => {
       const now = device.now;
       const row = device.row;
@@ -97,7 +97,6 @@ function deviceTable(devices) {
       return [
         device.deviceId,
         chip(device.info.state),
-        row?.state ?? "—",
         row?.generation ?? "—",
         short(row?.sfu_session_id),
         device.sockets.length
@@ -105,7 +104,9 @@ function deviceTable(devices) {
           : "none",
         open ? ago(open.lastPing ?? open.connectedAt, now) : "—",
         device.watchingRooms.length
-          ? device.watchingRooms.map((watch) => `${watch.room_id} (${watch.subscribers} sub, ends ${inSeconds(watch.expires_at, now)})`).join("; ")
+          ? device.watchingRooms
+              .map((watch) => `${watch.room_id}: ${watch.viewers.map(short).join(", ") || "no viewers"} (ends ${inSeconds(watch.expires_at, now)})`)
+              .join("\n")
           : "nobody",
         inSeconds(device.alarm, now),
         row?.last_error ?? "",
