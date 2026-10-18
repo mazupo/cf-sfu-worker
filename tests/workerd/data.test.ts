@@ -332,6 +332,41 @@ describe("control", () => {
     const pulled = calls.filter((call) => call.path.endsWith("/datachannels/new")).at(-1)!;
     expect(pulled.body.dataChannels.map((channel: { canReply: boolean }) => channel.canReply)).toEqual([true, true]);
   });
+
+  test("a controller that leaves gives up canReply first, and the next one has 5 s from its grant", async () => {
+    const { calls, device } = await setup();
+    const v1 = await dataViewer("v1");
+    const v2 = await dataViewer("v2");
+    const [first, second] = calls.filter((call) => call.path.endsWith("/datachannels/establish")).map(sessionOf);
+    await publishWithData(device);
+    await openData(v1);
+    await openData(v2);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    v2.send("takeControl", { deviceId: "cam-1" });
+    await info(v2, (device) => device.waiting.length === 1);
+
+    // Leaving without releasing: the SFU would take about 5 s to give canReply to v2.
+    v1.send("leave");
+    await canReply(v2, true);
+    const updates = canReplyUpdates(calls);
+    const revoked = updates.findIndex(([session, value]) => session === first && !value);
+    expect(revoked).toBeGreaterThanOrEqual(0);
+    expect(revoked).toBeLessThan(updates.findIndex(([session, value]) => session === second && value));
+    // The confirm time counts from the grant, not from when v2 was picked.
+    const stub = env.DEVICES.getByName("cam-1");
+    await expect
+      .poll(async () =>
+        runInDurableObject(stub, async (_instance, state) => {
+          const control = JSON.parse(state.storage.sql.exec<{ state: string }>("SELECT state FROM control").one().state);
+          return control.handover.deadline - Date.now();
+        }),
+      )
+      .toBeLessThanOrEqual(5000);
+    expect(await device.next("control")).toEqual({ controller: undefined });
+    v2.send("controlReady", { deviceId: "cam-1" });
+    expect(await device.next("control")).toEqual(controller("lab-a", "v2"));
+  });
 });
 
 describe("recovery", () => {

@@ -139,7 +139,7 @@ On a viewer whose token has `data_channels`:
 1. Send your own offer as above. Data channels need it.
 2. When a device is live with `dataChannels`, send `subscribe` with `data: [deviceId]`. `subscribed` lists its two channels.
 3. To send to the device, send `take_control`. If somebody else controls it, you wait in line.
-4. When the worker hands you control, `subscribed` has `canReply: true` for the device. Once its channels are open, send `control_ready`. If you do not do this within 5 seconds, the next viewer in line gets control.
+4. When the worker hands you control, `subscribed` has `canReply: true` for the device. Once its channels are open, send `control_ready`. If you do not do this within 5 seconds of that `subscribed`, the next viewer in line gets control.
 5. Send `release_control` to give up control or your place in line. Leaving the room or closing the device's channels does the same.
 
 Control belongs to the device, not to a room. A device in two rooms has one line for viewers of both rooms. Control stays with the viewer when the device publishes again.

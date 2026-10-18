@@ -651,9 +651,17 @@ export class Room extends DurableObject<Env> {
     await this.releaseViewer(viewer.viewer_id, deviceIds);
   }
 
+  /**
+   * Closes the viewer's channels to a device at the SFU. A viewer with canReply gives it up too:
+   * otherwise the SFU takes about 5 s to give it to the next viewer. Both calls go at once, since
+   * each takes about 5 s when the viewer's PeerConnection is already gone.
+   */
   private async closeData(sfu: RealtimeSfu, sessionId: string, sub: DataSubscriptionRow): Promise<void> {
     const ids = (JSON.parse(sub.channels) as DataChannel[]).map((channel) => channel.id);
-    await sfu.closeDataChannels(sessionId, ids).catch(() => undefined);
+    await Promise.allSettled([
+      sub.can_reply ? sfu.updateDataChannels(sessionId, deviceChannels("remote", sub.device_session, false)) : undefined,
+      sfu.closeDataChannels(sessionId, ids),
+    ]);
   }
 
   private async onTakeControl(ws: WebSocket, viewerId: string, message: TakeControl): Promise<void> {
@@ -977,12 +985,20 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE device_id = ?", deviceId);
   }
 
-  /** Forgets the viewer's data channels; each device drops it from its control state. */
+  /**
+   * Closes and forgets the viewer's data channels. Each device then drops it from its control
+   * state, and the next one waiting takes over.
+   */
   private async dropData(viewerId: string): Promise<string[]> {
-    const deviceIds = this.dataSubscriptions(viewerId).map((sub) => sub.deviceId);
+    const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
+    const sessionId = this.viewer(viewerId)?.sfu_session_id;
+    if (sessionId) {
+      const sfu = new RealtimeSfu(this.env);
+      await Promise.allSettled(subs.map((sub) => this.closeData(sfu, sessionId, sub)));
+    }
     this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
-    await Promise.allSettled(deviceIds.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
-    return deviceIds;
+    await Promise.allSettled(subs.map((sub) => this.env.DEVICES.getByName(sub.device_id).controlGone(this.roomId, viewerId)));
+    return subs.map((sub) => sub.device_id);
   }
 
   private async watchAll(now: number): Promise<void> {

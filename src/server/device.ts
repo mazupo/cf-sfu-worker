@@ -14,6 +14,7 @@ import {
 import { debugInfo, errorName, publishOfferSchema, stateName, type Claims } from "../shared/protocol";
 import {
   CONTROL_CONFIRM_MS,
+  CONTROL_GRANT_MS,
   COUNT_GRACE_MS,
   DEVICE_GONE_MS,
   DISCONNECT_GRACE_MS,
@@ -528,7 +529,7 @@ export class Device extends DurableObject<Env> {
         return { ok: true };
       }
       if (control.controller || control.handover) control.waiting.push(me);
-      else control.handover = { ...me, deadline: Date.now() + CONTROL_CONFIRM_MS };
+      else control.handover = { ...me, deadline: handoverDeadline() };
       await this.saveControl(control);
       return { ok: true };
     });
@@ -969,7 +970,7 @@ export class Device extends DurableObject<Env> {
 
   private handOverToNext(control: ControlState): void {
     const next = control.waiting.shift();
-    if (next) control.handover = { ...next, deadline: Date.now() + CONTROL_CONFIRM_MS };
+    if (next) control.handover = { ...next, deadline: handoverDeadline() };
   }
 
   /** Asks the viewer's room to grant canReply. A viewer that cannot take it is skipped at once. */
@@ -977,8 +978,17 @@ export class Device extends DurableObject<Env> {
     const granted = await this.env.ROOMS.getByName(to.room)
       .grantControl(this.deviceId, to.viewerId)
       .catch(() => false);
-    if (granted) return;
-    await this.queue.run("control", () => this.removeFromControl((ref) => sameViewer(ref, to)));
+    if (!granted) {
+      await this.queue.run("control", () => this.removeFromControl((ref) => sameViewer(ref, to)));
+      return;
+    }
+    // The viewer has canReply now. Its CONTROL_CONFIRM_MS start here, however long the SFU took.
+    await this.queue.run("control", async () => {
+      const control = this.control();
+      if (!control.handover || !sameViewer(control.handover, to)) return;
+      control.handover = { ...control.handover, deadline: Date.now() + CONTROL_CONFIRM_MS };
+      await this.saveControl(control);
+    });
   }
 
   /** A handover that was not confirmed in time goes to the next one waiting. Returns who timed out. */
@@ -1060,4 +1070,9 @@ export class Device extends DurableObject<Env> {
 
 function sameViewer(a: ViewerRef | null | undefined, b: ViewerRef | null | undefined): boolean {
   return !!a && !!b && a.room === b.room && a.viewerId === b.viewerId;
+}
+
+/** A new handover's deadline: time for the room to grant canReply, then to confirm. The grant resets it. */
+function handoverDeadline(): number {
+  return Date.now() + CONTROL_GRANT_MS + CONTROL_CONFIRM_MS;
 }
