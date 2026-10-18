@@ -20,7 +20,8 @@ import {
   type ViewerInfo,
   type ViewerResponse,
 } from "../proto/cloudflare";
-import { debugInfo, deviceIdMessageSchema, sdpMessageSchema, subscribeSchema, unsubscribeSchema } from "../shared/protocol";
+import { debugInfo, deviceIdMessageSchema, sdpMessageSchema, stateName, subscribeSchema, unsubscribeSchema } from "../shared/protocol";
+import { REGISTRY_NAME, type RoomSummary } from "./registry";
 import { PRESENCE_CHECK_MS, WATCH_RENEW_MS, settings, type Settings } from "./config";
 import { deviceChannels, iceServers, RealtimeSfu, SfuError, type TrackObject, type TracksResponse } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
@@ -132,6 +133,8 @@ export class Room extends DurableObject<Env> {
   private ready: boolean;
   /** Receive sessions started at join time, by viewer_id. The first subscribe picks one up. */
   private readonly earlySessions = new Map<string, Promise<string | null>>();
+  /** A report to the Registry is on its way for the current burst of changes. */
+  private reportQueued = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -179,6 +182,7 @@ export class Room extends DurableObject<Env> {
       }
       this.sql.exec("INSERT INTO members (device_id, joined_at) VALUES (?, ?)", deviceId, now);
     }
+    this.reportSoon();
     const viewers = this.viewerCount();
     if (viewers > 0) {
       // The device reports its state right after it joins.
@@ -196,6 +200,7 @@ export class Room extends DurableObject<Env> {
   async removeMember(deviceId: string): Promise<void> {
     if (!this.ready) return;
     this.forgetDevice(deviceId);
+    this.reportSoon();
     if (this.viewerCount() > 0) this.broadcast({ members: { devices: this.memberInfos() } });
     await this.deleteIfEmpty();
   }
@@ -852,6 +857,7 @@ export class Room extends DurableObject<Env> {
       await Promise.allSettled(stale.map((deviceId) => this.watchDevice(deviceId, now)));
     }
 
+    this.reportSoon();
     if (await this.deleteIfEmpty()) return;
     await this.scheduleAlarm(now);
   }
@@ -1099,9 +1105,45 @@ export class Room extends DurableObject<Env> {
   }
 
   private broadcast(message: ViewerResponse, except?: WebSocket): void {
+    // Whatever viewers hear about, the dashboard wants too.
+    this.reportSoon();
     for (const ws of this.ctx.getWebSockets()) {
       if (ws !== except && ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
     }
+  }
+
+  /** Tells the Registry what this room holds, once per burst of changes. Best effort. */
+  private reportSoon(): void {
+    if (this.reportQueued) return;
+    this.reportQueued = true;
+    setTimeout(() => {
+      this.reportQueued = false;
+      this.env.REGISTRY.getByName(REGISTRY_NAME)
+        .report(this.roomId, this.summary())
+        .catch(() => undefined);
+    }, 0);
+  }
+
+  /** For the Registry. Null once the room is empty and its storage is gone. */
+  private summary(): RoomSummary | null {
+    if (!this.ready) return null;
+    const viewers = this.sql
+      .exec<{ data_channels: number; socket_closed_at: number | null }>("SELECT data_channels, socket_closed_at FROM viewers")
+      .toArray();
+    // The room keeps a device's state only while someone watches.
+    const devices = this.sql
+      .exec<{ device_id: string; info: string | null }>(
+        "SELECT m.device_id, d.info FROM members m LEFT JOIN devices d ON d.device_id = m.device_id ORDER BY m.device_id",
+      )
+      .toArray()
+      .map((row) => ({ deviceId: row.device_id, state: row.info ? stateName((JSON.parse(row.info) as DeviceInfo).state) : null }));
+    if (viewers.length === 0 && devices.length === 0) return null;
+    return {
+      viewers: viewers.filter((viewer) => viewer.socket_closed_at === null).length,
+      away: viewers.filter((viewer) => viewer.socket_closed_at !== null).length,
+      ipcViewers: viewers.filter((viewer) => viewer.data_channels).length,
+      devices,
+    };
   }
 
   /** Everyone in the room, oldest first, as the viewers see them. */
@@ -1164,6 +1206,7 @@ export class Room extends DurableObject<Env> {
     if (members > 0 || this.viewerCount() > 0) return false;
     await this.ctx.storage.deleteAll();
     this.ready = false;
+    this.reportSoon();
     return true;
   }
 }

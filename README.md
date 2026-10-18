@@ -49,6 +49,16 @@ Both pages ping from a Web Worker, so they stay online in a background tab.
 
 Open **Server state** on either page to see what the Durable Objects hold, refreshed every 2 seconds: each device's state, generation, socket and last ping, which rooms watch it, and each viewer's subscriptions. The debug routes behind it (`GET /cloudflare/debug/rooms/:roomId` and `GET /cloudflare/debug/devices/:deviceId`) answer only on `localhost`, or when the worker has `DEBUG_STATE=true`. They show SFU session IDs, so keep them off in production.
 
+### Dashboard
+
+Open `/dashboard` to see every room this worker serves: how many rooms, viewers and devices there are, and one row per room. Click a room to see its devices and viewers, the same tables as **Server state**.
+
+The page refreshes every minute. Under **Auto refresh**, pick 3 s, 1 min, 5 min or Off, or press **Refresh**. It does not refresh while the tab is hidden. Each refresh is one request to the worker and one to the Registry, plus one to each open room, so a longer interval uses fewer of your plan's requests.
+
+On `localhost` it works as it is. Anywhere else, set a secret `ADMIN_KEY` on the worker (`npx wrangler secret put ADMIN_KEY`, any long random string) and enter it on the page. Without that secret, `/cloudflare/admin/*` answers only on `localhost`.
+
+Durable Objects cannot list their instances, so each Room reports to one `Registry` Durable Object when its viewers or devices change, and once a minute while it is in use. A device that goes away leaves its rooms after a minute, even when nobody watches it or its socket closed without a close event, as on a deploy: a connected device checks its socket every 5 minutes. Each worker deployment has its own Registry. A room shows a device's state only while someone in that room watches it; otherwise the dashboard says `unwatched`, and the room's details read the device itself.
+
 ## Protocol
 
 ### 1. Get a token

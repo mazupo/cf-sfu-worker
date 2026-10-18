@@ -18,11 +18,15 @@
   "durable_objects": {
     "bindings": [
       { "name": "DEVICES", "class_name": "Device" },
-      { "name": "ROOMS", "class_name": "Room" }
+      { "name": "ROOMS", "class_name": "Room" },
+      { "name": "REGISTRY", "class_name": "Registry" }
     ]
   },
   // Never edit a deployed migration. Add a new tag instead.
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Device", "Room"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Device", "Room"] },
+    { "tag": "v2", "new_sqlite_classes": ["Registry"] }
+  ],
   // Limits token requests per IP address. Counts are kept per Cloudflare location.
   "ratelimits": [
     { "name": "TOKEN_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
@@ -53,7 +57,8 @@
       "durable_objects": {
         "bindings": [
           { "name": "DEVICES", "class_name": "Device" },
-          { "name": "ROOMS", "class_name": "Room" }
+          { "name": "ROOMS", "class_name": "Room" },
+          { "name": "REGISTRY", "class_name": "Registry" }
         ]
       },
       "ratelimits": [

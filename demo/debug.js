@@ -1,6 +1,8 @@
 // "Server state" panel for the demo pages. Reads /cloudflare/debug/* every 2 s while the panel
 // is open. Those routes answer on localhost, or when the worker has DEBUG_STATE=true.
 
+import { ago as agoAt, clock, duration } from "./time.js";
+
 const SOCKET_STATES = ["connecting", "open", "closing", "closed"];
 
 /**
@@ -40,7 +42,7 @@ export function startDebugPanel({ panel, body, updated, url, key, intervalMs = 2
         body.replaceChildren(...render(json, raw));
         const pre = body.querySelector("details.raw pre");
         if (pre) pre.scrollTop = raw.scrollTop;
-        updated.textContent = `updated ${new Date().toLocaleTimeString()}`;
+        updated.textContent = `updated ${clock()}`;
       }
     } catch (error) {
       body.replaceChildren(note(error.message));
@@ -64,17 +66,20 @@ function selecting(element) {
   return selection !== null && !selection.isCollapsed && element.contains(selection.anchorNode);
 }
 
+/** A room's devices and viewers, from /cloudflare/debug/rooms/:id or /cloudflare/admin/rooms/:id. */
+export function renderRoom(json) {
+  const room = json.room;
+  return [
+    heading(`Room ${room.roomId}: ${room.members.length} device(s), ${room.viewers.length} viewer(s), alarm ${until(room.alarm, room.now)}`),
+    deviceTable(json.devices),
+    viewerTable(room),
+  ];
+}
+
 function render(json, raw) {
   const parts = [];
   if (json.room) {
-    const room = json.room;
-    parts.push(
-      heading(
-        `Room ${room.roomId}: ${room.members.length} device(s), ${room.viewers.length} viewer(s), alarm ${inSeconds(room.alarm, room.now)}`,
-      ),
-    );
-    parts.push(deviceTable(json.devices));
-    parts.push(viewerTable(room));
+    parts.push(...renderRoom(json));
   } else if (json.device) {
     parts.push(heading(`Device ${json.device.deviceId}`));
     parts.push(deviceTable([json.device]));
@@ -105,10 +110,10 @@ function deviceTable(devices) {
         open ? ago(open.lastPing ?? open.connectedAt, now) : "—",
         device.watchingRooms.length
           ? device.watchingRooms
-              .map((watch) => `${watch.room_id}: ${watch.viewers.map(short).join(", ") || "no viewers"} (ends ${inSeconds(watch.expires_at, now)})`)
+              .map((watch) => `${watch.room_id}: ${watch.viewers.map(short).join(", ") || "no viewers"} (ends ${until(watch.expires_at, now)})`)
               .join("\n")
           : "nobody",
-        inSeconds(device.alarm, now),
+        until(device.alarm, now),
         row?.last_error ?? "",
       ];
     }),
@@ -197,10 +202,10 @@ function short(id) {
 
 function ago(timestamp, now) {
   if (!timestamp) return "—";
-  return `${Math.max(0, Math.round((now - timestamp) / 1000))} s ago`;
+  return agoAt(timestamp, now);
 }
 
-function inSeconds(timestamp, now) {
+function until(timestamp, now) {
   if (!timestamp) return "none";
-  return `in ${Math.round((timestamp - now) / 1000)} s`;
+  return timestamp < now ? `${duration(now - timestamp)} late` : `in ${duration(timestamp - now)}`;
 }

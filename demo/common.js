@@ -11,6 +11,7 @@ import {
   ViewerResponse,
 } from "../src/proto/cloudflare";
 import { Packet } from "../src/proto/packet";
+import { clock } from "./time.js";
 
 export { DeviceState, ErrorCode };
 
@@ -162,7 +163,7 @@ export function persistForm(form, storageKey) {
 
 export function createLog(element) {
   return (text) => {
-    const time = new Date().toLocaleTimeString();
+    const time = clock();
     element.textContent = `${time}  ${text}\n${element.textContent}`.slice(0, 20_000);
   };
 }

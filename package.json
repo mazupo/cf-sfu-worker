@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "wrangler dev --ip 0.0.0.0",
     "deploy": "wrangler deploy",
-    "build:demo": "esbuild demo/viewer.js demo/device.js --bundle --format=esm --target=es2022 --outdir=public/js --log-level=warning",
+    "build:demo": "esbuild demo/viewer.js demo/device.js demo/dashboard.js --bundle --format=esm --target=es2022 --outdir=public/js --log-level=warning",
     "proto": "node scripts/check-protocol.mjs && buf generate",
     "cf-typegen": "wrangler types --env-file .dev.vars.example",
     "typecheck": "tsc --noEmit",

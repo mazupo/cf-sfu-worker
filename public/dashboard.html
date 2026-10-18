@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cf-sfu-worker dashboard</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>cf-sfu-worker dashboard</h1>
+      <nav>
+        <a href="./">Viewer</a>
+        <a href="./device">Device simulator</a>
+        <a href="./dashboard" aria-current="page">Dashboard</a>
+      </nav>
+    </header>
+
+    <form class="panel" id="key-form">
+      <label title="The worker's ADMIN_KEY secret. Not needed on localhost when the worker has none.">Admin key
+        <input type="password" id="admin-key" autocomplete="off" placeholder="not needed on localhost">
+      </label>
+      <p class="status" id="deployment"></p>
+    </form>
+
+    <section class="totals" id="totals" aria-live="polite"></section>
+
+    <section class="panel rooms">
+      <div class="rooms-head">
+        <h2>Rooms</h2>
+        <div class="refresh">
+          <span class="status" id="status">Loading…</span>
+          <label title="Each refresh is a request to the worker and its Durable Objects. Paused while this tab is hidden.">Auto refresh
+            <select id="refresh-every">
+              <option value="3000">3 s</option>
+              <option value="60000" selected>1 min</option>
+              <option value="300000">5 min</option>
+              <option value="0">Off</option>
+            </select>
+          </label>
+          <button type="button" class="secondary small" id="refresh-now">Refresh</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Room</th><th>Devices</th><th>Viewers</th><th>Updated</th></tr>
+          </thead>
+          <tbody id="rooms"></tbody>
+        </table>
+      </div>
+      <p class="status">Click a room to see its devices and viewers.</p>
+    </section>
+  </main>
+  <script type="module" src="./js/dashboard.js"></script>
+</body>
+</html>

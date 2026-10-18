@@ -12,10 +12,12 @@ import {
   type TokenResponse,
 } from "./shared/protocol";
 import { settings } from "./server/config";
+import { REGISTRY_NAME } from "./server/registry";
 import { CLAIMS_HEADER, upgradeRequired } from "./server/socket";
 import { TokenError, roleForPublicKey, signToken, verifyToken } from "./server/token";
 
 export { Device } from "./server/device";
+export { Registry } from "./server/registry";
 export { Room } from "./server/room";
 
 const MAX_BODY_BYTES = 4096;
@@ -134,9 +136,7 @@ app.get("/cloudflare/debug/rooms/:roomId", async (c) => {
   if (denied) return denied;
   const roomId = idSchema.safeParse(c.req.param("roomId"));
   if (!roomId.success) return error(c, 400, "id_invalid", "The room ID is not valid.");
-  const room = await c.env.ROOMS.getByName(roomId.data).debugState();
-  const devices = await Promise.all(room.members.map((member) => c.env.DEVICES.getByName(member.device_id).debugState()));
-  return c.json({ room, devices }, 200, { "Cache-Control": "no-store" });
+  return c.json(await roomDetails(c.env, roomId.data), 200, { "Cache-Control": "no-store" });
 });
 
 app.get("/cloudflare/debug/devices/:deviceId", async (c) => {
@@ -146,6 +146,37 @@ app.get("/cloudflare/debug/devices/:deviceId", async (c) => {
   if (!deviceId.success) return error(c, 400, "id_invalid", "The device ID is not valid.");
   const device = await c.env.DEVICES.getByName(deviceId.data).debugState();
   return c.json({ device }, 200, { "Cache-Control": "no-store" });
+});
+
+// The dashboard: every room this worker serves. With ADMIN_KEY set, it takes that key on any host;
+// without it, it answers only on localhost.
+app.get("/cloudflare/admin/rooms", async (c) => {
+  const denied = await adminDenied(c);
+  if (denied) return denied;
+  const rooms = await c.env.REGISTRY.getByName(REGISTRY_NAME).rooms();
+  // A device can be in several rooms. Count it once, live if any room sees it live.
+  const devices = new Map<string, boolean>();
+  for (const room of rooms) {
+    for (const device of room.devices) devices.set(device.deviceId, devices.get(device.deviceId) === true || device.state === "live");
+  }
+  const totals = {
+    rooms: rooms.length,
+    viewers: rooms.reduce((sum, room) => sum + room.viewers, 0),
+    away: rooms.reduce((sum, room) => sum + room.away, 0),
+    ipcViewers: rooms.reduce((sum, room) => sum + room.ipcViewers, 0),
+    devices: devices.size,
+    liveDevices: [...devices.values()].filter(Boolean).length,
+  };
+  const host = new URL(c.req.url).host;
+  return c.json({ host, appId: c.env.REALTIME_SFU_APP_ID, now: Date.now(), totals, rooms }, 200, { "Cache-Control": "no-store" });
+});
+
+app.get("/cloudflare/admin/rooms/:roomId", async (c) => {
+  const denied = await adminDenied(c);
+  if (denied) return denied;
+  const roomId = idSchema.safeParse(c.req.param("roomId"));
+  if (!roomId.success) return error(c, 400, "id_invalid", "The room ID is not valid.");
+  return c.json(await roomDetails(c.env, roomId.data), 200, { "Cache-Control": "no-store" });
 });
 
 app.all("/cloudflare/*", (c) => error(c, 404, "route_not_found", "Unknown path."));
@@ -190,6 +221,34 @@ function bodyProblem(json: unknown): string {
     return "Devices send {device_id, room_ids, can_subscribe: false}. Viewers send {viewer_id, room_id, can_subscribe: true}.";
   }
   return `${issue.path.join(".") || "body"}: ${issue.message}.`;
+}
+
+/** A room and its member devices, from their own Durable Objects. */
+async function roomDetails(env: Env, roomId: string) {
+  const room = await env.ROOMS.getByName(roomId).debugState();
+  const devices = await Promise.all(room.members.map((member) => env.DEVICES.getByName(member.device_id).debugState()));
+  return { room, devices };
+}
+
+async function adminDenied(c: Context<App>): Promise<Response | null> {
+  const key = String(c.env.ADMIN_KEY ?? "");
+  if (!key) {
+    if (LOOPBACK_HOSTS.has(new URL(c.req.url).hostname)) return null;
+    return error(c, 404, "route_not_found", "Unknown path.");
+  }
+  const bearer = /^Bearer\s+(\S+)$/i.exec(c.req.header("Authorization") ?? "")?.[1] ?? "";
+  if (!(await sameSecret(bearer, key))) return error(c, 401, "key_required", "Send Authorization: Bearer <ADMIN_KEY>.");
+  return null;
+}
+
+/** Compares in constant time, so the answer time says nothing about the key. */
+async function sameSecret(given: string, expected: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(given)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  return crypto.subtle.timingSafeEqual(a, b);
 }
 
 function allowedOrigin(env: Env, origin: string): string | null {

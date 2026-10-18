@@ -20,6 +20,7 @@ import {
   viewerProtocol as protocol,
 } from "./common.js";
 import { startDebugPanel } from "./debug.js";
+import { clock } from "./time.js";
 
 /** Errors that will not change for the same publication. Do not ask again. */
 const PERMANENT = new Set([
@@ -700,7 +701,7 @@ function ipcLine(deviceId, direction, label, text) {
   if (!list) return;
   const item = document.createElement("li");
   item.className = direction;
-  const time = new Date().toLocaleTimeString();
+  const time = clock();
   const arrow = direction === "out" ? "→" : direction === "in" ? "←" : "·";
   item.textContent = `${time} ${arrow} ${label ? `${label.slice(1)} ` : ""}${text}`;
   list.prepend(item);

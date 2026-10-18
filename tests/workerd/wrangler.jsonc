@@ -5,10 +5,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "DEVICES", "class_name": "Device" },
-      { "name": "ROOMS", "class_name": "Room" }
+      { "name": "ROOMS", "class_name": "Room" },
+      { "name": "REGISTRY", "class_name": "Registry" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Device", "Room"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Device", "Room"] },
+    { "tag": "v2", "new_sqlite_classes": ["Registry"] }
+  ],
   "vars": {
     "ALLOWED_ORIGINS": "*",
     "TOKEN_TTL_SECONDS": "30",
@@ -24,6 +28,7 @@
     "REALTIME_SFU_APP_ID": "test-app",
     "REALTIME_SFU_BEARER_TOKEN": "test-sfu-token",
     "DEVICE_PRIVATE_KEY": "MC4CAQAwBQYDK2VwBCIEIHN-ekhY6SuL9x57SqskDiuXhXn6sH5BPGlR6wQOMwHR",
+    "ADMIN_KEY": "test-admin-key",
     "VIEWER_PRIVATE_KEY": "MC4CAQAwBQYDK2VwBCIEIHr9d6ew9CX312fStL1XjFlSVEqgkA4geVaF7KDH_0Eb"
   }
 }

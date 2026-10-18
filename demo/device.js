@@ -18,6 +18,7 @@ import {
   viewerName,
 } from "./common.js";
 import { startDebugPanel } from "./debug.js";
+import { clock } from "./time.js";
 
 const form = document.getElementById("device-form");
 const connectButton = document.getElementById("connect");
@@ -271,7 +272,7 @@ function ipcLine(direction, label, text) {
   const item = document.createElement("li");
   item.className = direction;
   const arrow = direction === "out" ? "→" : direction === "in" ? "←" : "·";
-  item.textContent = `${new Date().toLocaleTimeString()} ${arrow} ${label ? `${label.slice(1)} ` : ""}${text}`;
+  item.textContent = `${clock()} ${arrow} ${label ? `${label.slice(1)} ` : ""}${text}`;
   ipcLog.prepend(item);
   while (ipcLog.children.length > 100) ipcLog.lastElementChild.remove();
 }
@@ -314,7 +315,7 @@ function testPattern() {
     context.fillRect(0, 0, canvas.width, canvas.height);
     context.fillStyle = "#fff";
     context.font = "bold 48px ui-monospace, Consolas, monospace";
-    context.fillText(clock(now), 40, 180);
+    context.fillText(patternClock(now), 40, 180);
     context.font = "24px system-ui, sans-serif";
     context.fillText(String(name), 40, 230);
   };
@@ -325,7 +326,7 @@ function testPattern() {
 }
 
 /** 12:34:56.78 */
-function clock(date) {
+function patternClock(date) {
   const pad = (value) => String(value).padStart(2, "0");
   const hundredths = pad(Math.floor(date.getMilliseconds() / 10));
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${hundredths}`;
