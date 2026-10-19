@@ -18,9 +18,10 @@
     </header>
 
     <form class="panel" id="key-form">
-      <label title="The worker's ADMIN_KEY secret. Not needed on localhost when the worker has none.">Admin key
+      <label id="key-field" title="The worker's ADMIN_KEY secret. Not needed on localhost when the worker has none.">Admin key
         <input type="password" id="admin-key" autocomplete="off" placeholder="not needed on localhost">
       </label>
+      <p class="status" id="identity" hidden>Signed in with Cloudflare Access as <span id="identity-email"></span> · <a href="/cdn-cgi/access/logout">Sign out</a></p>
       <p class="status" id="deployment"></p>
     </form>
 

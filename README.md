@@ -57,7 +57,22 @@ Open `/cloudflare/admin/` to see every room this worker serves: how many rooms, 
 
 The page refreshes every minute. Under **Auto refresh**, pick 3 s, 1 min, 5 min or Off, or press **Refresh**. It does not refresh while the tab is hidden. Each refresh is one request to the worker and one to the Registry, plus one to each open room, so a longer interval uses fewer of your plan's requests.
 
-On `localhost` it works as it is. Anywhere else, set a secret `ADMIN_KEY` on the worker (`npx wrangler secret put ADMIN_KEY`, any long random string) and enter it on the page. Without that secret, `/cloudflare/admin/*` answers only on `localhost`.
+On `localhost` it works as it is. Anywhere else, protect it in one of two ways. Without either, `/cloudflare/admin/*` answers only on `localhost`.
+
+**Cloudflare Access** (recommended): people sign in, and you can see and revoke their sessions. The Zero Trust free plan is enough.
+
+1. In **Zero Trust > Access > Applications**, add a **self-hosted** application for your route's hostname with the path `cloudflare/admin`, for example `example.com/cloudflare/admin`. It covers both the page and its API. Do not protect the whole worker: devices and viewers need the token API and WebSockets, and Worker-level Access refuses WebSockets.
+2. Add a policy that allows your email address or your Cloudflare account.
+3. Copy the application's **AUD tag**, and set it and your team domain as secrets:
+
+   ```sh
+   npx wrangler secret put ACCESS_TEAM_DOMAIN   # https://<your-team>.cloudflareaccess.com
+   npx wrangler secret put ACCESS_AUD
+   ```
+
+The worker checks the JWT that Access adds to each request (`Cf-Access-Jwt-Assertion`) itself, so requests that reach the worker without Access, such as on `workers.dev`, are refused. With these two set, `ADMIN_KEY` no longer opens the dashboard.
+
+**ADMIN_KEY**: set a secret `ADMIN_KEY` on the worker (`npx wrangler secret put ADMIN_KEY`, any long random string) and enter it on the page.
 
 Durable Objects cannot list their instances, so each Room reports to one `Registry` Durable Object when its viewers or devices change, and once a minute while it is in use. A device that goes away leaves its rooms after a minute, even when nobody watches it or its socket closed without a close event, as on a deploy: a connected device checks its socket every 5 minutes. Each worker deployment has its own Registry. A room shows a device's state only while someone in that room watches it; otherwise the dashboard says `unwatched`, and the room's details read the device itself.
 

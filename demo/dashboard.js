@@ -1,5 +1,6 @@
-// Dashboard: every room this worker serves, from /cloudflare/admin/*. When the worker has an
-// ADMIN_KEY secret, enter it here; without one, the dashboard answers on localhost only.
+// Dashboard: every room this worker serves, from /cloudflare/admin/*. Behind Cloudflare Access it
+// needs nothing more. Otherwise, when the worker has an ADMIN_KEY secret, enter it here; without
+// one, the dashboard answers on localhost only.
 import { renderRoom } from "./debug.js";
 import { ago, clock } from "./time.js";
 
@@ -10,6 +11,8 @@ const EVERY_STORAGE = "cf-sfu-worker.refreshEvery";
 
 const keyInput = document.getElementById("admin-key");
 const everySelect = document.getElementById("refresh-every");
+const keyField = document.getElementById("key-field");
+const identityEl = document.getElementById("identity");
 const deploymentEl = document.getElementById("deployment");
 const totalsEl = document.getElementById("totals");
 const roomsEl = document.getElementById("rooms");
@@ -56,8 +59,11 @@ document.getElementById("key-form").addEventListener("submit", (event) => event.
 
 function get(path) {
   const key = keyInput.value.trim();
+  // Makes Access answer 401 when its sign-in has expired, instead of redirecting to its login page.
+  const headers = { "X-Requested-With": "XMLHttpRequest" };
+  if (key) headers.Authorization = `Bearer ${key}`;
   return fetch(`/cloudflare/admin${path}`, {
-    headers: key ? { Authorization: `Bearer ${key}` } : {},
+    headers,
     cache: "no-store",
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
@@ -75,7 +81,14 @@ async function refresh() {
       return;
     }
     if (response.status === 401) {
-      showProblem("Enter the worker's ADMIN_KEY.");
+      // Ours carries an error code. Access's own 401 means its sign-in expired.
+      showProblem(json.error?.code === "key_required"
+        ? "Enter the worker's ADMIN_KEY."
+        : "Your Cloudflare Access sign-in has expired. Reload the page to sign in again.");
+      return;
+    }
+    if (response.status === 403 && json.error?.code === "access_required") {
+      showProblem("This dashboard is behind Cloudflare Access. Reload the page to sign in.");
       return;
     }
     if (!response.ok) {
@@ -87,6 +100,7 @@ async function refresh() {
       if (!json.rooms.some((room) => room.roomId === roomId)) opened.delete(roomId);
     }
     lastList = json;
+    showAuth(json.auth);
     render(json);
     statusEl.textContent = `updated ${clock()}`;
     for (const roomId of opened) loadDetails(roomId);
@@ -109,6 +123,14 @@ async function loadDetails(roomId) {
     loading.delete(roomId);
     if (lastList && opened.has(roomId)) render(lastList);
   }
+}
+
+/** Behind Access the key is not used: show who signed in instead. */
+function showAuth(auth) {
+  const access = auth?.mode === "access";
+  keyField.hidden = access;
+  identityEl.hidden = !access;
+  if (access) document.getElementById("identity-email").textContent = auth.email ?? "an unknown user";
 }
 
 function showProblem(text) {
