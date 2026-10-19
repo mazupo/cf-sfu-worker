@@ -38,8 +38,8 @@ Keep the public keys. Devices and viewers use them.
 
 Then open two browser tabs:
 
-1. `http://localhost:8787/device`: the device simulator. Paste the device public key and click **Connect**.
-2. `http://localhost:8787/`: the viewer. Paste the viewer public key, use the same room, and click **Join**.
+1. `http://localhost:8787/cloudflare/device`: the device simulator. Paste the device public key and click **Connect**.
+2. `http://localhost:8787/cloudflare/`: the viewer. Paste the viewer public key, use the same room, and click **Join**.
 
 The simulator starts publishing when the viewer joins, and stops 30 seconds after the viewer leaves.
 
@@ -47,11 +47,13 @@ To try the data channels, check **Enable IPC** on both pages before you connect.
 
 Both pages ping from a Web Worker, so they stay online in a background tab.
 
+The pages are under `/cloudflare/`, like the API, so they deploy with the worker on a route such as `example.com/cloudflare/*`.
+
 Open **Server state** on either page to see what the Durable Objects hold, refreshed every 2 seconds: each device's state, generation, socket and last ping, which rooms watch it, and each viewer's subscriptions. The debug routes behind it (`GET /cloudflare/debug/rooms/:roomId` and `GET /cloudflare/debug/devices/:deviceId`) answer only on `localhost`, or when the worker has `DEBUG_STATE=true`. They show SFU session IDs, so keep them off in production.
 
 ### Dashboard
 
-Open `/dashboard` to see every room this worker serves: how many rooms, viewers and devices there are, and one row per room. Click a room to see its devices and viewers, the same tables as **Server state**.
+Open `/cloudflare/admin/` to see every room this worker serves: how many rooms, viewers and devices there are, and one row per room. Click a room to see its devices and viewers, the same tables as **Server state**.
 
 The page refreshes every minute. Under **Auto refresh**, pick 3 s, 1 min, 5 min or Off, or press **Refresh**. It does not refresh while the tab is hidden. Each refresh is one request to the worker and one to the Registry, plus one to each open room, so a longer interval uses fewer of your plan's requests.
 

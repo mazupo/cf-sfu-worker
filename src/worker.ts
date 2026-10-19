@@ -179,7 +179,18 @@ app.get("/cloudflare/admin/rooms/:roomId", async (c) => {
   return c.json(await roomDetails(c.env, roomId.data), 200, { "Cache-Control": "no-store" });
 });
 
+// The demo pages and the dashboard live under /cloudflare/ too, so they deploy with the route.
+app.get("/cloudflare/*", async (c) => {
+  const asset = await c.env.ASSETS.fetch(c.req.raw);
+  return asset.status === 404 ? error(c, 404, "route_not_found", "Unknown path.") : asset;
+});
+
 app.all("/cloudflare/*", (c) => error(c, 404, "route_not_found", "Unknown path."));
+
+// On workers.dev and localhost, the pages' old addresses.
+app.get("/", (c) => c.redirect("/cloudflare/"));
+app.get("/device", (c) => c.redirect("/cloudflare/device"));
+app.get("/dashboard", (c) => c.redirect("/cloudflare/admin/"));
 
 app.onError((err, c) => {
   console.error(JSON.stringify({ event: "unhandled_error", path: new URL(c.req.url).pathname, message: String(err) }));
