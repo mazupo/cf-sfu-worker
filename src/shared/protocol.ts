@@ -95,8 +95,18 @@ export const subscribeSchema = z
   .object({
     tracks: z.array(z.object({ deviceId: idSchema, trackName: trackNameSchema })).max(64),
     data: z.array(idSchema).max(16),
+    microphones: z.array(viewerIdSchema).max(64),
   })
-  .refine((message) => message.tracks.length > 0 || message.data.length > 0);
+  .refine((message) => message.tracks.length > 0 || message.data.length > 0 || message.microphones.length > 0);
+
+/**
+ * A viewer's own offer. With a track, it publishes the viewer's microphone: the whole offer, and
+ * the microphone's m=audio.
+ */
+export const viewerOfferSchema = z.object({
+  sdp: sdpSchema,
+  tracks: z.array(z.object({ trackName: z.literal("microphone"), mid: midSchema })).max(1),
+});
 
 /** An answer or an offer from a viewer. */
 export const sdpMessageSchema = z.object({ sdp: sdpSchema });

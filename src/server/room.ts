@@ -9,6 +9,7 @@ import {
   type DataChannel,
   type DataSubscription,
   type DeviceInfo,
+  type Mute,
   type ReleaseControl,
   type Subscribe,
   type SubscribeAnswer,
@@ -20,7 +21,15 @@ import {
   type ViewerInfo,
   type ViewerResponse,
 } from "../proto/cloudflare";
-import { debugInfo, deviceIdMessageSchema, sdpMessageSchema, stateName, subscribeSchema, unsubscribeSchema } from "../shared/protocol";
+import {
+  debugInfo,
+  deviceIdMessageSchema,
+  sdpMessageSchema,
+  stateName,
+  subscribeSchema,
+  unsubscribeSchema,
+  viewerOfferSchema,
+} from "../shared/protocol";
 import { REGISTRY_NAME, type RoomSummary } from "./registry";
 import { PRESENCE_CHECK_MS, WATCH_RENEW_MS, settings, type Settings } from "./config";
 import { deviceChannels, iceServers, RealtimeSfu, SfuError, type TrackObject, type TracksResponse } from "./realtime";
@@ -42,6 +51,9 @@ const CLOSE_LEFT = 1000;
 const DATA_NONE = 0;
 const DATA_READY = 1;
 
+/** The track name of a viewer's microphone in its own SFU session. */
+const MICROPHONE_TRACK = "microphone";
+
 type ViewerRow = {
   viewer_id: string;
   sfu_session_id: string | null;
@@ -52,6 +64,13 @@ type ViewerRow = {
   /** The token asked for data_channels. */
   data_channels: number;
   data_transport: typeof DATA_NONE | typeof DATA_READY;
+  /** The microphone's mid in the viewer's own session, while it publishes one. */
+  mic_mid: string | null;
+  /** Counts its microphone publications, so others can tell a new one from the last. */
+  mic_generation: number;
+  muted: number;
+  /** 1 while its microphone offer waits for the SFU: it holds a place under the room's limit. */
+  mic_pending: number;
 };
 
 type DataSubscriptionRow = {
@@ -67,9 +86,12 @@ type DataSubscriptionRow = {
 type SubscriptionRow = {
   viewer_id: string;
   mid: string;
+  /** Empty for another viewer's microphone. */
   device_id: string;
   track_name: string;
   generation: number;
+  /** The viewer whose microphone this is. */
+  mic_of: string | null;
 };
 
 type ViewerAttachment = { viewerId: string; connectedAt: number };
@@ -95,7 +117,11 @@ const SCHEMA = `
     created_at INTEGER NOT NULL,
     socket_closed_at INTEGER,
     data_channels INTEGER NOT NULL,
-    data_transport INTEGER NOT NULL
+    data_transport INTEGER NOT NULL,
+    mic_mid TEXT,
+    mic_generation INTEGER NOT NULL DEFAULT 0,
+    muted INTEGER NOT NULL DEFAULT 0,
+    mic_pending INTEGER NOT NULL DEFAULT 0
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS subscriptions (
     viewer_id TEXT NOT NULL,
@@ -103,6 +129,7 @@ const SCHEMA = `
     device_id TEXT NOT NULL,
     track_name TEXT NOT NULL,
     generation INTEGER NOT NULL,
+    mic_of TEXT,
     PRIMARY KEY (viewer_id, mid)
   ) WITHOUT ROWID;
   -- Devices whose _lossy and _reliable a viewer pulled into its session.
@@ -141,6 +168,11 @@ export class Room extends DurableObject<Env> {
     this.config = settings(env);
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ready = tableExists(ctx.storage.sql, "members");
+    if (this.ready) {
+      addMissingColumns(ctx.storage.sql);
+      // A new instance has no request running, so no microphone offer is waiting.
+      ctx.storage.sql.exec("UPDATE viewers SET mic_pending = 0 WHERE mic_pending = 1");
+    }
     // A deploy drops every socket without a close event. Hibernation keeps them, so no sockets
     // here means they are gone: count the viewers as disconnected from now, so they can resume.
     if (this.ready && ctx.getWebSockets().length === 0) {
@@ -373,7 +405,7 @@ export class Room extends DurableObject<Env> {
           this.fail(ws, sfu ? ErrorCode.ERROR_CODE_SFU : ErrorCode.ERROR_CODE_INTERNAL, message, name);
         }
       });
-    const { subscribe, answer, unsubscribe, leave, takeControl, releaseControl, controlReady, offer } = request;
+    const { subscribe, answer, unsubscribe, leave, takeControl, releaseControl, controlReady, offer, mute } = request;
     if (subscribe) {
       const asked = [...subscribe.tracks.map((track) => track.deviceId), ...subscribe.data];
       await run(() => this.onSubscribe(ws, viewerId, subscribe).finally(() => this.releaseViewer(viewerId, asked)));
@@ -394,6 +426,8 @@ export class Room extends DurableObject<Env> {
       await run(() => this.onControlReady(ws, viewerId, controlReady));
     } else if (offer) {
       await run(() => this.onViewerOffer(ws, viewerId, offer));
+    } else if (mute) {
+      await run(async () => this.onMute(viewerId, mute));
     }
   }
 
@@ -425,7 +459,7 @@ export class Room extends DurableObject<Env> {
   private async onSubscribe(ws: WebSocket, viewerId: string, message: Subscribe): Promise<void> {
     const parsed = subscribeSchema.safeParse(message);
     if (!parsed.success) {
-      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "subscribe needs tracks [{deviceId, trackName}] or data [deviceId].", "subscribe");
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "subscribe needs tracks [{deviceId, trackName}], data [deviceId] or microphones [viewerId].", "subscribe");
       return;
     }
     const viewer = this.viewer(viewerId)!;
@@ -435,7 +469,7 @@ export class Room extends DurableObject<Env> {
     }
     // Data channels need no SDP, so they go first and the media offer comes last.
     if (parsed.data.data.length > 0) await this.subscribeData(ws, viewer, parsed.data.data);
-    if (parsed.data.tracks.length === 0) {
+    if (parsed.data.tracks.length === 0 && parsed.data.microphones.length === 0) {
       sendViewer(ws, { subscribed: this.subscribed(viewerId) });
       return;
     }
@@ -456,7 +490,7 @@ export class Room extends DurableObject<Env> {
     }
 
     const remote: TrackObject[] = [];
-    const wanted: Array<{ deviceId: string; trackName: string; generation: number }> = [];
+    const wanted: Array<{ deviceId: string; trackName: string; generation: number; micOf?: string }> = [];
     for (const [deviceId, names] of byDevice) {
       const resolved = await this.env.DEVICES.getByName(deviceId).resolve(this.roomId, viewerId);
       if (!resolved.ok) {
@@ -486,6 +520,22 @@ export class Room extends DurableObject<Env> {
         wanted.push({ deviceId, trackName, generation: resolved.generation });
       }
     }
+    // Other viewers' microphones, pulled from their own sessions.
+    for (const micOf of new Set(parsed.data.microphones)) {
+      const speaker = micOf === viewerId ? null : this.viewer(micOf);
+      if (!speaker?.mic_mid || !speaker.sfu_session_id) {
+        this.failTrack(ws, {
+          code: ErrorCode.ERROR_CODE_TRACK_NOT_FOUND,
+          message: `${micOf} has no microphone in this room.`,
+          viewerId: micOf,
+        });
+        continue;
+      }
+      const duplicate = current.some((sub) => sub.viewerId === micOf && sub.generation === speaker.mic_generation);
+      if (duplicate) continue;
+      remote.push({ location: "remote", sessionId: speaker.sfu_session_id, trackName: MICROPHONE_TRACK });
+      wanted.push({ deviceId: "", trackName: MICROPHONE_TRACK, generation: speaker.mic_generation, micOf });
+    }
     if (remote.length === 0) {
       sendViewer(ws, { subscribed: this.subscribed(viewerId) });
       return;
@@ -508,7 +558,7 @@ export class Room extends DurableObject<Env> {
       // The session expired, e.g. it was made at join time and nothing was live for a long
       // time. The viewer has to start a new PeerConnection for the new one, and send its own
       // offer again for the data channel transport.
-      await this.forgetSession(viewerId);
+      this.forgetSession(viewerId);
       sessionId = await this.newSession(sfu, viewerId);
       sessionReset = true;
       result = await sfu.addTracks(sessionId, remote);
@@ -522,7 +572,7 @@ export class Room extends DurableObject<Env> {
         this.failTrack(ws, {
           code: ErrorCode.ERROR_CODE_TRACK_NOT_READY,
           message: `${item?.errorCode ?? "track_failed"}: ${item?.errorDescription ?? `Could not pull ${track.trackName}.`}`,
-          deviceId: track.deviceId,
+          ...(track.micOf ? { viewerId: track.micOf } : { deviceId: track.deviceId }),
           trackName: track.trackName,
           retryable: true,
         });
@@ -530,12 +580,14 @@ export class Room extends DurableObject<Env> {
       }
       const mid = item.mid;
       this.sql.exec(
-        "INSERT OR REPLACE INTO subscriptions (viewer_id, mid, device_id, track_name, generation) VALUES (?, ?, ?, ?, ?)",
+        `INSERT OR REPLACE INTO subscriptions (viewer_id, mid, device_id, track_name, generation, mic_of)
+         VALUES (?, ?, ?, ?, ?, ?)`,
         viewerId,
         mid,
         track.deviceId,
         track.trackName,
         track.generation,
+        track.micOf ?? null,
       );
     });
     this.finishNegotiation(ws, viewerId, result, sessionReset);
@@ -563,9 +615,14 @@ export class Room extends DurableObject<Env> {
    * most DTLS waits, and it connects while the devices wake. Data channels need this transport.
    */
   private async onViewerOffer(ws: WebSocket, viewerId: string, message: SubscribeOffer): Promise<void> {
-    const parsed = sdpMessageSchema.safeParse(message);
+    const parsed = viewerOfferSchema.safeParse(message);
     if (!parsed.success) {
-      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "offer needs an sdp.", "offer");
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "offer needs an sdp, and tracks only for the microphone.", "offer");
+      return;
+    }
+    const microphone = parsed.data.tracks[0];
+    if (microphone) {
+      await this.onMicrophone(ws, viewerId, parsed.data.sdp, microphone.mid);
       return;
     }
     let viewer = this.viewer(viewerId)!;
@@ -573,7 +630,7 @@ export class Room extends DurableObject<Env> {
       // A new PeerConnection: the last one failed, e.g. the SFU was out of reach for a while or
       // did not take its answer. Viewers send their own offer only from a new one. It gets a new
       // session and subscribes again. Whatever the old one was negotiating is void.
-      await this.forgetSession(viewerId);
+      this.forgetSession(viewerId);
       viewer = this.viewer(viewerId)!;
     }
     const sfu = new RealtimeSfu(this.env);
@@ -595,6 +652,73 @@ export class Room extends DurableObject<Env> {
     }
     this.sql.exec("UPDATE viewers SET data_transport = ? WHERE viewer_id = ?", DATA_READY, viewerId);
     sendViewer(ws, { answer: { sdp: answer.sdp } });
+  }
+
+  /**
+   * Publishes the viewer's microphone on its own session, so the other viewers can pull it: an
+   * offer of the viewer's with the microphone in `tracks`. The offer carries the whole
+   * PeerConnection, and the SFU answers it at once. Whether it starts muted came with `mute`.
+   */
+  private async onMicrophone(ws: WebSocket, viewerId: string, sdp: string, mid: string): Promise<void> {
+    const viewer = this.viewer(viewerId)!;
+    if (viewer.data_transport !== DATA_READY || !viewer.sfu_session_id) {
+      this.failMicrophone(ws, ErrorCode.ERROR_CODE_BUSY, "Send your own offer first.");
+      return;
+    }
+    if (viewer.negotiating) {
+      this.failMicrophone(ws, ErrorCode.ERROR_CODE_BUSY, "Send the answer for the last offer first.");
+      return;
+    }
+    if (viewer.mic_mid) {
+      this.failMicrophone(ws, ErrorCode.ERROR_CODE_BUSY, "This PeerConnection already publishes a microphone.");
+      return;
+    }
+    // Offers still waiting for the SFU count too: each viewer runs in its own queue, so two can
+    // be here at once.
+    const speakers = this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM viewers WHERE mic_mid IS NOT NULL OR mic_pending = 1")
+      .one().n;
+    if (speakers >= this.config.maxMicrophonesPerRoom) {
+      this.failMicrophone(
+        ws,
+        ErrorCode.ERROR_CODE_MICROPHONE_LIMIT,
+        `Room ${this.roomId} already has ${this.config.maxMicrophonesPerRoom} microphones. You can listen.`,
+      );
+      return;
+    }
+    this.sql.exec("UPDATE viewers SET mic_pending = 1 WHERE viewer_id = ?", viewerId);
+    let answer: string;
+    try {
+      const result = await new RealtimeSfu(this.env).addTracks(
+        viewer.sfu_session_id,
+        [{ location: "local", mid, trackName: MICROPHONE_TRACK }],
+        { type: "offer", sdp },
+      );
+      const track = result.tracks?.[0];
+      if (track?.errorCode || result.sessionDescription?.type !== "answer") {
+        throw new SfuError(
+          track?.errorCode ?? "sfu_answer_missing",
+          track?.errorDescription ?? "The SFU did not answer the microphone offer.",
+          502,
+        );
+      }
+      answer = result.sessionDescription.sdp;
+    } finally {
+      this.sql.exec("UPDATE viewers SET mic_pending = 0 WHERE viewer_id = ?", viewerId);
+    }
+    this.sql.exec(
+      "UPDATE viewers SET mic_mid = ?, mic_generation = mic_generation + 1 WHERE viewer_id = ?",
+      mid,
+      viewerId,
+    );
+    sendViewer(ws, { answer: { sdp: answer } });
+    this.broadcastViewers();
+  }
+
+  /** Before a microphone is published, it only sets the state the microphone starts in. */
+  private onMute(viewerId: string, message: Mute): void {
+    this.sql.exec("UPDATE viewers SET muted = ? WHERE viewer_id = ?", message.muted ? 1 : 0, viewerId);
+    if (this.viewer(viewerId)?.mic_mid) this.broadcastViewers();
   }
 
   /** Pulls each device's _lossy and _reliable into the viewer's session. No SDP needed. */
@@ -902,6 +1026,7 @@ export class Room extends DurableObject<Env> {
         dataChannels: Boolean(viewer.data_channels),
         dataTransport: viewer.data_transport === DATA_READY ? "ready" : "none",
         data: this.dataSubscriptions(viewer.viewer_id),
+        microphone: viewer.mic_mid ? { mid: viewer.mic_mid, generation: viewer.mic_generation, muted: Boolean(viewer.muted) } : null,
       })),
       alarm: await this.ctx.storage.getAlarm(),
     };
@@ -933,7 +1058,13 @@ export class Room extends DurableObject<Env> {
     return this.sql
       .exec<SubscriptionRow>("SELECT * FROM subscriptions WHERE viewer_id = ? ORDER BY mid", viewerId)
       .toArray()
-      .map((row) => ({ deviceId: row.device_id, trackName: row.track_name, mid: row.mid, generation: row.generation }));
+      .map((row) => ({
+        deviceId: row.device_id,
+        trackName: row.track_name,
+        mid: row.mid,
+        generation: row.generation,
+        viewerId: row.mic_of ?? "",
+      }));
   }
 
   private dataSubscription(viewerId: string, deviceId: string): DataSubscriptionRow | null {
@@ -978,7 +1109,8 @@ export class Room extends DurableObject<Env> {
    * the device (it unsubscribed, left, or its subscribe failed), the device stops counting it.
    */
   private async releaseViewer(viewerId: string, deviceIds: Iterable<string>): Promise<void> {
-    const done = [...new Set(deviceIds)].filter((deviceId) => !this.isSubscribedTo(viewerId, deviceId));
+    // A microphone's subscription has no device.
+    const done = [...new Set(deviceIds)].filter((deviceId) => deviceId && !this.isSubscribedTo(viewerId, deviceId));
     await Promise.allSettled(done.map((deviceId) => this.env.DEVICES.getByName(deviceId).release(this.roomId, viewerId)));
   }
 
@@ -1015,10 +1147,7 @@ export class Room extends DurableObject<Env> {
   private async dropData(viewerId: string, keepControl = false): Promise<string[]> {
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
     const sessionId = this.viewer(viewerId)?.sfu_session_id;
-    if (sessionId) {
-      const sfu = new RealtimeSfu(this.env);
-      await Promise.allSettled(subs.map((sub) => this.closeData(sfu, sessionId, sub)));
-    }
+    if (sessionId) await this.closeAllData(sessionId, subs);
     this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
     if (!keepControl) {
       await Promise.allSettled(subs.map((sub) => this.env.DEVICES.getByName(sub.device_id).controlGone(this.roomId, viewerId)));
@@ -1026,19 +1155,33 @@ export class Room extends DurableObject<Env> {
     return subs.map((sub) => sub.device_id);
   }
 
+  private async closeAllData(sessionId: string, subs: DataSubscriptionRow[]): Promise<void> {
+    const sfu = new RealtimeSfu(this.env);
+    await Promise.allSettled(subs.map((sub) => this.closeData(sfu, sessionId, sub)));
+  }
+
   /**
    * The viewer's PeerConnection and SFU session are done with: its tracks and channels go with
    * them. It keeps its control and its place in the devices' counts, because it subscribes again
    * on the next session, which its next offer starts.
    */
-  private async forgetSession(viewerId: string): Promise<void> {
-    await this.dropData(viewerId, true);
+  private forgetSession(viewerId: string): void {
+    const viewer = this.viewer(viewerId);
+    const hadMicrophone = Boolean(viewer?.mic_mid);
+    // The old session's channels close in the background: with its PeerConnection gone, each
+    // call takes about 5 s, and the new offer's answer should not wait for them.
+    const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
+    if (viewer?.sfu_session_id && subs.length > 0) void this.closeAllData(viewer.sfu_session_id, subs);
+    this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec(
-      "UPDATE viewers SET sfu_session_id = NULL, negotiating = 0, pending_offer = NULL, data_transport = ? WHERE viewer_id = ?",
+      `UPDATE viewers SET sfu_session_id = NULL, negotiating = 0, pending_offer = NULL, data_transport = ?, mic_mid = NULL
+       WHERE viewer_id = ?`,
       DATA_NONE,
       viewerId,
     );
+    // Its microphone went with the session. Others unsubscribe, and pull the next one.
+    if (hadMicrophone) this.broadcastViewers();
   }
 
   private async watchAll(now: number): Promise<void> {
@@ -1078,6 +1221,9 @@ export class Room extends DurableObject<Env> {
     for (const deviceId of await this.dropData(viewerId, true)) affected.add(deviceId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);
+    // Others' pulls of its microphone stay until they unsubscribe, so the SFU closes them too.
+    // Its generations start over if it joins again: mark them with 0, which no publication has.
+    this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE mic_of = ?", viewerId);
     this.broadcastViewers();
     const members = this.sql
       .exec<{ device_id: string }>("SELECT device_id FROM members")
@@ -1149,11 +1295,19 @@ export class Room extends DurableObject<Env> {
   /** Everyone in the room, oldest first, as the viewers see them. */
   private viewerInfos(): ViewerInfo[] {
     return this.sql
-      .exec<{ viewer_id: string; data_channels: number; socket_closed_at: number | null }>(
-        "SELECT viewer_id, data_channels, socket_closed_at FROM viewers ORDER BY created_at, viewer_id",
+      .exec<Pick<ViewerRow, "viewer_id" | "data_channels" | "socket_closed_at" | "mic_mid" | "mic_generation" | "muted">>(
+        `SELECT viewer_id, data_channels, socket_closed_at, mic_mid, mic_generation, muted FROM viewers
+         ORDER BY created_at, viewer_id`,
       )
       .toArray()
-      .map((row) => ({ viewerId: row.viewer_id, dataChannels: Boolean(row.data_channels), away: row.socket_closed_at !== null }));
+      .map((row) => ({
+        viewerId: row.viewer_id,
+        dataChannels: Boolean(row.data_channels),
+        away: row.socket_closed_at !== null,
+        microphone: row.mic_mid !== null,
+        muted: Boolean(row.muted),
+        microphoneGeneration: row.mic_generation,
+      }));
   }
 
   /** Tells the viewers who is in the room now. `except` already has it, e.g. in its joined. */
@@ -1169,10 +1323,15 @@ export class Room extends DurableObject<Env> {
     sendViewer(ws, { error: signalError({ code, message, request, deviceId }) });
   }
 
-  /** An error for one device or track of a subscribe. The rest of the request goes on. */
+  /** A microphone offer failed: the viewer rolls it back and only listens, or tries again later. */
+  private failMicrophone(ws: WebSocket, code: ErrorCode, message: string): void {
+    sendViewer(ws, { error: signalError({ code, message, request: "offer", trackName: MICROPHONE_TRACK }) });
+  }
+
+  /** An error for one device, track or microphone of a subscribe. The rest of the request goes on. */
   private failTrack(
     ws: WebSocket,
-    fields: { code: ErrorCode; message: string; deviceId: string; trackName?: string; retryable?: boolean },
+    fields: { code: ErrorCode; message: string; deviceId?: string; viewerId?: string; trackName?: string; retryable?: boolean },
   ): void {
     sendViewer(ws, { error: signalError({ ...fields, request: "subscribe" }) });
   }
@@ -1233,4 +1392,16 @@ function offlineInfo(deviceId: string): DeviceInfo {
     handover: undefined,
     waiting: [],
   };
+}
+
+/** Tables made before the microphone columns get them. A room keeps its tables while it is in use. */
+function addMissingColumns(sql: SqlStorage): void {
+  const columns = (table: string) =>
+    new Set(sql.exec<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((row) => row.name));
+  const viewers = columns("viewers");
+  if (!viewers.has("mic_mid")) sql.exec("ALTER TABLE viewers ADD COLUMN mic_mid TEXT");
+  if (!viewers.has("mic_generation")) sql.exec("ALTER TABLE viewers ADD COLUMN mic_generation INTEGER NOT NULL DEFAULT 0");
+  if (!viewers.has("muted")) sql.exec("ALTER TABLE viewers ADD COLUMN muted INTEGER NOT NULL DEFAULT 0");
+  if (!viewers.has("mic_pending")) sql.exec("ALTER TABLE viewers ADD COLUMN mic_pending INTEGER NOT NULL DEFAULT 0");
+  if (!columns("subscriptions").has("mic_of")) sql.exec("ALTER TABLE subscriptions ADD COLUMN mic_of TEXT");
 }

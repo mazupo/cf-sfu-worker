@@ -118,8 +118,8 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | Worker → viewer | `joined` | `viewerId`, `room`, `resumed`, `iceServers`, `devices`, `subscriptions`, `data`, `viewers` |
 | Worker → viewer | `device` | One device's new state, with `dataChannels`, `controller`, `handover` and `waiting` |
 | Worker → viewer | `members` | The room's devices changed |
-| Worker → viewer | `viewers` | The room's viewers changed: each has `viewerId`, `dataChannels` and `away` (the socket closed, and it may come back) |
-| Viewer → worker | `subscribe` | `tracks: [{ deviceId, trackName }]`, `data: [deviceId]` |
+| Worker → viewer | `viewers` | The room's viewers changed: each has `viewerId`, `dataChannels`, `away` (the socket closed, and it may come back), `microphone`, `muted` and `microphoneGeneration` |
+| Viewer → worker | `subscribe` | `tracks: [{ deviceId, trackName }]`, `data: [deviceId]`, `microphones: [viewerId]` |
 | Worker → viewer | `offer` | `sdp`, `tracks`, `sessionReset` |
 | Viewer → worker | `answer` | `sdp` |
 | Worker → viewer | `subscribed` | `tracks`, `data: [{ deviceId, generation, channels, canReply }]` |
@@ -127,10 +127,11 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | Viewer → worker | `take_control` | `deviceId` |
 | Viewer → worker | `release_control` | `deviceId` |
 | Viewer → worker | `control_ready` | `deviceId` |
-| Viewer → worker | `offer` | `sdp`: the viewer's own offer, right after `joined`, and again from a new PeerConnection when the last one failed |
+| Viewer → worker | `offer` | `sdp`: the viewer's own offer, right after `joined`, and again from a new PeerConnection when the last one failed. With `tracks: [{ trackName: "microphone", mid }]`, it publishes the viewer's microphone. |
 | Worker → viewer | `answer` | `sdp`: the SFU's answer to it |
+| Viewer → worker | `mute` | `muted`. Send it before the microphone's `offer` too. |
 | Viewer → worker | `leave` | |
-| Worker → both | `error` | `code`, `message`, `request`, `deviceId`, `trackName`, `retryable` |
+| Worker → both | `error` | `code`, `message`, `request`, `deviceId`, `viewerId`, `trackName`, `retryable` |
 
 The proto file also defines the device states (`DeviceState`), the error codes (`ErrorCode`) and the close codes (`CloseCode`). Close code `4000` means another connection used the same `device_id` or `viewer_id`. Do not reconnect after it.
 
@@ -175,6 +176,17 @@ On a viewer whose token has `data_channels`:
 5. Send `release_control` to give up control or your place in line. Leaving the room or closing the device's channels does the same.
 
 Control belongs to the device, not to a room. A device in two rooms has one line for viewers of both rooms. Control stays with the viewer when the device publishes again.
+
+### 4. Voice
+
+Viewers in a room can talk to each other. Devices do not hear them.
+
+1. After the `answer` to your own offer, get the microphone and add it to the PeerConnection as a `sendonly` transceiver. Send `mute` with whether it starts muted, then the new offer as `offer` with `tracks: [{ trackName: "microphone", mid }]`, using the transceiver's `mid`. Apply the `answer`.
+2. The other viewers see `microphone: true` in `viewers`. To hear someone, send `subscribe` with `microphones: [viewerId]`. The track comes with the SFU's offer, like a device's track, and its subscription has `viewerId` instead of `deviceId`.
+3. To mute, disable the track and send `mute`. The others see `muted` in `viewers`.
+4. A new PeerConnection publishes again. `microphoneGeneration` then goes up: unsubscribe the old track and subscribe again. When a viewer stops publishing or leaves, unsubscribe its track.
+
+A room takes `MAX_MICROPHONES_PER_ROOM` microphones, 10 by default. Past that, the `offer` gets `error` with `microphone_limit` and `trackName: "microphone"`: roll the offer back and only listen.
 
 The worker does not read the messages. pi-webrtc expects `protocol.Packet` from [`packet.proto`](https://github.com/mazupo/protocol/blob/main/protos/packet.proto), with the text in `raw`. The demo pages do the same.
 

@@ -9,6 +9,7 @@ export type Settings = {
   maxViewersPerDevice: number;
   maxDevicesPerRoom: number;
   maxRoomsPerDevice: number;
+  maxMicrophonesPerRoom: number;
 };
 
 /** How often a watched device or a room with viewers checks heartbeats. */
@@ -46,6 +47,7 @@ export function settings(env: Env): Settings {
     maxViewersPerDevice: positive(env.MAX_VIEWERS_PER_DEVICE, 10),
     maxDevicesPerRoom: positive(env.MAX_DEVICES_PER_ROOM, 16),
     maxRoomsPerDevice: positive(env.MAX_ROOMS_PER_DEVICE, 4),
+    maxMicrophonesPerRoom: positive(env.MAX_MICROPHONES_PER_ROOM, 10),
   };
 }
 

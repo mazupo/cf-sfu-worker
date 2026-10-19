@@ -128,8 +128,8 @@ describe("watching", () => {
     expect(offer.sdp).toBe("v=0 subscriber-offer");
     expect(offer.sessionReset).toBe(false);
     expect(subscribed.tracks).toEqual([
-      { deviceId: "cam-1", trackName: "video_track", mid: "100", generation: 1 },
-      { deviceId: "cam-1", trackName: "audio_track", mid: "101", generation: 1 },
+      { deviceId: "cam-1", trackName: "video_track", mid: "100", generation: 1, viewerId: "" },
+      { deviceId: "cam-1", trackName: "audio_track", mid: "101", generation: 1, viewerId: "" },
     ]);
     // The viewer pulled from the device's session; it never sees that session ID.
     const [publisher] = publisherSessions(calls);

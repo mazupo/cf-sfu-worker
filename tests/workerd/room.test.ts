@@ -207,15 +207,15 @@ describe("rooms", () => {
 
   test("viewers see who else watches the room", async () => {
     const alice = await connect(await viewerToken("Alice", "lab-viewers"));
-    expect((await alice.next("joined")).viewers).toEqual([{ viewerId: "Alice", dataChannels: false, away: false }]);
+    expect((await alice.next("joined")).viewers).toEqual([{ viewerId: "Alice", dataChannels: false, away: false, microphone: false, muted: false, microphoneGeneration: 0 }]);
 
     const bob = await connect(await viewerToken("Bob Lee", "lab-viewers", true));
     const bobJoined = await bob.next("joined");
     expect(bobJoined.viewers.map((viewer: { viewerId: string }) => viewer.viewerId)).toEqual(["Alice", "Bob Lee"]);
     expect(await alice.next("viewers")).toEqual({
       viewers: [
-        { viewerId: "Alice", dataChannels: false, away: false },
-        { viewerId: "Bob Lee", dataChannels: true, away: false },
+        { viewerId: "Alice", dataChannels: false, away: false, microphone: false, muted: false, microphoneGeneration: 0 },
+        { viewerId: "Bob Lee", dataChannels: true, away: false, microphone: false, muted: false, microphoneGeneration: 0 },
       ],
     });
     // Its joined has the list already.
@@ -227,7 +227,7 @@ describe("rooms", () => {
 
     // A dropped socket may come back, so it stays in the list as away.
     bob.close();
-    expect((await alice.next("viewers")).viewers[1]).toEqual({ viewerId: "Bob Lee", dataChannels: true, away: true });
+    expect((await alice.next("viewers")).viewers[1]).toEqual({ viewerId: "Bob Lee", dataChannels: true, away: true, microphone: false, muted: false, microphoneGeneration: 0 });
 
     carol.send("leave");
     await carol.closed();
