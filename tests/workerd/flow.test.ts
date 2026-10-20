@@ -3,6 +3,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test, vi } from "vitest";
 
 import { ErrorCode, ViewerRequest } from "../../src/proto/cloudflare";
+import { CLAIMS_HEADER } from "../../src/server/socket";
 import {
   connect,
   deviceToken,
@@ -10,9 +11,20 @@ import {
   PUBLISH_TRACKS,
   publisherSessions,
   state_,
-  type TestSocket,
+  TestSocket,
   viewerToken,
 } from "./helpers";
+
+/** The request the worker hands a Durable Object for this token, with its claims. */
+function socketRequest(token: string): Request {
+  const claims = atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"));
+  return new Request("http://localhost/cloudflare/rtc", {
+    headers: { Upgrade: "websocket", [CLAIMS_HEADER]: encodeURIComponent(claims) },
+  });
+}
+
+/** The kind of each message a socket got so far, in order: "joined", "wake", ... */
+const kinds = (ws: TestSocket) => ws.messages.map((message) => Object.keys(message)[0]);
 
 /** Moves a Device DO timer into the past and runs its alarm. */
 async function expireDeviceTimer(deviceId: string, column: "linger_until" | "wake_deadline"): Promise<void> {
@@ -92,6 +104,43 @@ describe("device socket", () => {
     second.close();
   });
 
+  test("a reconnecting device gets joined before a wake, even when a room watches meanwhile", async () => {
+    mockSfu();
+    const first = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await first.next("joined");
+    const request = socketRequest(await deviceToken("cam-1", ["lab-a"]));
+    // The new connection waits for its rooms; a room's watch() comes in right then.
+    const received = await runInDurableObject(env.DEVICES.getByName("cam-1"), async (instance) => {
+      const fetching = instance.fetch(request);
+      await instance.watch("lab-a", []);
+      const second = new TestSocket((await fetching).webSocket!, "device");
+      await vi.waitFor(() => expect(second.has("wake")).toBe(true));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      second.close();
+      return kinds(second);
+    });
+    expect(received[0]).toBe("joined");
+    expect(received.filter((kind) => kind === "wake")).toHaveLength(1);
+    expect(first.has("wake")).toBe(false);
+  });
+
+  test("a reconnecting device does not look offline to its rooms while it joins", async () => {
+    mockSfu();
+    const first = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await first.next("joined");
+    const request = socketRequest(await deviceToken("cam-1", ["lab-a"]));
+    // The old socket is closed and the new one waits for its rooms, e.g. after a network change.
+    const during = await runInDurableObject(env.DEVICES.getByName("cam-1"), async (instance) => {
+      const fetching = instance.fetch(request);
+      const info = await instance.getInfo();
+      const second = new TestSocket((await fetching).webSocket!, "device");
+      await second.next("joined");
+      second.close();
+      return info.state;
+    });
+    expect(during).toBe(state_("sleeping"));
+  });
+
   test("what a replaced viewer socket still sends, such as a late leave, is ignored", async () => {
     mockSfu();
     const room = env.ROOMS.getByName("lab-a");
@@ -128,8 +177,8 @@ describe("watching", () => {
     expect(offer.sdp).toBe("v=0 subscriber-offer");
     expect(offer.sessionReset).toBe(false);
     expect(subscribed.tracks).toEqual([
-      { deviceId: "cam-1", trackName: "video_track", mid: "100", generation: 1, viewerId: "" },
-      { deviceId: "cam-1", trackName: "audio_track", mid: "101", generation: 1, viewerId: "" },
+      { deviceId: "cam-1", trackName: "video_track", mid: "100", generation: 1, viewerId: "", room: "" },
+      { deviceId: "cam-1", trackName: "audio_track", mid: "101", generation: 1, viewerId: "", room: "" },
     ]);
     // The viewer pulled from the device's session; it never sees that session ID.
     const [publisher] = publisherSessions(calls);

@@ -40,6 +40,9 @@
       <label class="check" title="Publish _lossy and _reliable, like pi-webrtc's --enable-ipc. Choose before you connect.">
         <input type="checkbox" name="ipc" id="ipc"> Enable IPC
       </label>
+      <label class="check" title="Play the viewers' voices, like pi-webrtc without --no-audio. Choose before you connect.">
+        <input type="checkbox" name="voices" id="voices" checked> Play viewers' voices
+      </label>
       <div>
         <button type="submit" id="connect">Connect</button>
         <button type="button" class="secondary" id="disconnect" disabled>Disconnect</button>
@@ -47,6 +50,8 @@
     </form>
 
     <p class="status" id="status">Not connected.</p>
+    <p class="status" id="voices-status" hidden></p>
+    <div id="voices-audio" hidden></div>
     <section class="panel preview">
       <video id="preview" autoplay playsinline muted></video>
     </section>

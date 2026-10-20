@@ -31,7 +31,8 @@ import {
   viewerOfferSchema,
 } from "../shared/protocol";
 import { REGISTRY_NAME, type RoomSummary } from "./registry";
-import { PRESENCE_CHECK_MS, WATCH_RENEW_MS, settings, type Settings } from "./config";
+import { MICROPHONE_TRACK, PRESENCE_CHECK_MS, WATCH_RENEW_MS, settings, type Settings } from "./config";
+import type { RoomMicrophone } from "./device";
 import { deviceChannels, iceServers, RealtimeSfu, SfuError, type TrackObject, type TracksResponse } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
 import {
@@ -50,9 +51,6 @@ const CLOSE_LEFT = 1000;
 /** The data channel transport of a viewer's session. */
 const DATA_NONE = 0;
 const DATA_READY = 1;
-
-/** The track name of a viewer's microphone in its own SFU session. */
-const MICROPHONE_TRACK = "microphone";
 
 type ViewerRow = {
   viewer_id: string;
@@ -96,7 +94,9 @@ type SubscriptionRow = {
 
 type ViewerAttachment = { viewerId: string; connectedAt: number };
 
-export type AddMemberResult = { ok: true; viewers: number } | { ok: false; code: ErrorCode; message: string };
+export type AddMemberResult =
+  | { ok: true; viewers: number; microphones: RoomMicrophone[] }
+  | { ok: false; code: ErrorCode; message: string };
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS members (
@@ -226,7 +226,8 @@ export class Room extends DurableObject<Env> {
       );
       this.broadcast({ members: { devices: this.memberInfos() } });
     }
-    return { ok: true, viewers };
+    // The device plays these voices, if it plays any.
+    return { ok: true, viewers, microphones: this.microphones() };
   }
 
   async removeMember(deviceId: string): Promise<void> {
@@ -316,8 +317,9 @@ export class Room extends DurableObject<Env> {
       if (!resumable) {
         await this.dropViewer(viewerId);
       } else if (viewer.data_channels && !claims.grant.dataChannels) {
-        // Resumed without data channels: it closes them and gives up its control.
-        await this.dropData(viewerId);
+        // Resumed without data channels: it gives up its control, and the SFU closes them in the
+        // background, since the old PeerConnection is usually gone.
+        await this.dropData(viewerId, false, true);
       }
       viewer = this.viewer(viewerId);
     }
@@ -713,6 +715,7 @@ export class Room extends DurableObject<Env> {
     );
     sendViewer(ws, { answer: { sdp: answer } });
     this.broadcastViewers();
+    this.tellDevicesSoon();
   }
 
   /** Before a microphone is published, it only sets the state the microphone starts in. */
@@ -1064,6 +1067,8 @@ export class Room extends DurableObject<Env> {
         mid: row.mid,
         generation: row.generation,
         viewerId: row.mic_of ?? "",
+        // Only a device's pull of a microphone needs the room: a viewer's are all in its own.
+        room: "",
       }));
   }
 
@@ -1142,12 +1147,16 @@ export class Room extends DurableObject<Env> {
 
   /**
    * Closes and forgets the viewer's data channels. Unless `keepControl`, each device then drops it
-   * from its control state, and the next one waiting takes over.
+   * from its control state, and the next one waiting takes over. With `background`, the SFU
+   * closes them meanwhile: without the viewer's PeerConnection, each call takes about 5 s.
    */
-  private async dropData(viewerId: string, keepControl = false): Promise<string[]> {
+  private async dropData(viewerId: string, keepControl = false, background = false): Promise<string[]> {
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
     const sessionId = this.viewer(viewerId)?.sfu_session_id;
-    if (sessionId) await this.closeAllData(sessionId, subs);
+    if (sessionId) {
+      const closing = this.closeAllData(sessionId, subs);
+      if (!background) await closing;
+    }
     this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
     if (!keepControl) {
       await Promise.allSettled(subs.map((sub) => this.env.DEVICES.getByName(sub.device_id).controlGone(this.roomId, viewerId)));
@@ -1181,7 +1190,10 @@ export class Room extends DurableObject<Env> {
       viewerId,
     );
     // Its microphone went with the session. Others unsubscribe, and pull the next one.
-    if (hadMicrophone) this.broadcastViewers();
+    if (hadMicrophone) {
+      this.broadcastViewers();
+      this.tellDevicesSoon();
+    }
   }
 
   private async watchAll(now: number): Promise<void> {
@@ -1217,6 +1229,7 @@ export class Room extends DurableObject<Env> {
   private async dropViewer(viewerId: string): Promise<void> {
     this.earlySessions.delete(viewerId);
     const licensed = Boolean(this.viewer(viewerId)?.data_channels);
+    const hadMicrophone = Boolean(this.viewer(viewerId)?.mic_mid);
     const affected = new Set(this.subscriptions(viewerId).map((sub) => sub.deviceId));
     for (const deviceId of await this.dropData(viewerId, true)) affected.add(deviceId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
@@ -1225,6 +1238,7 @@ export class Room extends DurableObject<Env> {
     // Its generations start over if it joins again: mark them with 0, which no publication has.
     this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE mic_of = ?", viewerId);
     this.broadcastViewers();
+    if (hadMicrophone) this.tellDevicesSoon();
     const members = this.sql
       .exec<{ device_id: string }>("SELECT device_id FROM members")
       .toArray()
@@ -1308,6 +1322,34 @@ export class Room extends DurableObject<Env> {
         muted: Boolean(row.muted),
         microphoneGeneration: row.mic_generation,
       }));
+  }
+
+  /** The microphones the room's devices play: every viewer's that publishes one. */
+  private microphones(): RoomMicrophone[] {
+    return this.sql
+      .exec<Pick<ViewerRow, "viewer_id" | "sfu_session_id" | "mic_generation">>(
+        `SELECT viewer_id, sfu_session_id, mic_generation FROM viewers
+         WHERE mic_mid IS NOT NULL AND sfu_session_id IS NOT NULL ORDER BY created_at, viewer_id`,
+      )
+      .toArray()
+      .map((row) => ({ viewerId: row.viewer_id, sessionId: row.sfu_session_id!, generation: row.mic_generation }));
+  }
+
+  /**
+   * Tells every device in the room which microphones to play, without holding up the caller. One
+   * update at a time, each with the list as it is when it starts, so every device ends on the latest.
+   * The key cannot be a viewer ID: those have no colon.
+   */
+  private tellDevicesSoon(): void {
+    void this.queue.run("devices:voices", async () => {
+      if (!this.ready) return;
+      const microphones = this.microphones();
+      const members = this.sql
+        .exec<{ device_id: string }>("SELECT device_id FROM members")
+        .toArray()
+        .map((row) => row.device_id);
+      await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).hear(this.roomId, microphones)));
+    });
   }
 
   /** Tells the viewers who is in the room now. `except` already has it, e.g. in its joined. */

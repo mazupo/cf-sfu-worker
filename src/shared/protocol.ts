@@ -89,6 +89,7 @@ export const publishOfferSchema = z.object({
   sdp: sdpSchema,
   tracks: z.array(z.object({ mid: midSchema, trackName: trackNameSchema })).min(1).max(16),
   dataChannels: z.boolean(),
+  voices: z.boolean(),
 });
 
 export const subscribeSchema = z

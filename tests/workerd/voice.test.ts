@@ -1,15 +1,24 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, test } from "vitest";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { describe, expect, test, vi } from "vitest";
 
 import { ErrorCode } from "../../src/proto/cloudflare";
-import { connect, mockSfu, sessionOf, type SfuCall, type TestSocket, viewerToken } from "./helpers";
+import {
+  connect,
+  deviceToken,
+  mockSfu,
+  PUBLISH_TRACKS,
+  sessionOf,
+  type SfuCall,
+  type TestSocket,
+  viewerToken,
+} from "./helpers";
 
 const ROOM = "voice";
 
 /** Joins and has its own offer answered, so its session can carry a microphone. */
-async function viewer(viewerId: string): Promise<TestSocket> {
-  const ws = await connect(await viewerToken(viewerId, ROOM));
+async function viewer(viewerId: string, room = ROOM): Promise<TestSocket> {
+  const ws = await connect(await viewerToken(viewerId, room));
   await ws.next("joined");
   ws.send("offer", { sdp: `v=0 ${viewerId}-offer` });
   await ws.next("answer");
@@ -66,7 +75,7 @@ describe("voice", () => {
 
     bob.send("subscribe", { microphones: ["Alice"] });
     const offer = await bob.next("offer");
-    expect(offer.tracks).toEqual([{ deviceId: "", viewerId: "Alice", trackName: "microphone", mid: "100", generation: 1 }]);
+    expect(offer.tracks).toEqual([{ deviceId: "", viewerId: "Alice", trackName: "microphone", mid: "100", generation: 1, room: "" }]);
     const pull = calls.filter((call) => call.path.endsWith("/tracks/new")).at(-1)!;
     expect(sessionOf(pull)).toBe(sessionOfOffer(calls, "Bob"));
     expect(pull.body.tracks).toEqual([{ location: "remote", sessionId: sessionOfOffer(calls, "Alice"), trackName: "microphone" }]);
@@ -123,6 +132,24 @@ describe("voice", () => {
     carol.send("subscribe", { microphones: ["Alice", "Bob"] });
     expect((await carol.next("offer")).tracks.map((t: { viewerId: string }) => t.viewerId)).toEqual(["Alice", "Bob"]);
     for (const ws of [...speakers, carol]) ws.close();
+  });
+
+  test("microphones offered at the same time still stop at the limit", async () => {
+    mockSfu({ microphoneDelayMs: 200 });
+    const alice = await viewer("Alice");
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    // One place is left, and the SFU is slow: both offers are waiting at once.
+    const bob = await viewer("Bob");
+    const carol = await viewer("Carol");
+    publishMicrophone(bob, "Bob");
+    publishMicrophone(carol, "Carol");
+    const outcome = async (ws: TestSocket) => {
+      await vi.waitFor(() => expect(ws.has("answer") || ws.has("error")).toBe(true), { timeout: 3000 });
+      return ws.has("answer") ? "answer" : (await ws.next("error")).code;
+    };
+    expect([await outcome(bob), await outcome(carol)].sort()).toEqual(["answer", ErrorCode.ERROR_CODE_MICROPHONE_LIMIT].sort());
+    for (const ws of [alice, bob, carol]) ws.close();
   });
 
   test("a new PeerConnection drops the microphone until it publishes again", async () => {
@@ -188,5 +215,247 @@ describe("voice", () => {
     await alice.next("answer");
     expect((await viewersOf(alice)).Alice).toMatchObject({ microphone: true, microphoneGeneration: 1 });
     alice.close();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Devices play the viewers' voices
+// ---------------------------------------------------------------------------------------------
+
+const CAM = "cam-voice";
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A device in `rooms`, connected and sleeping. */
+async function device(rooms: string[] = [ROOM]): Promise<TestSocket> {
+  const ws = await connect(await deviceToken(CAM, rooms));
+  await ws.next("joined");
+  return ws;
+}
+
+/** Answers the wake with an offer, with voices or without, and says its PeerConnection is connected. */
+async function publish(ws: TestSocket, voices = true): Promise<void> {
+  await ws.next("wake");
+  ws.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS, voices });
+  await ws.next("answer");
+  ws.send("ready", {});
+}
+
+/** The session the device published on. */
+function deviceSession(calls: SfuCall[]): string {
+  return sessionOf(calls.find((call) => call.body?.sessionDescription?.sdp === "v=0 publisher-offer")!);
+}
+
+/** The microphones pulled into the device's session. */
+function devicePulls(calls: SfuCall[]): SfuCall[] {
+  const session = deviceSession(calls);
+  return calls.filter((call) => call.path.endsWith(`/sessions/${session}/tracks/new`) && call.body.tracks[0].location === "remote");
+}
+
+/** Waits for a call, e.g. the device's renegotiate, which follows its answer. */
+async function callMatching(calls: SfuCall[], match: (call: SfuCall) => boolean): Promise<SfuCall> {
+  for (let tries = 0; tries < 100; tries++) {
+    const found = calls.find(match);
+    if (found) return found;
+    await sleep(20);
+  }
+  throw new Error(`No such SFU call in ${JSON.stringify(calls.map((call) => call.path))}`);
+}
+
+/** A viewer's microphone in the device's offer. */
+const voice = (viewerId: string, mid: string, room = ROOM, generation = 1) => ({
+  deviceId: "",
+  trackName: "microphone",
+  mid,
+  generation,
+  viewerId,
+  room,
+});
+
+describe("device voices", () => {
+  test("a device plays every microphone in its room: the SFU's offer, the device's answer", async () => {
+    const calls = mockSfu();
+    const cam = await device();
+    const alice = await viewer("Alice");
+    await publish(cam);
+    await alice.device(CAM, "live");
+
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    expect(await cam.next("offer")).toEqual({ sdp: "v=0 subscriber-offer", tracks: [voice("Alice", "100")], sessionReset: false });
+    expect(devicePulls(calls).map((call) => call.body.tracks)).toEqual([
+      [{ location: "remote", sessionId: sessionOfOffer(calls, "Alice"), trackName: "microphone" }],
+    ]);
+
+    cam.send("answer", { sdp: "v=0 device-answer" });
+    const session = deviceSession(calls);
+    const renegotiate = await callMatching(calls, (call) => call.path.endsWith(`/sessions/${session}/renegotiate`));
+    expect(renegotiate.body.sessionDescription).toEqual({ type: "answer", sdp: "v=0 device-answer" });
+
+    // No offer is waiting now.
+    cam.send("answer", { sdp: "v=0 stray-answer" });
+    expect(await cam.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_NO_OFFER, request: "answer" });
+
+    // The speaker leaves: the device's pull of it is closed, which the device answers too.
+    alice.send("leave");
+    expect(await cam.next("offer")).toEqual({ sdp: "v=0 close-offer", tracks: [], sessionReset: false });
+    const close = await callMatching(calls, (call) => call.path.endsWith(`/sessions/${session}/tracks/close`));
+    expect(close.body.tracks).toEqual([{ mid: "100" }]);
+    cam.close();
+  });
+
+  test("a forced close needs no answer, so the next pull goes at once", async () => {
+    const calls = mockSfu({ closeWithoutOffer: true });
+    const cam = await device();
+    const alice = await viewer("Alice");
+    const bob = await viewer("Bob");
+    await publish(cam);
+    await alice.device(CAM, "live");
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100")]);
+    cam.send("answer", { sdp: "v=0 device-answer" });
+
+    // Bob publishes while Alice leaves: the close needs no SDP, and Bob's pull follows it.
+    alice.send("leave");
+    publishMicrophone(bob, "Bob");
+    await bob.next("answer");
+    const session = deviceSession(calls);
+    await callMatching(calls, (call) => call.path.endsWith(`/sessions/${session}/tracks/close`));
+    expect((await cam.next("offer")).tracks).toEqual([voice("Bob", "101")]);
+    for (const ws of [cam, bob]) ws.close();
+  });
+
+  test("a microphone published before the device is live is pulled once it is", async () => {
+    mockSfu();
+    const cam = await device();
+    const alice = await viewer("Alice");
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    await publish(cam);
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100")]);
+    for (const ws of [cam, alice]) ws.close();
+  });
+
+  test("one negotiation at a time: a change waits for the device's answer", async () => {
+    const calls = mockSfu();
+    const cam = await device();
+    const alice = await viewer("Alice");
+    const bob = await viewer("Bob");
+    await publish(cam);
+    await alice.device(CAM, "live");
+
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100")]);
+    publishMicrophone(bob, "Bob");
+    await bob.next("answer");
+    await sleep(200);
+    expect(cam.has("offer")).toBe(false);
+    expect(devicePulls(calls)).toHaveLength(1);
+
+    cam.send("answer", { sdp: "v=0 device-answer" });
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100"), voice("Bob", "101")]);
+    expect(devicePulls(calls)).toHaveLength(2);
+    for (const ws of [cam, alice, bob]) ws.close();
+  });
+
+  test("a device that published without voices pulls none", async () => {
+    const calls = mockSfu();
+    const cam = await device();
+    const alice = await viewer("Alice");
+    await publish(cam, false);
+    await alice.device(CAM, "live");
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    await sleep(200);
+    expect(cam.has("offer")).toBe(false);
+    expect(devicePulls(calls)).toHaveLength(0);
+    for (const ws of [cam, alice]) ws.close();
+  });
+
+  test("a device in two rooms plays both, each microphone with its room", async () => {
+    mockSfu();
+    const cam = await device([ROOM, "voice-2"]);
+    const alice = await viewer("Alice");
+    await publish(cam);
+    await alice.device(CAM, "live");
+    const otherAlice = await viewer("Alice", "voice-2");
+
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100")]);
+    cam.send("answer", { sdp: "v=0 device-answer" });
+    publishMicrophone(otherAlice, "Alice");
+    await otherAlice.next("answer");
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100"), voice("Alice", "101", "voice-2")]);
+    for (const ws of [cam, alice, otherAlice]) ws.close();
+  });
+
+  test("a device that does not answer plays no voices until it publishes again", async () => {
+    mockSfu();
+    const cam = await device();
+    const alice = await viewer("Alice");
+    const bob = await viewer("Bob");
+    await publish(cam);
+    await alice.device(CAM, "live");
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    await cam.next("offer");
+
+    const stub = env.DEVICES.getByName(CAM);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE voice_state SET offer_sent_at = ?", Date.now() - 60_000);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await cam.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_SFU, request: "answer" });
+
+    publishMicrophone(bob, "Bob");
+    await bob.next("answer");
+    await sleep(200);
+    expect(cam.has("offer")).toBe(false);
+    for (const ws of [cam, alice, bob]) ws.close();
+  });
+
+  test("a microphone the SFU cannot pull yet is tried again later", async () => {
+    mockSfu({ missingTrack: "microphone" });
+    const cam = await device();
+    const alice = await viewer("Alice");
+    await publish(cam);
+    await alice.device(CAM, "live");
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    // The fake SFU still sends an offer; the microphone is not in it.
+    expect((await cam.next("offer")).tracks).toEqual([]);
+    cam.send("answer", { sdp: "v=0 device-answer" });
+    await sleep(200);
+    expect(cam.has("offer")).toBe(false);
+
+    mockSfu();
+    const stub = env.DEVICES.getByName(CAM);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("UPDATE voice_state SET retry_at = ?", Date.now() - 1);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100")]);
+    for (const ws of [cam, alice]) ws.close();
+  });
+
+  test("a device stored before voices gets the new tables", async () => {
+    mockSfu();
+    const first = await device();
+    const stub = env.DEVICES.getByName(CAM);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE voices; DROP TABLE voice_pulls; DROP TABLE voice_state;");
+    });
+    await expect(runInDurableObject(stub, (_instance, state) => state.abort("deploy"))).rejects.toThrow();
+    first.close();
+
+    const cam = await device();
+    const alice = await viewer("Alice");
+    await publish(cam);
+    publishMicrophone(alice, "Alice");
+    await alice.next("answer");
+    expect((await cam.next("offer")).tracks).toEqual([voice("Alice", "100")]);
+    for (const ws of [cam, alice]) ws.close();
   });
 });

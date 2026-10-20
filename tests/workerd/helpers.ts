@@ -174,13 +174,27 @@ export type SfuCall = { method: string; path: string; body: any };
 
 /** Fakes the Realtime SFU API and records every call. */
 export function mockSfu(
-  options: { missingTrack?: string; expireFirstPublish?: boolean; failDeviceChannels?: number[] } = {},
+  options: {
+    missingTrack?: string;
+    expireFirstPublish?: boolean;
+    failDeviceChannels?: number[];
+    closeWithoutOffer?: boolean;
+    /** The first renegotiate fails, as when the SFU does not take an answer. */
+    failFirstRenegotiate?: boolean;
+    /** The SFU takes this long to answer a viewer's microphone offer. */
+    microphoneDelayMs?: number;
+    /** Taking canReply away fails. */
+    failRevoke?: boolean;
+    /** The SFU takes this long to close data channels, as when the viewer's PeerConnection is gone. */
+    dataCloseDelayMs?: number;
+  } = {},
 ): SfuCall[] {
   const calls: SfuCall[] = [];
   let sessions = 0;
   let mids = 100;
   let publishes = 0;
   let deviceChannels = 0;
+  let renegotiations = 0;
   // Like the real SFU: channel ids per session, even for published ones and odd for pulled ones.
   const channelIds = new Map<string, { local: number; remote: number }>();
   const record = async (request: { method: string; url: string; text(): Promise<string>; headers: Headers }) => {
@@ -200,6 +214,9 @@ export function mockSfu(
       const call = await record(request);
       const tracks = call.body.tracks as Array<{ location: string; mid?: string; trackName: string; sessionId?: string }>;
       if (tracks[0]?.location === "local") {
+        if (options.microphoneDelayMs && tracks[0].trackName === "microphone") {
+          await new Promise((resolve) => setTimeout(resolve, options.microphoneDelayMs));
+        }
         if (options.expireFirstPublish && publishes++ === 0) {
           return HttpResponse.json({ errorCode: "session_error", errorDescription: "Session expired." }, { status: 410 });
         }
@@ -225,6 +242,9 @@ export function mockSfu(
     }),
     http.put(`${SFU}/sessions/:sessionId/renegotiate`, async ({ request }) => {
       await record(request);
+      if (options.failFirstRenegotiate && renegotiations++ === 0) {
+        return HttpResponse.json({ errorCode: "internal_error", errorDescription: "Could not renegotiate." }, { status: 500 });
+      }
       return new HttpResponse(null, { status: 200 });
     }),
     http.post(`${SFU}/sessions/:sessionId/datachannels/establish`, async ({ request }) => {
@@ -253,14 +273,22 @@ export function mockSfu(
     }),
     http.put(`${SFU}/sessions/:sessionId/datachannels/update`, async ({ request }) => {
       const call = await record(request);
+      if (options.failRevoke && call.body.dataChannels[0]?.canReply === false) {
+        return HttpResponse.json({ errorCode: "internal_error", errorDescription: "Could not update." }, { status: 500 });
+      }
       return HttpResponse.json({ dataChannels: call.body.dataChannels });
     }),
     http.put(`${SFU}/sessions/:sessionId/datachannels/close`, async ({ request }) => {
       const call = await record(request);
+      if (options.dataCloseDelayMs) await new Promise((resolve) => setTimeout(resolve, options.dataCloseDelayMs));
       return HttpResponse.json({ dataChannels: call.body.dataChannels });
     }),
     http.put(`${SFU}/sessions/:sessionId/tracks/close`, async ({ request }) => {
       const call = await record(request);
+      // The real SFU: a forced close needs no SDP.
+      if (options.closeWithoutOffer) {
+        return HttpResponse.json({ requiresImmediateRenegotiation: false, tracks: call.body.tracks });
+      }
       return HttpResponse.json({
         requiresImmediateRenegotiation: true,
         sessionDescription: { type: "offer", sdp: "v=0 close-offer" },

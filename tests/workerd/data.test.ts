@@ -431,6 +431,71 @@ describe("recovery", () => {
     expect((await v1.next("subscribed")).tracks).toHaveLength(1);
   });
 
+  test("an answer the SFU does not take is void once a new PeerConnection offers", async () => {
+    mockSfu({ failFirstRenegotiate: true });
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    // It subscribes before its own offer, so its data transport is not ready.
+    const v1 = await connect(await viewerToken("v1", "lab-a"));
+    await v1.next("joined");
+    await publishWithData(device);
+    await v1.device("cam-1", "live");
+    const video = { tracks: [{ deviceId: "cam-1", trackName: "video_track" }] };
+    v1.send("subscribe", video);
+    await v1.next("offer");
+    v1.send("answer", { sdp: "v=0 viewer-answer" });
+    expect(await v1.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_SFU, request: "answer" });
+    v1.send("subscribe", video);
+    expect(await v1.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_BUSY, request: "subscribe" });
+
+    // The viewer starts over with a new PeerConnection, whose own offer voids the old negotiation.
+    v1.send("offer", { sdp: "v=0 viewer-offer-2" });
+    expect(await v1.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    v1.send("subscribe", video);
+    await v1.next("offer");
+    v1.send("answer", { sdp: "v=0 viewer-answer-2" });
+    expect((await v1.next("subscribed")).tracks).toHaveLength(1);
+  });
+
+  test("a controller gives up control even when the SFU fails to take canReply away", async () => {
+    mockSfu({ failRevoke: true });
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await openData(v1);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    v1.send("releaseControl", { deviceId: "cam-1" });
+    expect(await device.next("control")).toEqual({ controller: undefined });
+    expect(v1.has("error")).toBe(false);
+  });
+
+  test("a viewer that resumes without data_channels gives up control at once; its channels close meanwhile", async () => {
+    // The SFU is slow to close channels of a PeerConnection that is gone.
+    const calls = mockSfu({ dataCloseDelayMs: 1500 });
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await openData(v1);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    v1.close();
+
+    const started = Date.now();
+    const resumed = await connect(await viewerToken("v1", "lab-a", false));
+    const joined = await resumed.next("joined");
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(joined).toMatchObject({ resumed: true, data: [] });
+    expect(await device.next("control")).toEqual({ controller: undefined });
+    expect(calls.some((call) => call.path.endsWith("/datachannels/close"))).toBe(true);
+    resumed.send("subscribe", { data: ["cam-1"] });
+    expect(await resumed.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_DATA_CHANNELS_OFF });
+    // Let the slow close finish before the next test.
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+  });
+
   test("device channels that did not open after the answer open when the device is ready", async () => {
     mockSfu({ failDeviceChannels: [0] });
     const device = await connect(await deviceToken("cam-1", ["lab-a"]));

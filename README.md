@@ -109,8 +109,10 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | --- | --- | --- |
 | Worker → device | `joined` | `deviceId`, `state`, `generation`, `rooms`, `iceServers` |
 | Worker → device | `wake` | Nothing. Publish from the start: close any PeerConnection, create a new one and send an offer. |
-| Device → worker | `offer` | `sdp`, `tracks: [{ mid, trackName }]`, `dataChannels` |
+| Device → worker | `offer` | `sdp`, `tracks: [{ mid, trackName }]`, `dataChannels`, `voices` |
 | Worker → device | `answer` | `generation`, `sdp` |
+| Worker → device | `offer` | `sdp`, `tracks`: the SFU's offer for the viewers' voices, after an `offer` with `voices`. Each track has `viewerId` and `room`. |
+| Device → worker | `answer` | `sdp`: the answer to it |
 | Worker → device | `channels` | `channels: [{ label, id }]`: the device's `_lossy` and `_reliable` |
 | Worker → device | `control` | `controller`: who controls the device now. Only for the log. |
 | Device → worker | `ready` | Nothing. Send it when the PeerConnection is connected. Viewers can subscribe only after it. |
@@ -179,7 +181,7 @@ Control belongs to the device, not to a room. A device in two rooms has one line
 
 ### 4. Voice
 
-Viewers in a room can talk to each other. Devices do not hear them.
+Viewers in a room can talk to each other, and the room's devices play their voices.
 
 1. After the `answer` to your own offer, get the microphone and add it to the PeerConnection as a `sendonly` transceiver. Send `mute` with whether it starts muted, then the new offer as `offer` with `tracks: [{ trackName: "microphone", mid }]`, using the transceiver's `mid`. Apply the `answer`.
 2. The other viewers see `microphone: true` in `viewers`. To hear someone, send `subscribe` with `microphones: [viewerId]`. The track comes with the SFU's offer, like a device's track, and its subscription has `viewerId` instead of `deviceId`.
@@ -187,6 +189,12 @@ Viewers in a room can talk to each other. Devices do not hear them.
 4. A new PeerConnection publishes again. `microphoneGeneration` then goes up: unsubscribe the old track and subscribe again. When a viewer stops publishing or leaves, unsubscribe its track.
 
 A room takes `MAX_MICROPHONES_PER_ROOM` microphones, 10 by default. Past that, the `offer` gets `error` with `microphone_limit` and `trackName: "microphone"`: roll the offer back and only listen.
+
+A device plays the voices when its `offer` has `voices: true`. pi-webrtc sends it unless it runs with `--no-audio`; the simulator has **Play viewers' voices**. Once the device is live, the worker pulls the microphone of every viewer in the device's rooms into the device's session:
+
+1. When the microphones change, the worker sends the SFU's `offer`. Apply it, and send your `answer`. Each track in it has the `viewerId` and the `room` of the viewer.
+2. One change at a time: the next one waits for your answer. Answer within 10 seconds, or the worker plays no voices until you publish again.
+3. When a viewer stops publishing or leaves, the worker closes its track without SDP. The track goes quiet, and the next `offer` leaves it out.
 
 The worker does not read the messages. pi-webrtc expects `protocol.Packet` from [`packet.proto`](https://github.com/mazupo/protocol/blob/main/protos/packet.proto), with the text in `raw`. The demo pages do the same.
 

@@ -9,23 +9,28 @@ import {
   type DeviceInfo,
   type PublishOffer,
   type SignalError,
+  type SubscribeAnswer,
+  type Subscription,
   type ViewerRef,
 } from "../proto/cloudflare";
-import { debugInfo, errorName, publishOfferSchema, stateName, type Claims } from "../shared/protocol";
+import { debugInfo, errorName, publishOfferSchema, sdpMessageSchema, stateName, type Claims } from "../shared/protocol";
 import {
   CONTROL_CONFIRM_MS,
   CONTROL_GRANT_MS,
   COUNT_GRACE_MS,
   DEVICE_GONE_MS,
   DISCONNECT_GRACE_MS,
+  MICROPHONE_TRACK,
   PRESENCE_CHECK_MS,
   UNWATCHED_CHECK_MS,
+  VOICE_ANSWER_MS,
+  VOICE_RETRY_MS,
   WAKE_ATTEMPTS,
   WATCH_LEASE_MS,
   settings,
   type Settings,
 } from "./config";
-import { deviceChannels, iceServers, RealtimeSfu, SfuError } from "./realtime";
+import { deviceChannels, iceServers, RealtimeSfu, SfuError, type TracksResponse } from "./realtime";
 import { claimsFromRequest, jsonError, tableExists, useToken } from "./shared";
 import {
   KeyedQueue,
@@ -63,7 +68,8 @@ type DeviceRow = {
   offline_notified: number;
 };
 
-type SocketAttachment = { connectedAt: number };
+/** `joined` is false until the socket got `joined`; sockets from before it have none. */
+type SocketAttachment = { connectedAt: number; joined?: boolean };
 
 export type WatchResult = { member: boolean; info: DeviceInfo };
 
@@ -72,6 +78,14 @@ export type ResolveResult =
   | { ok: false; code: ErrorCode; message: string };
 
 export type ControlResult = { ok: true } | { ok: false; code: ErrorCode; message: string };
+
+/** A viewer's microphone that a room wants its devices to play. */
+export type RoomMicrophone = { viewerId: string; sessionId: string; generation: number };
+
+/** A room's microphone as this device keeps it; with a mid once pulled into its session. */
+type VoiceRow = { room_id: string; viewer_id: string; session_id: string; generation: number };
+type VoicePullRow = VoiceRow & { mid: string };
+type VoiceState = { enabled: number; offer_sent_at: number | null; retry_at: number | null };
 
 /** Who may send to the device through its data channels. Survives new publications. */
 type ControlState = {
@@ -124,6 +138,34 @@ const SCHEMA = `
   ) WITHOUT ROWID;
 `;
 
+/** The viewers' voices. Separate, so devices stored before them get the tables on start. */
+const VOICE_SCHEMA = `
+  -- The microphones each room wants the device to play, as the room last sent them.
+  CREATE TABLE IF NOT EXISTS voices (
+    room_id TEXT NOT NULL,
+    viewer_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    PRIMARY KEY (room_id, viewer_id)
+  ) WITHOUT ROWID;
+  -- The microphones pulled into the device's current session.
+  CREATE TABLE IF NOT EXISTS voice_pulls (
+    mid TEXT PRIMARY KEY,
+    room_id TEXT NOT NULL,
+    viewer_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL
+  ) WITHOUT ROWID;
+  -- Whether this publication plays voices, when the SFU's offer went to the device, and when to
+  -- try again the microphones the SFU could not pull yet (one row).
+  CREATE TABLE IF NOT EXISTS voice_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL,
+    offer_sent_at INTEGER,
+    retry_at INTEGER
+  );
+`;
+
 /**
  * One instance per device_id. Owns the device's socket and presence, its SFU publisher session,
  * and when the device should publish: it sends `wake` when a room starts watching and `sleep`
@@ -143,6 +185,7 @@ export class Device extends DurableObject<Env> {
     // Devices send "ping" every 15 s. The runtime answers without waking this object.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ready = tableExists(ctx.storage.sql, "device");
+    if (this.ready) ctx.storage.sql.exec(VOICE_SCHEMA);
     // A deploy drops the socket without a close event. Hibernation keeps it, so no socket here
     // means it is gone: count the device as disconnected from now, so it has the usual grace
     // time to reconnect before viewers see it offline.
@@ -175,7 +218,7 @@ export class Device extends DurableObject<Env> {
       return jsonError(400, "claims_invalid", "The token does not match this device.");
     }
     if (!this.ready) {
-      this.sql.exec(SCHEMA);
+      this.sql.exec(SCHEMA + VOICE_SCHEMA);
       this.ready = true;
     }
     const now = Date.now();
@@ -183,7 +226,7 @@ export class Device extends DurableObject<Env> {
       return jsonError(401, "token_used", "The access token was already used. Request a new one.");
     }
 
-    let row = this.row() ?? this.createRow(now);
+    if (!this.row()) this.createRow(now);
 
     // A newer connection always wins. The old client stops reconnecting when it gets REPLACED.
     for (const old of this.ctx.getWebSockets()) {
@@ -192,12 +235,15 @@ export class Device extends DurableObject<Env> {
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+    // Accepted at once, so the old socket's close does not count as the device leaving. Nothing
+    // goes to it before `joined`: socket() skips it until then.
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ connectedAt: now } satisfies SocketAttachment);
+    server.serializeAttachment({ connectedAt: now, joined: false } satisfies SocketAttachment);
 
-    const { errors: roomErrors, left } = await this.updateRooms(row, claims, now);
+    const [{ errors: roomErrors, left }, ice] = await Promise.all([this.updateRooms(claims, now), iceServers(this.env)]);
     if (left.length > 0) await this.queue.run("control", () => this.removeFromControl((ref) => left.includes(ref.room)));
-    row = this.row()!;
+    // Nothing below waits until `joined` is sent, so no other request can come in between.
+    const row = this.row()!;
 
     // Keep the publication only when the same publisher reconnects its socket: it sends the
     // generation of the answer its PeerConnection uses.
@@ -219,9 +265,10 @@ export class Device extends DurableObject<Env> {
         state: row.state,
         generation: row.generation,
         rooms: this.rooms(row),
-        iceServers: await iceServers(this.env),
+        iceServers: ice,
       },
     });
+    server.serializeAttachment({ connectedAt: now, joined: true } satisfies SocketAttachment);
     for (const error of roomErrors) sendDevice(server, { error });
     // A device that reconnects while publishing may have missed changes.
     const channels = JSON.parse(row.channels) as DataChannel[];
@@ -239,14 +286,16 @@ export class Device extends DurableObject<Env> {
     // A replaced socket is closing: what it still sends belongs to the old connection.
     if (ws.readyState !== WebSocket.OPEN) return;
     const request = decodeFrame(DeviceRequest, data);
-    const { offer, ready } = request ?? {};
+    const { offer, ready, answer } = request ?? {};
     if (offer) {
       await this.queue.run("publish", () => this.onOffer(ws, offer));
     } else if (ready) {
       await this.queue.run("publish", () => this.onReady(ws));
+    } else if (answer) {
+      await this.queue.run("publish", () => this.onVoicesAnswer(ws, answer));
     } else {
       const name = request ? requestName(request) : "";
-      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "Send a binary DeviceRequest with offer or ready.", name);
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "Send a binary DeviceRequest with offer, ready or answer.", name);
     }
   }
 
@@ -286,6 +335,7 @@ export class Device extends DurableObject<Env> {
     row.offline_notified = 1;
     this.save(row);
     this.forgetWatch();
+    this.sql.exec("DELETE FROM voices");
     await this.queue.run("control", () => this.removeFromControl(() => true));
     await Promise.allSettled(rooms.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
   }
@@ -296,7 +346,7 @@ export class Device extends DurableObject<Env> {
       this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "The offer needs sdp and tracks.", "offer");
       return;
     }
-    const { sdp, tracks, dataChannels } = parsed.data;
+    const { sdp, tracks, dataChannels, voices } = parsed.data;
     // Any offer while waking or live will do, even one sent before the latest wake: it comes
     // from the same device, which uses only the reply to its last offer.
     const before = this.row();
@@ -347,6 +397,8 @@ export class Device extends DurableObject<Env> {
       row.last_error = ErrorCode.ERROR_CODE_UNSPECIFIED;
       row.last_seen = now;
       this.save(row);
+      // A new session pulls nothing yet. The voices come once the device is live.
+      this.resetVoices(voices);
 
       sendDevice(ws, { answer: { generation: row.generation, sdp: result.sessionDescription.sdp } });
       if (!this.hasWatchers(now)) this.startLinger(now);
@@ -416,6 +468,177 @@ export class Device extends DurableObject<Env> {
     this.save(row);
     void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
+    // Behind this in the queue: the device's PeerConnection is connected, so it can take an offer.
+    this.syncVoicesSoon();
+  }
+
+  // -------------------------------------------------------------------------
+  // The viewers' voices: their microphones, pulled into the device's session
+  // -------------------------------------------------------------------------
+
+  /** The device's answer to the SFU's offer for the voices. Then the next change goes. */
+  private async onVoicesAnswer(ws: WebSocket, message: SubscribeAnswer): Promise<void> {
+    const parsed = sdpMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "answer needs an sdp.", "answer");
+      return;
+    }
+    const row = this.row();
+    if (!row?.sfu_session_id || this.voiceState().offer_sent_at === null) {
+      this.fail(ws, ErrorCode.ERROR_CODE_NO_OFFER, "There is no offer waiting for an answer.", "answer");
+      return;
+    }
+    try {
+      await new RealtimeSfu(this.env).renegotiate(row.sfu_session_id, parsed.data.sdp);
+    } catch (error) {
+      const code = error instanceof SfuError ? error.code : "renegotiate_failed";
+      this.stopVoices(`${code}: the SFU did not take the answer.`);
+      return;
+    }
+    this.sql.exec("UPDATE voice_state SET offer_sent_at = NULL WHERE id = 1");
+    await this.syncVoices();
+  }
+
+  /** Runs syncVoices behind whatever the device's queue is doing. */
+  private syncVoicesSoon(): void {
+    void this.queue.run("publish", () => this.syncVoices());
+  }
+
+  /**
+   * Pulls the microphones the rooms want into the device's session and closes the ones they no
+   * longer want, one SFU negotiation at a time: changes that come meanwhile wait for the device's
+   * answer. Only while live, with voices on, and with the device connected.
+   */
+  private async syncVoices(): Promise<void> {
+    const row = this.row();
+    const ws = this.socket();
+    const state = this.voiceState();
+    if (!row || row.state !== LIVE || !row.sfu_session_id || !ws || !state.enabled || state.offer_sent_at !== null) return;
+    const sessionId = row.sfu_session_id;
+    const key = (voice: VoiceRow) => `${voice.room_id}\n${voice.viewer_id}\n${voice.session_id}\n${voice.generation}`;
+    const pulled = this.sql.exec<VoicePullRow>("SELECT * FROM voice_pulls").toArray();
+    const wanted = this.sql.exec<VoiceRow>("SELECT * FROM voices ORDER BY room_id, viewer_id").toArray();
+    const wantedKeys = new Set(wanted.map(key));
+    const pulledKeys = new Set(pulled.map(key));
+    const closing = pulled.filter((pull) => !wantedKeys.has(key(pull)));
+    // Microphones the SFU could not pull wait for their retry, so a failing one cannot loop.
+    const retrying = state.retry_at !== null && state.retry_at > Date.now();
+    const adding = retrying ? [] : wanted.filter((voice) => !pulledKeys.has(key(voice)));
+    if (closing.length === 0 && adding.length === 0) return;
+
+    const sfu = new RealtimeSfu(this.env);
+    let result: TracksResponse;
+    let failed = false;
+    try {
+      if (closing.length > 0) {
+        result = await sfu.closeTracks(sessionId, closing.map((pull) => pull.mid));
+      } else {
+        result = await sfu.addTracks(
+          sessionId,
+          adding.map((voice) => ({ location: "remote", sessionId: voice.session_id, trackName: MICROPHONE_TRACK })),
+        );
+      }
+    } catch (error) {
+      // E.g. the device's session expired. Its next publication starts over.
+      const code = error instanceof SfuError ? error.code : "voices_failed";
+      console.log(JSON.stringify({ event: "voices_failed", deviceId: this.deviceId, code }));
+      this.scheduleVoiceRetry();
+      await this.scheduleAlarm(Date.now());
+      return;
+    }
+    // The publication may have ended while the SFU call ran.
+    if (this.row()?.sfu_session_id !== sessionId) return;
+    if (closing.length > 0) {
+      for (const pull of closing) this.sql.exec("DELETE FROM voice_pulls WHERE mid = ?", pull.mid);
+    } else {
+      const returned = result.tracks ?? [];
+      adding.forEach((voice, index) => {
+        const track = returned[index];
+        if (track?.errorCode || !track?.mid) {
+          // Usually not_found_track_error: the viewer's first packets are still on their way.
+          console.log(JSON.stringify({ event: "voice_not_ready", deviceId: this.deviceId, viewerId: voice.viewer_id, code: track?.errorCode ?? null }));
+          failed = true;
+          return;
+        }
+        this.sql.exec(
+          "INSERT OR REPLACE INTO voice_pulls (mid, room_id, viewer_id, session_id, generation) VALUES (?, ?, ?, ?, ?)",
+          track.mid,
+          voice.room_id,
+          voice.viewer_id,
+          voice.session_id,
+          voice.generation,
+        );
+      });
+      if (failed) this.scheduleVoiceRetry();
+    }
+    if (result.requiresImmediateRenegotiation && result.sessionDescription?.type === "offer") {
+      this.sql.exec("UPDATE voice_state SET offer_sent_at = ? WHERE id = 1", Date.now());
+      sendDevice(ws, { offer: { sdp: result.sessionDescription.sdp, tracks: this.voiceSubscriptions(), sessionReset: false } });
+    } else if (closing.length > 0 && adding.length > 0) {
+      // Nothing to answer: go on with the new ones.
+      this.syncVoicesSoon();
+    }
+    await this.scheduleAlarm(Date.now());
+  }
+
+  /** Every microphone pulled into the device's session, as its offer lists them. */
+  private voiceSubscriptions(): Subscription[] {
+    return this.sql
+      .exec<VoicePullRow>("SELECT * FROM voice_pulls ORDER BY room_id, viewer_id")
+      .toArray()
+      .map((pull) => ({
+        deviceId: "",
+        trackName: MICROPHONE_TRACK,
+        mid: pull.mid,
+        generation: pull.generation,
+        viewerId: pull.viewer_id,
+        room: pull.room_id,
+      }));
+  }
+
+  private voiceState(): VoiceState {
+    return (
+      this.sql.exec<VoiceState>("SELECT enabled, offer_sent_at, retry_at FROM voice_state WHERE id = 1").toArray()[0] ?? {
+        enabled: 0,
+        offer_sent_at: null,
+        retry_at: null,
+      }
+    );
+  }
+
+  /** A new publication, or none: nothing is pulled into it yet. */
+  private resetVoices(enabled: boolean): void {
+    this.sql.exec("DELETE FROM voice_pulls");
+    this.sql.exec(
+      "INSERT OR REPLACE INTO voice_state (id, enabled, offer_sent_at, retry_at) VALUES (1, ?, NULL, NULL)",
+      enabled ? 1 : 0,
+    );
+  }
+
+  /** Plays no voices until the device publishes again, rather than pile up offers it cannot take. */
+  private stopVoices(message: string): void {
+    console.log(JSON.stringify({ event: "voices_stopped", deviceId: this.deviceId, message }));
+    this.sql.exec("UPDATE voice_state SET enabled = 0, offer_sent_at = NULL, retry_at = NULL WHERE id = 1");
+    const ws = this.socket();
+    if (ws) this.fail(ws, ErrorCode.ERROR_CODE_SFU, `${message} The viewers' voices stop until the next publication.`, "answer");
+  }
+
+  private scheduleVoiceRetry(): void {
+    this.sql.exec("UPDATE voice_state SET retry_at = ? WHERE id = 1 AND retry_at IS NULL", Date.now() + VOICE_RETRY_MS);
+  }
+
+  /** Stores the microphones a room wants this device to play. */
+  private setVoices(roomId: string, microphones: RoomMicrophone[]): void {
+    this.sql.exec("DELETE FROM voices WHERE room_id = ?", roomId);
+    for (const mic of microphones) {
+      this.sql.exec(
+        "INSERT OR REPLACE INTO voices (room_id, viewer_id, session_id, generation) VALUES (?, ?, ?, ?)",
+        roomId,
+        mic.viewerId,
+        mic.sessionId,
+        mic.generation,
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -452,6 +675,14 @@ export class Device extends DurableObject<Env> {
     }
     await this.scheduleAlarm(now);
     return { member: true, info: this.info(now) };
+  }
+
+  /** The microphones a room wants this device to play. The room sends its whole list on each change. */
+  async hear(roomId: string, microphones: RoomMicrophone[]): Promise<void> {
+    const row = this.row();
+    if (!row || !this.rooms(row).includes(roomId)) return;
+    this.setVoices(roomId, microphones);
+    this.syncVoicesSoon();
   }
 
   /** A room has no viewers left. */
@@ -593,6 +824,13 @@ export class Device extends DurableObject<Env> {
           }
         : null,
       control: this.ready ? this.control() : null,
+      voices: this.ready
+        ? {
+            state: this.voiceState(),
+            wanted: this.sql.exec<VoiceRow>("SELECT * FROM voices ORDER BY room_id, viewer_id").toArray(),
+            pulled: this.sql.exec<VoicePullRow>("SELECT * FROM voice_pulls ORDER BY room_id, viewer_id").toArray(),
+          }
+        : null,
       watchingRooms: this.ready
         ? this.sql
             .exec<{ room_id: string; expires_at: number }>("SELECT * FROM watching_rooms ORDER BY room_id")
@@ -645,7 +883,7 @@ export class Device extends DurableObject<Env> {
     }
 
     // Dropped without a close, e.g. the process was killed, and not back within a minute.
-    if (!this.socket() && row.disconnected_at !== null && now - row.disconnected_at >= DEVICE_GONE_MS && this.rooms(row).length > 0) {
+    if (!this.connection() && row.disconnected_at !== null && now - row.disconnected_at >= DEVICE_GONE_MS && this.rooms(row).length > 0) {
       console.log(JSON.stringify({ event: "device_gone", deviceId: this.deviceId, silentMs: now - row.disconnected_at }));
       await this.leaveRooms(row);
     }
@@ -686,6 +924,16 @@ export class Device extends DurableObject<Env> {
 
     if (changed) await this.notifyRoomsSoon();
 
+    const voice = this.voiceState();
+    if (voice.offer_sent_at !== null && voice.offer_sent_at + VOICE_ANSWER_MS <= now) {
+      await this.queue.run("publish", async () => {
+        if (this.voiceState().offer_sent_at !== null) this.stopVoices("The device did not answer the offer for the voices.");
+      });
+    } else if (voice.retry_at !== null && voice.retry_at <= now) {
+      this.sql.exec("UPDATE voice_state SET retry_at = NULL WHERE id = 1");
+      this.syncVoicesSoon();
+    }
+
     const expired = await this.queue.run("control", () => this.expireHandover(now));
     // Outside the control queue: the room may be waiting on this object for the same viewer.
     if (expired) {
@@ -696,7 +944,7 @@ export class Device extends DurableObject<Env> {
 
     row = this.row()!;
     // Gone from every room: nothing here is needed any more, once no used token can come back.
-    if (!this.socket() && this.rooms(row).length === 0 && this.tokensExpireAt() === null) {
+    if (!this.connection() && this.rooms(row).length === 0 && this.tokensExpireAt() === null) {
       await this.ctx.storage.deleteAll();
       this.ready = false;
       return;
@@ -766,9 +1014,9 @@ export class Device extends DurableObject<Env> {
   }
 
   /** Joins the rooms in the token and leaves the rooms that are no longer in it. */
-  private async updateRooms(row: DeviceRow, claims: Claims, now: number): Promise<{ errors: SignalError[]; left: string[] }> {
+  private async updateRooms(claims: Claims, now: number): Promise<{ errors: SignalError[]; left: string[] }> {
     const wanted = [...new Set(claims.grant.rooms)];
-    const previous = this.rooms(row);
+    const previous = this.rooms(this.row()!);
     const errors: SignalError[] = [];
     const joined: string[] = [];
 
@@ -780,6 +1028,7 @@ export class Device extends DurableObject<Env> {
       if (result.status === "fulfilled" && result.value.ok) {
         joined.push(room);
         if (result.value.viewers > 0) this.setWatching(room, now);
+        this.setVoices(room, result.value.microphones);
       } else if (result.status === "fulfilled" && !result.value.ok) {
         errors.push(signalError({ code: result.value.code, message: result.value.message }));
       } else {
@@ -789,8 +1038,13 @@ export class Device extends DurableObject<Env> {
 
     const left = previous.filter((room) => !joined.includes(room));
     await Promise.allSettled(left.map((room) => this.env.ROOMS.getByName(room).removeMember(this.deviceId)));
-    for (const room of left) this.forgetWatch(room);
+    for (const room of left) {
+      this.forgetWatch(room);
+      this.sql.exec("DELETE FROM voices WHERE room_id = ?", room);
+    }
 
+    // Read again: a room's watch() may have changed the row meanwhile.
+    const row = this.row()!;
     row.rooms = JSON.stringify(joined);
     this.save(row);
     return { errors, left };
@@ -874,10 +1128,14 @@ export class Device extends DurableObject<Env> {
     row.data_channels = 0;
     row.linger_until = null;
     this.earlySession = null;
+    this.resetVoices(false);
   }
 
+  /** The socket to send to: the newest open one that got `joined`. */
   private socket(): WebSocket | null {
-    const sockets = this.ctx.getWebSockets().filter((ws) => ws.readyState === WebSocket.OPEN);
+    const sockets = this.ctx
+      .getWebSockets()
+      .filter((ws) => ws.readyState === WebSocket.OPEN && (ws.deserializeAttachment() as SocketAttachment | null)?.joined !== false);
     return sockets[sockets.length - 1] ?? null;
   }
 
@@ -893,8 +1151,18 @@ export class Device extends DurableObject<Env> {
   }
 
   private isOnline(now: number): boolean {
-    const ws = this.socket();
+    const ws = this.connection();
     return ws !== null && now - this.lastSeen(ws) <= this.config.deviceStaleMs;
+  }
+
+  /**
+   * The device's connection: the newest open socket, joined or still joining, so rooms do not
+   * see a reconnecting device go offline. Whether the device is there goes by this one; messages
+   * go only to socket().
+   */
+  private connection(): WebSocket | null {
+    const sockets = this.ctx.getWebSockets().filter((ws) => ws.readyState === WebSocket.OPEN);
+    return sockets[sockets.length - 1] ?? null;
   }
 
   private disconnectGraceOver(row: DeviceRow, now: number): boolean {
@@ -1036,7 +1304,10 @@ export class Device extends DurableObject<Env> {
     if (row.linger_until !== null) candidates.push(row.linger_until);
     const { handover } = this.control();
     if (handover) candidates.push(handover.deadline);
-    const ws = this.socket();
+    const voice = this.voiceState();
+    if (voice.offer_sent_at !== null) candidates.push(voice.offer_sent_at + VOICE_ANSWER_MS);
+    if (voice.retry_at !== null) candidates.push(voice.retry_at);
+    const ws = this.connection();
     if (this.hasWatchers(now)) {
       // Check again when the last ping turns stale, so a silent device shows offline about
       // DEVICE_STALE_SECONDS after its last ping instead of up to a full check interval later.

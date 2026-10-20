@@ -1,6 +1,7 @@
 // Demo device: waits on the socket, publishes after "wake", stops after "sleep".
 // This is what pi-webrtc does on a real device. With Enable IPC it also opens _lossy and
-// _reliable, like pi-webrtc's --enable-ipc.
+// _reliable, like pi-webrtc's --enable-ipc. With Play viewers' voices it plays the microphones
+// of the viewers in its rooms, like pi-webrtc without --no-audio.
 import {
   CLOSE_REPLACED,
   DeviceState,
@@ -30,6 +31,9 @@ const ipcPanel = document.getElementById("ipc-panel");
 const ipcControl = document.getElementById("ipc-controller");
 const ipcForm = document.getElementById("ipc-form");
 const ipcLog = document.getElementById("ipc-log");
+const voicesInput = document.getElementById("voices");
+const voicesStatus = document.getElementById("voices-status");
+const voicesAudio = document.getElementById("voices-audio");
 const log = createLog(document.getElementById("log"));
 
 document.getElementById("worker-url").value = location.origin;
@@ -53,8 +57,9 @@ let offered = false;
 let stopped = true;
 let attempt = 0;
 let stopPattern = null;
-/** This connection publishes data channels. Fixed until the next connect. */
+/** This connection publishes data channels, and plays the viewers' voices. Fixed until the next connect. */
 let ipc = false;
+let voices = true;
 const channels = new Map(); // label -> RTCDataChannel
 let controller = null; // { room, viewerId } of the viewer that can send to this device
 
@@ -68,11 +73,15 @@ async function connect() {
   dropSocket();
   const seq = ++connectSeq;
   const data = new FormData(form);
-  if (stopped) ipc = ipcInput.checked;
+  if (stopped) {
+    ipc = ipcInput.checked;
+    voices = voicesInput.checked;
+  }
   stopped = false;
   connectButton.disabled = true;
   disconnectButton.disabled = false;
   ipcInput.disabled = true;
+  voicesInput.disabled = true;
   ipcPanel.hidden = !ipc;
   const rooms = String(data.get("rooms")).split(",").map((room) => room.trim()).filter(Boolean);
   try {
@@ -116,6 +125,7 @@ function disconnect() {
   connectButton.disabled = false;
   disconnectButton.disabled = true;
   ipcInput.disabled = false;
+  voicesInput.disabled = false;
   ipcPanel.hidden = true;
   setStatus("Disconnected.");
 }
@@ -173,6 +183,10 @@ async function handle(frame) {
         setStatus(`Answer received (generation ${message.generation}). Connecting…`);
       }
       break;
+    case "offer":
+      // The viewers' voices changed: the SFU's offer for this PeerConnection.
+      if (pc && generation) await answerVoices(message);
+      break;
     case "sleep":
       stopPublishing();
       setStatus("Sleeping. Nobody is watching.");
@@ -222,6 +236,15 @@ async function startPublishing() {
   for (const track of stream.getTracks()) peer.addTransceiver(track, { direction: "sendonly" });
   // Any channel puts an m=application section in the offer. The worker sends the real ids.
   if (ipc) peer.createDataChannel("server-events", { negotiated: true, id: 0 });
+  // A viewer's voice, pulled by the worker. One <audio> each, so they mix.
+  peer.addEventListener("track", (event) => {
+    if (peer !== pc || event.track.kind !== "audio") return;
+    const audio = document.createElement("audio");
+    audio.autoplay = true;
+    audio.dataset.mid = event.transceiver.mid;
+    audio.srcObject = new MediaStream([event.track]);
+    voicesAudio.append(audio);
+  });
   peer.addEventListener("connectionstatechange", () => {
     if (peer !== pc) return;
     log(`peer ${peer.connectionState}`);
@@ -241,7 +264,25 @@ async function startPublishing() {
   if (publication !== mine || socket?.readyState !== WebSocket.OPEN) return;
   unanswered += 1;
   offered = true;
-  protocol.send(socket, "offer", { sdp: offer.sdp, tracks, dataChannels: ipc });
+  protocol.send(socket, "offer", { sdp: offer.sdp, tracks, dataChannels: ipc, voices });
+}
+
+/** Answers the SFU's offer, which lists every voice the PeerConnection now receives. */
+async function answerVoices(message) {
+  const peer = pc;
+  await peer.setRemoteDescription({ type: "offer", sdp: message.sdp });
+  const answer = await peer.createAnswer();
+  await peer.setLocalDescription(answer);
+  if (peer !== pc || socket?.readyState !== WebSocket.OPEN) return;
+  protocol.send(socket, "answer", { sdp: answer.sdp });
+  const mids = new Set(message.tracks.map((track) => track.mid));
+  for (const audio of voicesAudio.querySelectorAll("audio")) {
+    if (!mids.has(audio.dataset.mid)) audio.remove();
+  }
+  voicesStatus.hidden = false;
+  voicesStatus.textContent = message.tracks.length > 0
+    ? `Playing the voices of ${message.tracks.map((track) => viewerName({ room: track.room, viewerId: track.viewerId })).join(", ")}.`
+    : "No viewer has a microphone.";
 }
 
 /** Opens _lossy and _reliable with the ids the worker sent. Both send and receive. */
@@ -286,6 +327,8 @@ function stopPublishing() {
   renderIpc();
   pc?.close();
   pc = null;
+  voicesAudio.replaceChildren();
+  voicesStatus.hidden = true;
   stopPattern?.();
   stopPattern = null;
   for (const track of stream?.getTracks() ?? []) track.stop();

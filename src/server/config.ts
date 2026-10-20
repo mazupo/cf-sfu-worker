@@ -34,6 +34,12 @@ export const WAKE_ATTEMPTS = 2;
 export const CONTROL_CONFIRM_MS = 5_000;
 /** How long the room may take to grant canReply at the SFU, before the confirm time starts. */
 export const CONTROL_GRANT_MS = 10_000;
+/** A device answers the SFU's offer for the viewers' voices within this, or plays none until it publishes again. */
+export const VOICE_ANSWER_MS = 10_000;
+/** A microphone the SFU could not pull yet, e.g. its first packets are still on their way, is tried again after this. */
+export const VOICE_RETRY_MS = 2_000;
+/** The track name of a viewer's microphone in its own SFU session. */
+export const MICROPHONE_TRACK = "microphone";
 
 export function settings(env: Env): Settings {
   const seconds = (value: unknown, fallback: number) => positive(value, fallback) * 1000;
