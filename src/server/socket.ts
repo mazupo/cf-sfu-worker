@@ -40,6 +40,17 @@ export function closeSocket(ws: WebSocket, code: number, reason: string): void {
   }
 }
 
+/**
+ * Turns a connection away with a close code. A browser cannot read the status of a refused
+ * upgrade, so the socket is opened only to be closed at once.
+ */
+export function refuseSocket(code: number, reason: string): Response {
+  const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
+  server.accept();
+  server.close(code, reason);
+  return new Response(null, { status: 101, webSocket: client });
+}
+
 /** Decodes a binary frame, or returns null for text, oversized or broken frames. */
 export function decodeFrame<T>(codec: MessageFns<T>, data: string | ArrayBuffer): T | null {
   if (typeof data === "string" || data.byteLength > MAX_FRAME_BYTES) return null;

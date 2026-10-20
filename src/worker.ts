@@ -15,7 +15,7 @@ import { accessSettings, verifyAccess } from "./server/access";
 import { settings } from "./server/config";
 import { REGISTRY_NAME } from "./server/registry";
 import { CLAIMS_HEADER, upgradeRequired } from "./server/socket";
-import { TokenError, roleForPublicKey, signToken, verifyToken } from "./server/token";
+import { TokenError, hashSecret, roleForPublicKey, signToken, verifyToken } from "./server/token";
 
 export { Device } from "./server/device";
 export { Registry } from "./server/registry";
@@ -70,6 +70,7 @@ app.post(TOKEN_PATH, async (c) => {
     }
 
     const config = settings(c.env);
+    const secretHash = await hashSecret(body.secret);
     let sub: string;
     let grant: Grant;
     if (body.can_subscribe) {
@@ -79,6 +80,7 @@ app.post(TOKEN_PATH, async (c) => {
         canPublish: false,
         canSubscribe: true,
         ...(body.data_channels ? { dataChannels: true } : {}),
+        secretHash,
       };
     } else {
       const rooms = [...new Set(body.room_ids)];
@@ -86,7 +88,13 @@ app.post(TOKEN_PATH, async (c) => {
         return error(c, 400, "too_many_rooms", `A device can join up to ${config.maxRoomsPerDevice} rooms.`);
       }
       sub = body.device_id;
-      grant = { rooms, canPublish: true, canSubscribe: false, ...(body.generation ? { generation: body.generation } : {}) };
+      grant = {
+        rooms,
+        canPublish: true,
+        canSubscribe: false,
+        ...(body.generation ? { generation: body.generation } : {}),
+        secretHash,
+      };
     }
 
     const token = await signToken(c.env, role, sub, grant, config.tokenTtlSec);
@@ -233,7 +241,7 @@ function bodyProblem(json: unknown): string {
   const schema = role === true ? viewerTokenRequestSchema : role === false ? deviceTokenRequestSchema : null;
   const issue = schema?.safeParse(json).error?.issues[0];
   if (!issue) {
-    return "Devices send {device_id, room_ids, can_subscribe: false}. Viewers send {viewer_id, room_id, can_subscribe: true}.";
+    return "Devices send {device_id, room_ids, can_subscribe: false, secret}. Viewers send {viewer_id, room_id, can_subscribe: true, secret}.";
   }
   return `${issue.path.join(".") || "body"}: ${issue.message}.`;
 }

@@ -36,6 +36,7 @@ import {
   KeyedQueue,
   closeSocket,
   decodeFrame,
+  refuseSocket,
   requestName,
   sendDevice,
   signalError,
@@ -66,6 +67,8 @@ type DeviceRow = {
   last_seen: number;
   disconnected_at: number | null;
   offline_notified: number;
+  /** The hash of the secret it connected with. Only a token with the same one replaces a live connection. */
+  secret_hash: string | null;
 };
 
 /** `joined` is false until the socket got `joined`; sockets from before it have none. */
@@ -112,7 +115,8 @@ const SCHEMA = `
     last_error INTEGER NOT NULL,
     last_seen INTEGER NOT NULL,
     disconnected_at INTEGER,
-    offline_notified INTEGER NOT NULL
+    offline_notified INTEGER NOT NULL,
+    secret_hash TEXT
   );
   -- Rooms that have viewers interested in this device. A room renews its row while it has viewers.
   CREATE TABLE IF NOT EXISTS watching_rooms (
@@ -185,7 +189,14 @@ export class Device extends DurableObject<Env> {
     // Devices send "ping" every 15 s. The runtime answers without waking this object.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ready = tableExists(ctx.storage.sql, "device");
-    if (this.ready) ctx.storage.sql.exec(VOICE_SCHEMA);
+    if (this.ready) {
+      ctx.storage.sql.exec(VOICE_SCHEMA);
+      // A device stored before secrets gets the column; its next connection fills it.
+      const columns = ctx.storage.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('device')").toArray();
+      if (!columns.some((column) => column.name === "secret_hash")) {
+        ctx.storage.sql.exec("ALTER TABLE device ADD COLUMN secret_hash TEXT");
+      }
+    }
     // A deploy drops the socket without a close event. Hibernation keeps it, so no socket here
     // means it is gone: count the device as disconnected from now, so it has the usual grace
     // time to reconnect before viewers see it offline.
@@ -226,9 +237,15 @@ export class Device extends DurableObject<Env> {
       return jsonError(401, "token_used", "The access token was already used. Request a new one.");
     }
 
-    if (!this.row()) this.createRow(now);
+    const stored = this.row();
+    // Someone else with this device ID. It gets the ID once the other one is gone.
+    if (stored?.secret_hash && stored.secret_hash !== claims.grant.secretHash && this.isOnline(now)) {
+      console.log(JSON.stringify({ event: "device_id_in_use", deviceId: this.deviceId }));
+      return refuseSocket(CloseCode.CLOSE_CODE_ID_IN_USE, "Another live connection uses this device_id.");
+    }
+    if (!stored) this.createRow(now);
 
-    // A newer connection always wins. The old client stops reconnecting when it gets REPLACED.
+    // A newer connection with the same secret wins, and so does any once the old one stopped pinging.
     for (const old of this.ctx.getWebSockets()) {
       console.log(JSON.stringify({ event: "device_replaced", deviceId: this.deviceId }));
       closeSocket(old, CloseCode.CLOSE_CODE_REPLACED, "Another connection uses the same device_id.");
@@ -256,6 +273,7 @@ export class Device extends DurableObject<Env> {
     row.last_seen = now;
     row.disconnected_at = null;
     row.offline_notified = 0;
+    row.secret_hash = claims.grant.secretHash;
     this.save(row);
 
     // `joined` comes first: the device needs its ICE servers before a wake.
@@ -981,6 +999,7 @@ export class Device extends DurableObject<Env> {
       last_seen: now,
       disconnected_at: null,
       offline_notified: 0,
+      secret_hash: null,
     };
     this.save(row);
     return row;
@@ -990,8 +1009,8 @@ export class Device extends DurableObject<Env> {
     this.sql.exec(
       `INSERT OR REPLACE INTO device (id, state, generation, wake_deadline, wake_attempts,
          sfu_session_id, tracks, channels, data_channels, rooms, linger_until, last_error, last_seen, disconnected_at,
-         offline_notified)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         offline_notified, secret_hash)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       row.state,
       row.generation,
       row.wake_deadline,
@@ -1006,6 +1025,7 @@ export class Device extends DurableObject<Env> {
       row.last_seen,
       row.disconnected_at,
       row.offline_notified,
+      row.secret_hash,
     );
   }
 

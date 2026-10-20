@@ -1,7 +1,7 @@
 import { env, exports as workerExports } from "cloudflare:workers";
 import { describe, expect, test } from "vitest";
 
-import { signToken } from "../../src/server/token";
+import { hashSecret, signToken } from "../../src/server/token";
 import {
   DEVICE_PUBLIC_KEY,
   ORIGIN,
@@ -13,12 +13,15 @@ import {
   viewerToken,
 } from "./helpers";
 
+const SECRET = "a-random-secret-of-the-client";
+
 describe("POST /cloudflare/token", () => {
   test("a device key gets a short token and the socket URL", async () => {
     const response = await requestToken(DEVICE_PUBLIC_KEY, {
       device_id: "cam-1",
       room_ids: ["lab-a", "cam-1-only"],
       can_subscribe: false,
+      secret: SECRET,
     });
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
@@ -30,10 +33,27 @@ describe("POST /cloudflare/token", () => {
     expect(header).toEqual({ alg: "EdDSA", typ: "JWT", kid: "device" });
     expect(payload.sub).toBe("cam-1");
     expect(payload.exp - payload.iat).toBe(30);
-    expect(payload.grant).toEqual({ rooms: ["lab-a", "cam-1-only"], canPublish: true, canSubscribe: false });
-    // The public key never goes into the token.
+    expect(payload.grant).toEqual({
+      rooms: ["lab-a", "cam-1-only"],
+      canPublish: true,
+      canSubscribe: false,
+      secretHash: await hashSecret(SECRET),
+    });
+    // The public key never goes into the token, and the secret only as its hash.
     expect(body.token).not.toContain(DEVICE_PUBLIC_KEY);
     expect(JSON.stringify(payload)).not.toContain(DEVICE_PUBLIC_KEY);
+    expect(JSON.stringify(payload)).not.toContain(SECRET);
+  });
+
+  test("needs a secret of at least 16 characters", async () => {
+    for (const body of [
+      { viewer_id: "v1", room_id: "lab-a", can_subscribe: true },
+      { device_id: "cam-1", room_ids: ["lab-a"], can_subscribe: false, secret: "too-short" },
+    ]) {
+      const response = await requestToken(body.can_subscribe ? VIEWER_PUBLIC_KEY : DEVICE_PUBLIC_KEY, body);
+      expect(response.status).toBe(400);
+      expect((await response.json<{ error: { message: string } }>()).error.message).toMatch(/^secret:/);
+    }
   });
 
   test("requires a bearer key", async () => {
@@ -45,26 +65,26 @@ describe("POST /cloudflare/token", () => {
   });
 
   test("rejects an unknown key", async () => {
-    const response = await requestToken("not-a-key", { viewer_id: "v1", room_id: "lab-a", can_subscribe: true });
+    const response = await requestToken("not-a-key", { viewer_id: "v1", room_id: "lab-a", can_subscribe: true, secret: SECRET });
     expect(response.status).toBe(401);
     expect(await response.json()).toMatchObject({ error: { code: "key_invalid" } });
   });
 
   test("rejects a key used for the other role", async () => {
-    const response = await requestToken(DEVICE_PUBLIC_KEY, { viewer_id: "v1", room_id: "lab-a", can_subscribe: true });
+    const response = await requestToken(DEVICE_PUBLIC_KEY, { viewer_id: "v1", room_id: "lab-a", can_subscribe: true, secret: SECRET });
     expect(response.status).toBe(401);
     expect(await response.json()).toMatchObject({ error: { code: "role_mismatch" } });
   });
 
   test("rejects a bad body", async () => {
-    const response = await requestToken(VIEWER_PUBLIC_KEY, { viewer_id: "bad id!", room_id: "lab-a", can_subscribe: true });
+    const response = await requestToken(VIEWER_PUBLIC_KEY, { viewer_id: "bad id!", room_id: "lab-a", can_subscribe: true, secret: SECRET });
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: { code: "body_invalid" } });
   });
 
   test("a viewer ID may have spaces and letters in any language", async () => {
     for (const viewerId of ["Richard Tai", "戴子桓", "Ana-María.2"]) {
-      const response = await requestToken(VIEWER_PUBLIC_KEY, { viewer_id: viewerId, room_id: "lab-a", can_subscribe: true });
+      const response = await requestToken(VIEWER_PUBLIC_KEY, { viewer_id: viewerId, room_id: "lab-a", can_subscribe: true, secret: SECRET });
       expect(response.status, viewerId).toBe(200);
       const { token } = await response.json<{ token: string }>();
       const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0))));
@@ -79,11 +99,11 @@ describe("POST /cloudflare/token", () => {
 
   test("says which field of the body is wrong", async () => {
     const cases: [string, unknown, string][] = [
-      [VIEWER_PUBLIC_KEY, { viewer_id: " Richard", room_id: "lab-a", can_subscribe: true }, "viewer_id: use 1 to 64 letters, digits, spaces"],
-      [VIEWER_PUBLIC_KEY, { viewer_id: "x".repeat(65), room_id: "lab-a", can_subscribe: true }, "viewer_id:"],
-      [VIEWER_PUBLIC_KEY, { viewer_id: "v1", room_id: "lab a", can_subscribe: true }, 'room_id: use 1 to 64 letters, digits, ".", "_" or "-"'],
-      [DEVICE_PUBLIC_KEY, { device_id: "Richard Tai", room_ids: ["lab-a"], can_subscribe: false }, "device_id:"],
-      [DEVICE_PUBLIC_KEY, { device_id: "cam-1", room_ids: ["ok", "not ok"], can_subscribe: false }, "room_ids.1:"],
+      [VIEWER_PUBLIC_KEY, { viewer_id: " Richard", room_id: "lab-a", can_subscribe: true, secret: SECRET }, "viewer_id: use 1 to 64 letters, digits, spaces"],
+      [VIEWER_PUBLIC_KEY, { viewer_id: "x".repeat(65), room_id: "lab-a", can_subscribe: true, secret: SECRET }, "viewer_id:"],
+      [VIEWER_PUBLIC_KEY, { viewer_id: "v1", room_id: "lab a", can_subscribe: true, secret: SECRET }, 'room_id: use 1 to 64 letters, digits, ".", "_" or "-"'],
+      [DEVICE_PUBLIC_KEY, { device_id: "Richard Tai", room_ids: ["lab-a"], can_subscribe: false, secret: SECRET }, "device_id:"],
+      [DEVICE_PUBLIC_KEY, { device_id: "cam-1", room_ids: ["ok", "not ok"], can_subscribe: false, secret: SECRET }, "room_ids.1:"],
       [VIEWER_PUBLIC_KEY, { viewer: "v1" }, "Devices send {device_id"],
     ];
     for (const [key, body, message] of cases) {
@@ -100,6 +120,7 @@ describe("POST /cloudflare/token", () => {
       device_id: "cam-1",
       room_ids: ["r1", "r2", "r3", "r4", "r5"],
       can_subscribe: false,
+      secret: SECRET,
     });
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: { code: "too_many_rooms" } });
@@ -141,7 +162,7 @@ describe("GET /cloudflare/rtc", () => {
   });
 
   test("rejects an expired token", async () => {
-    const token = await signToken(env, "device", "cam-1", { rooms: ["lab-a"], canPublish: true, canSubscribe: false }, -1);
+    const token = await signToken(env, "device", "cam-1", { rooms: ["lab-a"], canPublish: true, canSubscribe: false, secretHash: "x" }, -1);
     const response = await openSocket(token);
     expect(response.status).toBe(401);
     expect(await response.json()).toMatchObject({ error: { code: "token_expired" } });

@@ -3,6 +3,7 @@
 // _reliable, like pi-webrtc's --enable-ipc. With Play viewers' voices it plays the microphones
 // of the viewers in its rooms, like pi-webrtc without --no-audio.
 import {
+  CLOSE_ID_IN_USE,
   CLOSE_REPLACED,
   DeviceState,
   ErrorCode,
@@ -11,6 +12,7 @@ import {
   decodeIpc,
   deviceProtocol as protocol,
   encodeIpc,
+  newSecret,
   openChannel,
   openSocket,
   persistForm,
@@ -40,6 +42,8 @@ document.getElementById("worker-url").value = location.origin;
 persistForm(form, "cf-sfu-worker.device");
 
 /** The one socket this tab uses. Events from any older socket are ignored. */
+// One per page, like a device's process: a reconnect keeps it, another tab has its own.
+const secret = newSecret();
 let socket = null;
 let connectSeq = 0;
 let reconnectTimer = null;
@@ -90,6 +94,7 @@ async function connect() {
       device_id: data.get("deviceId"),
       room_ids: rooms,
       can_subscribe: false,
+      secret,
       ...(pc && generation ? { generation } : {}),
     });
     if (seq !== connectSeq || stopped) return; // a newer connect or a disconnect won
@@ -134,19 +139,19 @@ function onClose(event) {
   socket = null;
   log(`socket closed ${event.code} ${event.reason}`);
   if (stopped) return;
-  if (event.code === CLOSE_REPLACED) {
-    // Another connection uses this device ID. Do not reconnect, or the two would keep replacing each other.
-    disconnect();
-    setStatus("Another connection uses this device ID. Check the device ID. Not reconnecting.");
+  if (event.code === CLOSE_REPLACED || event.code === CLOSE_ID_IN_USE) {
+    // Another connection has this device ID. Ours gets it back once that one is gone.
+    stopPublishing();
+    scheduleReconnect("Another connection uses this device ID. ");
     return;
   }
   scheduleReconnect();
 }
 
-function scheduleReconnect() {
+function scheduleReconnect(why = "") {
   if (stopped || reconnectTimer) return;
   const delay = backoff(attempt++);
-  setStatus(`Reconnecting in ${Math.round(delay / 1000)} s…`);
+  setStatus(`${why}Reconnecting in ${Math.round(delay / 1000)} s…`);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     if (!stopped) connect();

@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, test, vi } from "vitest";
 
-import { ErrorCode, ViewerRequest } from "../../src/proto/cloudflare";
+import { CloseCode, ErrorCode, ViewerRequest } from "../../src/proto/cloudflare";
 import { CLAIMS_HEADER } from "../../src/server/socket";
 import {
   connect,
@@ -102,6 +102,66 @@ describe("device socket", () => {
     await second.next("joined");
     expect((await first.closed()).code).toBe(4000);
     second.close();
+  });
+
+  test("a device with another secret cannot take the ID of a live one, but can once it is gone", async () => {
+    mockSfu();
+    const first = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await first.next("joined");
+    const other = await connect(await deviceToken("cam-1", ["lab-a"], undefined, "another-device-secret"));
+    expect((await other.closed()).code).toBe(CloseCode.CLOSE_CODE_ID_IN_USE);
+    expect(other.has("joined")).toBe(false);
+    expect(first.closeEvent).toBeNull();
+
+    first.close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const later = await connect(await deviceToken("cam-1", ["lab-a"], undefined, "another-device-secret"));
+    expect(await later.next("joined")).toMatchObject({ deviceId: "cam-1" });
+    later.close();
+  });
+
+  test("a viewer with another secret cannot take the ID of a live one, nor resume it once it is gone", async () => {
+    mockSfu();
+    const first = await connect(await viewerToken("v1", "lab-a"));
+    await first.next("joined");
+    const other = await connect(await viewerToken("v1", "lab-a", false, "someone-elses-secret"));
+    expect((await other.closed()).code).toBe(CloseCode.CLOSE_CODE_ID_IN_USE);
+    expect(first.closeEvent).toBeNull();
+
+    // It drops without leaving: only its own secret could resume it within 30 s.
+    first.close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const later = await connect(await viewerToken("v1", "lab-a", false, "someone-elses-secret"));
+    expect((await later.next("joined")).resumed).toBe(false);
+    later.close();
+  });
+
+  test("the late close of a viewer socket someone else took over does not mark the new viewer away", async () => {
+    mockSfu();
+    const room = env.ROOMS.getByName("lab-a");
+    const first = await connect(await viewerToken("v1", "lab-a"));
+    await first.next("joined");
+    // It stopped pinging: the socket is still open, but no longer live.
+    const old = await runInDurableObject(room, async (_instance, state) => {
+      const ws = state.getWebSockets("v1")[0]!;
+      ws.serializeAttachment({ viewerId: "v1", connectedAt: Date.now() - 60_000 });
+      return ws;
+    });
+    const request = socketRequest(await viewerToken("v1", "lab-a", false, "someone-elses-secret"));
+    const closedAt = await runInDurableObject(room, async (instance, state) => {
+      // The old socket's close comes in while the new viewer waits for the room's devices.
+      const watchAll = (instance as any).watchAll.bind(instance);
+      (instance as any).watchAll = async (now: number) => {
+        await instance.webSocketClose(old, CloseCode.CLOSE_CODE_REPLACED);
+        return watchAll(now);
+      };
+      const second = new TestSocket((await instance.fetch(request)).webSocket!, "viewer");
+      expect((await second.next("joined")).resumed).toBe(false);
+      const value = state.storage.sql.exec<{ socket_closed_at: number | null }>("SELECT socket_closed_at FROM viewers").one().socket_closed_at;
+      second.close();
+      return value;
+    });
+    expect(closedAt).toBeNull();
   });
 
   test("a reconnecting device gets joined before a wake, even when a room watches meanwhile", async () => {

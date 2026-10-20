@@ -134,6 +134,11 @@ function timingSafeEqual(a: string, b: string): boolean {
   return crypto.subtle.timingSafeEqual(left, right);
 }
 
+/** What a token carries instead of the client's secret: its SHA-256, base64url. */
+export async function hashSecret(secret: string): Promise<string> {
+  return base64UrlEncode(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(secret))));
+}
+
 function base64UrlJson(value: unknown): string {
   return base64UrlEncode(encoder.encode(JSON.stringify(value)));
 }

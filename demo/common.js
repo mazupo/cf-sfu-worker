@@ -58,6 +58,12 @@ export function viewerName(ref) {
 
 export const PING_INTERVAL_MS = 15_000;
 export const CLOSE_REPLACED = CloseCode.CLOSE_CODE_REPLACED;
+export const CLOSE_ID_IN_USE = CloseCode.CLOSE_CODE_ID_IN_USE;
+
+/** A random secret for the token request. Only a connection with it can take the place of ours. */
+export function newSecret() {
+  return [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 /** Trades a public key for a 30 s, single-use access token. */
 export async function requestToken(workerUrl, publicKey, body) {

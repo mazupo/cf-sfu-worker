@@ -39,6 +39,7 @@ import {
   KeyedQueue,
   closeSocket,
   decodeFrame,
+  refuseSocket,
   requestName,
   sendViewer,
   signalError,
@@ -69,6 +70,8 @@ type ViewerRow = {
   muted: number;
   /** 1 while its microphone offer waits for the SFU: it holds a place under the room's limit. */
   mic_pending: number;
+  /** The hash of the secret it joined with. Only a token with the same one resumes or replaces it. */
+  secret_hash: string | null;
 };
 
 type DataSubscriptionRow = {
@@ -121,7 +124,8 @@ const SCHEMA = `
     mic_mid TEXT,
     mic_generation INTEGER NOT NULL DEFAULT 0,
     muted INTEGER NOT NULL DEFAULT 0,
-    mic_pending INTEGER NOT NULL DEFAULT 0
+    mic_pending INTEGER NOT NULL DEFAULT 0,
+    secret_hash TEXT
   ) WITHOUT ROWID;
   CREATE TABLE IF NOT EXISTS subscriptions (
     viewer_id TEXT NOT NULL,
@@ -305,15 +309,23 @@ export class Room extends DurableObject<Env> {
       return jsonError(401, "token_used", "The access token was already used. Request a new one.");
     }
 
-    // First, while nothing has changed yet: once the old socket is closed, this must not wait.
+    // Asked first, before anything changes. Between closing the old socket and accepting this
+    // one, only watchAll() waits, when the room was empty; onSocketGone() skips the old socket.
     const ice = await iceServers(this.env);
 
     const viewerId = claims.sub;
     let viewer = this.viewer(viewerId);
     if (viewer) {
+      // Someone else with this viewer ID. It gets the ID once the other one is gone.
+      const sameClient = viewer.secret_hash === null || viewer.secret_hash === claims.grant.secretHash;
+      if (!sameClient && this.viewerAlive(viewerId, now)) {
+        console.log(JSON.stringify({ event: "viewer_id_in_use", room: this.roomId, viewerId }));
+        return refuseSocket(CloseCode.CLOSE_CODE_ID_IN_USE, "Another live connection uses this viewer_id.");
+      }
       const resumable =
-        this.ctx.getWebSockets(viewerId).length > 0 ||
-        (viewer.socket_closed_at !== null && now - viewer.socket_closed_at <= this.config.viewerResumeMs);
+        sameClient &&
+        (this.ctx.getWebSockets(viewerId).length > 0 ||
+          (viewer.socket_closed_at !== null && now - viewer.socket_closed_at <= this.config.viewerResumeMs));
       if (!resumable) {
         await this.dropViewer(viewerId);
       } else if (viewer.data_channels && !claims.grant.dataChannels) {
@@ -331,19 +343,21 @@ export class Room extends DurableObject<Env> {
     const wasEmpty = this.viewerCount() === 0;
     if (viewer) {
       this.sql.exec(
-        "UPDATE viewers SET socket_closed_at = NULL, data_channels = ? WHERE viewer_id = ?",
+        "UPDATE viewers SET socket_closed_at = NULL, data_channels = ?, secret_hash = ? WHERE viewer_id = ?",
         claims.grant.dataChannels ? 1 : 0,
+        claims.grant.secretHash,
         viewerId,
       );
     } else {
       this.sql.exec(
         `INSERT INTO viewers (viewer_id, sfu_session_id, negotiating, pending_offer, created_at, socket_closed_at,
-           data_channels, data_transport)
-         VALUES (?, NULL, 0, NULL, ?, NULL, ?, ?)`,
+           data_channels, data_transport, secret_hash)
+         VALUES (?, NULL, 0, NULL, ?, NULL, ?, ?, ?)`,
         viewerId,
         now,
         claims.grant.dataChannels ? 1 : 0,
         DATA_NONE,
+        claims.grant.secretHash,
       );
     }
     // Devices are waking now. Create the receive session meanwhile, so the first subscribe
@@ -447,7 +461,10 @@ export class Room extends DurableObject<Env> {
     const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
     if (!attachment || !this.ready) return;
     if (this.ctx.getWebSockets(attachment.viewerId).some((other) => other !== ws)) return;
-    if (!this.viewer(attachment.viewerId)) return;
+    const viewer = this.viewer(attachment.viewerId);
+    // Gone, or the socket of an earlier viewer with this ID that someone else took over: its
+    // close can come while the new one is joining.
+    if (!viewer || attachment.connectedAt < viewer.created_at) return;
     const now = Date.now();
     this.sql.exec(
       "UPDATE viewers SET socket_closed_at = COALESCE(socket_closed_at, ?) WHERE viewer_id = ?",
@@ -1035,6 +1052,13 @@ export class Room extends DurableObject<Env> {
     };
   }
 
+  /** One of the viewer's sockets is open and was pinged lately. */
+  private viewerAlive(viewerId: string, now: number): boolean {
+    return this.ctx
+      .getWebSockets(viewerId)
+      .some((ws) => ws.readyState === WebSocket.OPEN && now - this.lastSeen(ws) <= this.config.viewerStaleMs);
+  }
+
   private viewer(viewerId: string): ViewerRow | null {
     return this.sql.exec<ViewerRow>("SELECT * FROM viewers WHERE viewer_id = ?", viewerId).toArray()[0] ?? null;
   }
@@ -1445,5 +1469,6 @@ function addMissingColumns(sql: SqlStorage): void {
   if (!viewers.has("mic_generation")) sql.exec("ALTER TABLE viewers ADD COLUMN mic_generation INTEGER NOT NULL DEFAULT 0");
   if (!viewers.has("muted")) sql.exec("ALTER TABLE viewers ADD COLUMN muted INTEGER NOT NULL DEFAULT 0");
   if (!viewers.has("mic_pending")) sql.exec("ALTER TABLE viewers ADD COLUMN mic_pending INTEGER NOT NULL DEFAULT 0");
+  if (!viewers.has("secret_hash")) sql.exec("ALTER TABLE viewers ADD COLUMN secret_hash TEXT");
   if (!columns("subscriptions").has("mic_of")) sql.exec("ALTER TABLE subscriptions ADD COLUMN mic_of TEXT");
 }

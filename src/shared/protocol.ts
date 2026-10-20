@@ -27,6 +27,12 @@ export const trackNameSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 /** The generation of the device's last answer. Sent again on a reconnect, it keeps the stream. */
 const generationSchema = z.number().int().min(1);
 
+/**
+ * A random value the client makes once and keeps with its id. Only a connection with the same
+ * secret can resume or replace a live one with that id. The token carries only its hash.
+ */
+const secretSchema = z.string().min(16, "use at least 16 random characters").max(128);
+
 const sdpSchema = z.string().min(1).max(64_000);
 const midSchema = z.string().min(1).max(32);
 
@@ -38,6 +44,7 @@ export const deviceTokenRequestSchema = z.object({
   device_id: idSchema,
   room_ids: z.array(idSchema).min(1),
   can_subscribe: z.literal(false),
+  secret: secretSchema,
   generation: generationSchema.optional(),
 });
 
@@ -45,6 +52,7 @@ export const viewerTokenRequestSchema = z.object({
   viewer_id: viewerIdSchema,
   room_id: idSchema,
   can_subscribe: z.literal(true),
+  secret: secretSchema,
   /** Lets the viewer open devices' data channels and take control of a device. */
   data_channels: z.boolean().optional(),
 });
@@ -65,6 +73,8 @@ export const grantSchema = z.object({
   canSubscribe: z.boolean(),
   generation: generationSchema.optional(),
   dataChannels: z.boolean().optional(),
+  /** The SHA-256 of the client's secret, base64url. */
+  secretHash: z.string().min(1).max(64),
 });
 export type Grant = z.infer<typeof grantSchema>;
 

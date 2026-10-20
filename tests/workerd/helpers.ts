@@ -22,22 +22,25 @@ export function requestToken(key: string, body: unknown): Promise<Response> {
   );
 }
 
-export async function deviceToken(deviceId: string, rooms: string[], generation?: number): Promise<string> {
+/** Each id has its own secret by default, so a second connection with it resumes or replaces the first. */
+export async function deviceToken(deviceId: string, rooms: string[], generation?: number, secret = `device-secret-of-${deviceId}`): Promise<string> {
   const response = await requestToken(DEVICE_PUBLIC_KEY, {
     device_id: deviceId,
     room_ids: rooms,
     can_subscribe: false,
+    secret,
     ...(generation ? { generation } : {}),
   });
   expect(response.status).toBe(200);
   return (await response.json<{ token: string }>()).token;
 }
 
-export async function viewerToken(viewerId: string, room: string, dataChannels = false): Promise<string> {
+export async function viewerToken(viewerId: string, room: string, dataChannels = false, secret = `viewer-secret-of-${viewerId}`): Promise<string> {
   const response = await requestToken(VIEWER_PUBLIC_KEY, {
     viewer_id: viewerId,
     room_id: room,
     can_subscribe: true,
+    secret,
     ...(dataChannels ? { data_channels: true } : {}),
   });
   expect(response.status).toBe(200);

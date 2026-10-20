@@ -85,10 +85,17 @@ POST /cloudflare/token
 Authorization: Bearer <public key>
 Content-Type: application/json
 
-{ "device_id": "cam-1", "room_ids": ["lab-a"], "can_subscribe": false }
+{ "device_id": "cam-1", "room_ids": ["lab-a"], "can_subscribe": false, "secret": "9c1e4f0b7a2d6e8f3b5c1a9d" }
 ```
 
-A viewer sends `{ "viewer_id": "7f3a9c2e", "room_id": "lab-a", "can_subscribe": true }` with the viewer public key. Add `"data_channels": true` to let the viewer open the devices' data channels and take control of a device. A viewer without it only watches.
+A viewer sends `{ "viewer_id": "7f3a9c2e", "room_id": "lab-a", "can_subscribe": true, "secret": "..." }` with the viewer public key. Add `"data_channels": true` to let the viewer open the devices' data channels and take control of a device. A viewer without it only watches.
+
+The `secret` is a random string of 16 to 128 characters. Make one when the device starts, or when a viewer first joins, and send the same one on each reconnect. Everyone with the public key can ask for a token, and the ids are not secret: others in a room see them. The secret stops someone else from taking your id:
+
+- A connection with the same id and the same secret takes the place of the old one, which gets close code `4000`. A viewer keeps its subscriptions and its control.
+- A connection with the same id and another secret gets close code `4002` while the old one is still live, that is, its socket is open and it sent a ping in the last 45 seconds. Once the old one is gone, it gets the id: a device carries on as usual, and a viewer starts as a new viewer.
+
+The token carries only the secret's SHA-256, never the secret.
 
 The answer is `{ "token": "...", "expires_in": 30, "url": "wss://.../cloudflare/rtc" }`. The token works once and only for 30 seconds.
 
@@ -135,7 +142,7 @@ Each of these sets exactly one field, listed below. `ping` and `pong` are text f
 | Viewer → worker | `leave` | |
 | Worker → both | `error` | `code`, `message`, `request`, `deviceId`, `viewerId`, `trackName`, `retryable` |
 
-The proto file also defines the device states (`DeviceState`), the error codes (`ErrorCode`) and the close codes (`CloseCode`). Close code `4000` means another connection used the same `device_id` or `viewer_id`. Do not reconnect after it.
+The proto file also defines the device states (`DeviceState`), the error codes (`ErrorCode`) and the close codes (`CloseCode`). Close code `4000` means a newer connection took the same `device_id` or `viewer_id`, and `4002` that a live connection with another secret has it. A viewer stops after either. A device tries again after a while, and logs it: two devices may have the same id.
 
 The TypeScript for these messages is generated into `src/proto` and is not in git. `npm run dev`, `npm run deploy` and `npm run check` generate it from the `external/protocol` submodule. To run the tests or the typecheck on their own, run `npm run proto` first. It uses [buf](https://buf.build) from npm, so you do not need to install `protoc`. To change the messages, edit the proto files in `external/protocol`.
 
@@ -144,7 +151,7 @@ The `generation` counts a device's publications. It goes up by one with each off
 The worker replies to each offer, in order, with `answer` or an `error` for `offer`. A device uses only the reply to its last offer: one it sent before a new `wake` may still get a reply.
 
 A device that reconnects while it publishes adds `"generation"` from its last `answer` to the token request, so the stream continues. Otherwise the worker starts over: `joined` says `sleeping`, and a new `wake` follows if someone watches.
-A viewer that reconnects with the same `viewer_id` within 30 seconds keeps its subscriptions.
+A viewer that reconnects with the same `viewer_id` and `secret` within 30 seconds keeps its subscriptions.
 
 ### 3. Data channels
 

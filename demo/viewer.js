@@ -2,6 +2,7 @@
 // through a single PeerConnection. All signaling happens on one WebSocket. With Enable IPC it
 // also opens each device's _lossy and _reliable, and can take control of a device to send to it.
 import {
+  CLOSE_ID_IN_USE,
   CLOSE_REPLACED,
   DeviceState,
   ErrorCode,
@@ -10,6 +11,7 @@ import {
   decodeIpc,
   encodeIpc,
   errorName,
+  newSecret,
   openChannel,
   openSocket,
   persistForm,
@@ -111,6 +113,23 @@ function viewerId() {
   }
 }
 
+/** The secret this tab keeps for a viewer ID, so a reload can resume it. */
+function secretFor(id) {
+  const key = `cf-sfu-worker.secret:${id}`;
+  try {
+    let secret = sessionStorage.getItem(key);
+    if (!secret) {
+      secret = newSecret();
+      sessionStorage.setItem(key, secret);
+    }
+    return secret;
+  } catch {
+    secretFor.fallback ??= new Map();
+    if (!secretFor.fallback.has(id)) secretFor.fallback.set(id, newSecret());
+    return secretFor.fallback.get(id);
+  }
+}
+
 function setStatus(text) {
   statusEl.textContent = text;
 }
@@ -134,6 +153,7 @@ async function join() {
       viewer_id: viewerId(),
       room_id: data.get("room"),
       can_subscribe: true,
+      secret: secretFor(viewerId()),
       ...(ipc ? { data_channels: true } : {}),
     });
     if (seq !== connectSeq || leaving) return;
@@ -194,6 +214,11 @@ function onClose(event) {
   if (event.code === CLOSE_REPLACED) {
     leave();
     setStatus("Another tab joined with this viewer ID. This tab stopped.");
+    return;
+  }
+  if (event.code === CLOSE_ID_IN_USE) {
+    leave();
+    setStatus("Someone else is in the room with this viewer ID. Choose another one, or join again later.");
     return;
   }
   scheduleReconnect();
