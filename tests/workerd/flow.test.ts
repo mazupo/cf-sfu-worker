@@ -220,6 +220,29 @@ describe("device socket", () => {
     expect(second.has("error")).toBe(false);
     second.close();
   });
+
+  test("a leave that waited behind a slow request is ignored once a new socket resumed the viewer", async () => {
+    // The SFU is slow to take the microphone, so the leave waits behind it.
+    mockSfu({ microphoneDelayMs: 1000 });
+    const first = await connect(await viewerToken("v1", "lab-a"));
+    await first.next("joined");
+    first.send("offer", { sdp: "v=0 v1-offer" });
+    await first.next("answer");
+    first.send("offer", { sdp: "v=0 v1-microphone-offer", tracks: [{ trackName: "microphone", mid: "1" }] });
+    first.send("leave");
+    const second = await connect(await viewerToken("v1", "lab-a"));
+    expect((await second.next("joined")).resumed).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const viewers = await runInDurableObject(env.ROOMS.getByName("lab-a"), async (_instance, state) =>
+      state.storage.sql.exec<{ viewer_id: string }>("SELECT viewer_id FROM viewers").toArray(),
+    );
+    expect(viewers).toEqual([{ viewer_id: "v1" }]);
+    second.send("offer", { sdp: "v=0 v1-offer-2" });
+    expect(await second.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    expect(second.has("error")).toBe(false);
+    second.close();
+  });
 });
 
 describe("watching", () => {

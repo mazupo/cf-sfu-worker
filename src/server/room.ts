@@ -320,7 +320,7 @@ export class Room extends DurableObject<Env> {
         await this.dropViewer(viewerId);
       } else if (viewer.data_channels && !claims.grant.dataChannels) {
         // Resumed without data channels: give up control, and let the SFU close them in the background.
-        await this.dropData(viewerId, false, true);
+        await this.dropData(viewerId);
       }
       viewer = this.viewer(viewerId);
     }
@@ -385,10 +385,11 @@ export class Room extends DurableObject<Env> {
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
     const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
-    // A replaced socket is closing: what it still sends, e.g. a late leave, belongs to the old connection.
-    if (!attachment || !this.ready || ws.readyState !== WebSocket.OPEN) return;
+    if (!attachment || !this.ready) return;
     const request = decodeFrame(ViewerRequest, data);
     const name = request ? requestName(request) : "";
+    // The page leaves and closes the socket at once, so only a leave still counts once it is closing.
+    if (ws.readyState !== WebSocket.OPEN && !request?.leave) return;
     if (!request || !name) {
       this.fail(ws, ErrorCode.ERROR_CODE_INVALID_MESSAGE, "Send a binary ViewerRequest.", name);
       return;
@@ -396,6 +397,8 @@ export class Room extends DurableObject<Env> {
     const { viewerId } = attachment;
     const run = (task: () => Promise<void>) =>
       this.queue.run(viewerId, async () => {
+        // What a replaced socket sends, e.g. a late leave, belongs to the old connection.
+        if (this.replaced(ws, attachment)) return;
         if (!this.viewer(viewerId)) {
           this.fail(ws, ErrorCode.ERROR_CODE_VIEWER_GONE, "Join the room again.", name);
           return;
@@ -1024,6 +1027,13 @@ export class Room extends DurableObject<Env> {
       .some((ws) => ws.readyState === WebSocket.OPEN && now - this.lastSeen(ws) <= this.config.viewerStaleMs);
   }
 
+  /** Another socket took the viewer over, or the viewer left and joined anew after this socket opened. */
+  private replaced(ws: WebSocket, attachment: ViewerAttachment): boolean {
+    const viewer = this.viewer(attachment.viewerId);
+    if (viewer && attachment.connectedAt < viewer.created_at) return true;
+    return this.ctx.getWebSockets(attachment.viewerId).some((other) => other !== ws && other.readyState === WebSocket.OPEN);
+  }
+
   private viewer(viewerId: string): ViewerRow | null {
     return this.sql.exec<ViewerRow>("SELECT * FROM viewers WHERE viewer_id = ?", viewerId).toArray()[0] ?? null;
   }
@@ -1129,19 +1139,13 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE device_id = ?", deviceId);
   }
 
-  /** Closes the viewer's data channels; unless `keepControl`, also its control. `background`: don't wait. */
-  private async dropData(viewerId: string, keepControl = false, background = false): Promise<string[]> {
+  /** Gives up the viewer's control, and closes its data channels in the background. */
+  private async dropData(viewerId: string): Promise<void> {
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
     const sessionId = this.viewer(viewerId)?.sfu_session_id;
-    if (sessionId) {
-      const closing = this.closeAllData(sessionId, subs);
-      if (!background) await closing;
-    }
+    if (sessionId) void this.closeAllData(sessionId, subs);
     this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
-    if (!keepControl) {
-      await Promise.allSettled(subs.map((sub) => this.env.DEVICES.getByName(sub.device_id).controlGone(this.roomId, viewerId)));
-    }
-    return subs.map((sub) => sub.device_id);
+    await Promise.allSettled(subs.map((sub) => this.env.DEVICES.getByName(sub.device_id).controlGone(this.roomId, viewerId)));
   }
 
   private async closeAllData(sessionId: string, subs: DataSubscriptionRow[]): Promise<void> {
@@ -1201,33 +1205,35 @@ export class Room extends DurableObject<Env> {
     );
   }
 
+  /** Deletes the viewer before any wait, so a join meanwhile starts anew. */
   private async dropViewer(viewerId: string): Promise<void> {
     this.earlySessions.delete(viewerId);
-    const licensed = Boolean(this.viewer(viewerId)?.data_channels);
-    const hadMicrophone = Boolean(this.viewer(viewerId)?.mic_mid);
-    const affected = new Set(this.subscriptions(viewerId).map((sub) => sub.deviceId));
-    for (const deviceId of await this.dropData(viewerId, true)) affected.add(deviceId);
+    const viewer = this.viewer(viewerId);
+    const data = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
+    const affected = new Set([...this.subscriptions(viewerId).map((sub) => sub.deviceId), ...data.map((sub) => sub.device_id)]);
+    this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);
     // Others' pulls of its microphone stay until they unsubscribe. Generation 0 never matches a new one.
     this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE mic_of = ?", viewerId);
     this.broadcastViewers();
-    if (hadMicrophone) this.tellDevicesSoon();
+    if (viewer?.mic_mid) this.tellDevicesSoon();
     const members = this.sql
       .exec<{ device_id: string }>("SELECT device_id FROM members")
       .toArray()
       .map((row) => row.device_id);
     // Between PeerConnections it has no channels but may still control a device, so each device drops it.
-    if (licensed) {
+    if (viewer?.data_channels) {
       await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
     }
+    if (viewer?.sfu_session_id && data.length > 0) await this.closeAllData(viewer.sfu_session_id, data);
     if (this.viewerCount() > 0) {
       await this.releaseViewer(viewerId, affected);
       return;
     }
     // Nobody watches any more. Each device sleeps after its linger time.
-    await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).unwatch(this.roomId)));
     this.sql.exec("DELETE FROM devices");
+    await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).unwatch(this.roomId)));
   }
 
   /** Sends to the viewer's open sockets: one, unless a replaced one is still closing. */

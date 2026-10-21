@@ -496,6 +496,33 @@ describe("recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 1600));
   });
 
+  test("a viewer that leaves and joins again at once starts anew while its old channels close", async () => {
+    const calls = mockSfu({ dataCloseDelayMs: 1500 });
+    const device = await connect(await deviceToken("cam-1", ["lab-a"]));
+    await device.next("joined");
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await openData(v1);
+    // The Leave button sends leave and closes the socket. Join is clicked right after.
+    v1.send("leave");
+    v1.close();
+    const again = await connect(await viewerToken("v1", "lab-a", true));
+    const joined = await again.next("joined");
+    expect(joined).toMatchObject({ resumed: false, data: [] });
+    expect(joined.devices).toEqual([expect.objectContaining({ deviceId: "cam-1", state: state_("live") })]);
+
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    expect(calls.some((call) => call.path.endsWith("/datachannels/close"))).toBe(true);
+    again.send("offer", { sdp: "v=0 viewer-offer-2" });
+    expect(await again.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    again.send("subscribe", { data: ["cam-1"] });
+    expect((await again.next("subscribed")).data).toEqual([expect.objectContaining({ deviceId: "cam-1" })]);
+    expect(device.has("sleep")).toBe(false);
+    expect(again.has("error")).toBe(false);
+    again.close();
+    device.close();
+  });
+
   test("device channels that did not open after the answer open when the device is ready", async () => {
     mockSfu({ failDeviceChannels: [0] });
     const device = await connect(await deviceToken("cam-1", ["lab-a"]));
