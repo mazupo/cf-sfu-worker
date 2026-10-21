@@ -5,7 +5,7 @@ A device or a viewer trades a public key for a short access token. Then it opens
 ## Request
 
 ```http
-POST /cloudflare/token
+POST /sfu/token
 Authorization: Bearer <public key>
 Content-Type: application/json
 ```
@@ -41,7 +41,7 @@ A viewer sends the viewer public key:
 ## Response
 
 ```json
-{ "token": "eyJhbGciOiJFZERTQSIs...", "expires_in": 30, "url": "wss://example.com/cloudflare/rtc" }
+{ "token": "eyJhbGciOiJFZERTQSIs...", "expires_in": 30, "url": "wss://example.com/sfu/rtc" }
 ```
 
 The token works once, within `expires_in` seconds. Get a new token for each connection.
@@ -58,7 +58,7 @@ The token holds only a hash of the secret.
 ## Open the socket
 
 ```
-wss://<host>/cloudflare/rtc?access_token=<token>
+wss://<host>/sfu/rtc?access_token=<token>
 ```
 
 Then see [Messages](messages.md). For errors, see [Troubleshooting](../getting-started/troubleshooting.md).

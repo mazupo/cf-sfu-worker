@@ -63,21 +63,21 @@ To update later, run `git pull` and `npm run deploy`.
 The worker runs at `https://cf-sfu-worker.<your-subdomain>.workers.dev`.
 
 ```sh
-curl https://cf-sfu-worker.<your-subdomain>.workers.dev/cloudflare/health
+curl https://cf-sfu-worker.<your-subdomain>.workers.dev/sfu/health
 ```
 
-It answers `{"service":"cf-sfu-worker","ok":true}`. Then open `/cloudflare/device` and `/cloudflare/` on the same host, as in [Run it on your computer](../getting-started/local.md#6-watch-the-test-camera).
+It answers `{"service":"cf-sfu-worker","ok":true}`. Then open `/sfu/device` and `/sfu/` on the same host, as in [Run it on your computer](../getting-started/local.md#6-watch-the-test-camera).
 
 ## Use your own domain
 
-The pages and the API are all under `/cloudflare/`. Add a route in `wrangler.jsonc`, and deploy again:
+The pages and the API are all under `/sfu/`. Add a route in `wrangler.jsonc`, and deploy again:
 
 ```jsonc
-"routes": [{ "pattern": "example.com/cloudflare/*", "zone_name": "example.com" }],
+"routes": [{ "pattern": "example.com/sfu/*", "zone_name": "example.com" }],
 "workers_dev": false
 ```
 
-The rest of `example.com` is not affected. The `mazupo` environment in `wrangler.jsonc` is the mazupo deployment. You do not need it.
+The rest of `example.com` is not affected, but nothing else on it can use paths under `/sfu/`. The `mazupo` environment in `wrangler.jsonc` is the mazupo deployment. You do not need it.
 
 ## When you deploy again
 
@@ -86,4 +86,4 @@ A deploy closes every socket. Devices and viewers connect again within seconds, 
 ## Next
 
 - [Configuration](configuration.md): limits, TURN and the allowed origins.
-- [Dashboard](dashboard.md): protect `/cloudflare/admin/`.
+- [Dashboard](dashboard.md): protect `/sfu/admin/`.

@@ -8,12 +8,12 @@ Stream a Raspberry Pi or a Jetson camera to the worker with [pi-webrtc](https://
 ./pi-webrtc --camera=libcamera:0 \
     --uid=cam-1 \
     --use-cloudflare \
-    --api-url=http://192.168.1.10:8787/cloudflare \
+    --api-url=http://192.168.1.10:8787/sfu \
     --api-key=DEVICE_PUBLIC_KEY \
     --cloudflare-room=lab-a
 ```
 
-- `--api-url`: the worker URL, with `/cloudflare` at the end. For a worker on your computer, use your computer's IP address. For a deployed worker, use `https://`.
+- `--api-url`: the worker URL, with `/sfu` at the end. For a worker on your computer, use your computer's IP address. For a deployed worker, use `https://`.
 - `--api-key`: the device public key from `npm run keys`.
 - `--uid`: the device ID. Every device needs its own ID.
 - `--cloudflare-room`: a room to join. Repeat it to join up to 4 rooms.
@@ -22,7 +22,7 @@ The log shows `Connected to the Cloudflare worker`. The device now waits, and st
 
 ## Watch it
 
-- **Viewer page**: open `/cloudflare/` on the worker, and join the same room.
+- **Viewer page**: open `/sfu/` on the worker, and join the same room.
 - **Web app**: use `CloudflareRoom` from [@mazupo/client](https://github.com/mazupo/client-sdk-js/blob/main/docs/reference/cloudflare-room.md).
 
 ## More

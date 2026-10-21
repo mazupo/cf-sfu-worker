@@ -2,7 +2,7 @@ node_modules/
 .wrangler/
 dist/
 # Built from demo/ by npm run build:demo
-public/cloudflare/js/
+public/sfu/js/
 # Generated from external/protocol by npm run proto
 src/proto/
 .dev.vars

@@ -15,7 +15,7 @@ import {
 
 const SECRET = "a-random-secret-of-the-client";
 
-describe("POST /cloudflare/token", () => {
+describe("POST /sfu/token", () => {
   test("a device key gets a short token and the socket URL", async () => {
     const response = await requestToken(DEVICE_PUBLIC_KEY, {
       device_id: "cam-1",
@@ -27,7 +27,7 @@ describe("POST /cloudflare/token", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
     const body = await response.json<{ token: string; expires_in: number; url: string }>();
     expect(body.expires_in).toBe(30);
-    expect(body.url).toBe("ws://localhost/cloudflare/rtc");
+    expect(body.url).toBe("ws://localhost/sfu/rtc");
 
     const [header, payload] = body.token.split(".").slice(0, 2).map((part) => JSON.parse(atob(part.replace(/-/g, "+").replace(/_/g, "/"))));
     expect(header).toEqual({ alg: "EdDSA", typ: "JWT", kid: "device" });
@@ -58,7 +58,7 @@ describe("POST /cloudflare/token", () => {
 
   test("requires a bearer key", async () => {
     const response = await workerExports.default.fetch(
-      new Request(`${ORIGIN}/cloudflare/token`, { method: "POST", body: "{}" }),
+      new Request(`${ORIGIN}/sfu/token`, { method: "POST", body: "{}" }),
     );
     expect(response.status).toBe(401);
     expect(await response.json()).toMatchObject({ error: { code: "key_required" } });
@@ -128,7 +128,7 @@ describe("POST /cloudflare/token", () => {
 
   test("answers CORS preflight", async () => {
     const response = await workerExports.default.fetch(
-      new Request(`${ORIGIN}/cloudflare/token`, {
+      new Request(`${ORIGIN}/sfu/token`, {
         method: "OPTIONS",
         headers: {
           Origin: "https://app.example.com",
@@ -142,10 +142,10 @@ describe("POST /cloudflare/token", () => {
   });
 });
 
-describe("GET /cloudflare/rtc", () => {
+describe("GET /sfu/rtc", () => {
   test("needs a WebSocket upgrade", async () => {
     const token = await deviceToken("cam-1", ["lab-a"]);
-    const response = await workerExports.default.fetch(new Request(`${ORIGIN}/cloudflare/rtc?access_token=${token}`));
+    const response = await workerExports.default.fetch(new Request(`${ORIGIN}/sfu/rtc?access_token=${token}`));
     expect(response.status).toBe(426);
   });
 

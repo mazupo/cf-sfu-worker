@@ -4,7 +4,7 @@
   "main": "src/worker.ts",
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
-  // The demo pages are static. Only /cloudflare/* runs the Worker.
+  // The demo pages are static. Only /sfu/* runs the Worker.
   // Generates src/proto from the protocol submodule, then bundles the demo pages into public/js.
   "build": {
     "command": "npm run build",
@@ -13,7 +13,7 @@
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
-    "run_worker_first": ["/cloudflare/*"]
+    "run_worker_first": ["/sfu/*"]
   },
   "durable_objects": {
     "bindings": [
@@ -43,7 +43,7 @@
     "MAX_DEVICES_PER_ROOM": "16",
     "MAX_ROOMS_PER_DEVICE": "4",
     "MAX_MICROPHONES_PER_ROOM": "10",
-    // "true" opens /cloudflare/debug/* on this host. It is always open on localhost.
+    // "true" opens /sfu/debug/* on this host. It is always open on localhost.
     "DEBUG_STATE": "false"
   },
   "observability": { "enabled": true },
@@ -54,7 +54,7 @@
     // The mazupo deployment: `wrangler deploy --env mazupo`. Other deployments can ignore it.
     "mazupo": {
       "workers_dev": false,
-      "routes": [{ "pattern": "api.mazupo.com/cloudflare/*", "zone_name": "mazupo.com" }],
+      "routes": [{ "pattern": "api.mazupo.com/sfu/*", "zone_name": "mazupo.com" }],
       "durable_objects": {
         "bindings": [
           { "name": "DEVICES", "class_name": "Device" },

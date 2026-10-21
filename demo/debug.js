@@ -1,4 +1,4 @@
-// "Server state" panel for the demo pages. Reads /cloudflare/debug/* every 2 s while the panel
+// "Server state" panel for the demo pages. Reads /sfu/debug/* every 2 s while the panel
 // is open. Those routes answer on localhost, or when the worker has DEBUG_STATE=true.
 
 import { ago as agoAt, clock, duration } from "./time.js";
@@ -66,7 +66,7 @@ function selecting(element) {
   return selection !== null && !selection.isCollapsed && element.contains(selection.anchorNode);
 }
 
-/** A room's devices and viewers, from /cloudflare/debug/rooms/:id or /cloudflare/admin/rooms/:id. */
+/** A room's devices and viewers, from /sfu/debug/rooms/:id or /sfu/admin/rooms/:id. */
 export function renderRoom(json) {
   const room = json.room;
   return [

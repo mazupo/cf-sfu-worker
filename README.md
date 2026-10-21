@@ -45,8 +45,8 @@ In `.dev.vars`, set:
 
 Then open two browser tabs:
 
-1. [localhost:8787/cloudflare/device](http://localhost:8787/cloudflare/device): a camera simulator. Enter the device public key and a room. Click **Connect**.
-2. [localhost:8787/cloudflare/](http://localhost:8787/cloudflare/): the viewer. Enter the viewer public key and the same room. Click **Join**.
+1. [localhost:8787/sfu/device](http://localhost:8787/sfu/device): a camera simulator. Enter the device public key and a room. Click **Connect**.
+2. [localhost:8787/sfu/](http://localhost:8787/sfu/): the viewer. Enter the viewer public key and the same room. Click **Join**.
 
 Step by step: [Run it on your computer](docs/getting-started/local.md) · [Connect pi-webrtc](docs/getting-started/pi-webrtc.md)
 

@@ -751,7 +751,7 @@ startDebugPanel({
   url: () => {
     const data = new FormData(form);
     if (!data.get("workerUrl") || !data.get("room") || !data.get("viewerKey")) return null;
-    return new URL(`/cloudflare/debug/rooms/${encodeURIComponent(data.get("room"))}`, data.get("workerUrl")).toString();
+    return new URL(`/sfu/debug/rooms/${encodeURIComponent(data.get("room"))}`, data.get("workerUrl")).toString();
   },
   key: () => new FormData(form).get("viewerKey"),
 });

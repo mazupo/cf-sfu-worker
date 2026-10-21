@@ -12,7 +12,7 @@ const ADMIN_KEY = "test-admin-key";
 
 function admin(path: string, key?: string, origin = ORIGIN): Promise<Response> {
   return workerExports.default.fetch(
-    new Request(`${origin}/cloudflare/admin${path}`, { headers: key ? { Authorization: `Bearer ${key}` } : {} }),
+    new Request(`${origin}/sfu/admin${path}`, { headers: key ? { Authorization: `Bearer ${key}` } : {} }),
   );
 }
 
@@ -111,7 +111,7 @@ describe("dashboard behind Cloudflare Access", () => {
     network.use(http.get(`${TEAM}/cdn-cgi/access/certs`, () => HttpResponse.json({ keys: [jwk] })));
     const ctx = createExecutionContext();
     const response = await worker.fetch(
-      new Request(`${ORIGIN}/cloudflare/admin${path}`, { headers }),
+      new Request(`${ORIGIN}/sfu/admin${path}`, { headers }),
       { ...env, ACCESS_TEAM_DOMAIN: "test-team.cloudflareaccess.com/", ACCESS_AUD: AUD },
       ctx,
     );
