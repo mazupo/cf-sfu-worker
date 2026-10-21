@@ -14,6 +14,7 @@ import {
   openChannel,
   openSocket,
   persistForm,
+  apiPath,
   requestToken,
   stateName,
   viewerName,
@@ -36,7 +37,7 @@ const voicesStatus = document.getElementById("voices-status");
 const voicesAudio = document.getElementById("voices-audio");
 const log = createLog(document.getElementById("log"));
 
-document.getElementById("worker-url").value = location.origin;
+document.getElementById("api-url").value = `${location.origin}/sfu`;
 persistForm(form, "cf-sfu-worker.device");
 
 /** The one socket this tab uses. Events from older sockets are ignored. */
@@ -88,7 +89,7 @@ async function connect() {
   const rooms = String(data.get("rooms")).split(",").map((room) => room.trim()).filter(Boolean);
   try {
     // While publishing, send our answer's generation so a reconnect keeps the stream.
-    const { token, url } = await requestToken(data.get("workerUrl"), data.get("deviceKey"), {
+    const { token, url } = await requestToken(data.get("apiUrl"), data.get("deviceKey"), {
       device_id: data.get("deviceId"),
       room_ids: rooms,
       can_subscribe: false,
@@ -403,8 +404,8 @@ startDebugPanel({
   updated: document.getElementById("debug-updated"),
   url: () => {
     const data = new FormData(form);
-    if (!data.get("workerUrl") || !data.get("deviceId") || !data.get("deviceKey")) return null;
-    return new URL(`/sfu/debug/devices/${encodeURIComponent(data.get("deviceId"))}`, data.get("workerUrl")).toString();
+    if (!data.get("apiUrl") || !data.get("deviceId") || !data.get("deviceKey")) return null;
+    return apiPath(data.get("apiUrl"), `/debug/devices/${encodeURIComponent(data.get("deviceId"))}`);
   },
   key: () => new FormData(form).get("deviceKey"),
 });
