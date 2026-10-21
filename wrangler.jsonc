@@ -52,6 +52,7 @@
   // REALTIME_TURN_KEY_API_TOKEN. See .dev.vars.example.
   "env": {
     // The mazupo deployment: `wrangler deploy --env mazupo`. Other deployments can ignore it.
+    // It repeats the settings above; `npm run check` checks that they match.
     "mazupo": {
       "workers_dev": false,
       "routes": [{ "pattern": "api.mazupo.com/sfu/*", "zone_name": "mazupo.com" }],
@@ -63,7 +64,7 @@
         ]
       },
       "ratelimits": [
-        { "name": "TOKEN_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } }
+        { "name": "TOKEN_LIMITER", "namespace_id": "1002", "simple": { "limit": 20, "period": 60 } }
       ],
       "vars": {
         "ALLOWED_ORIGINS": "*",

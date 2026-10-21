@@ -13,7 +13,7 @@
     "cf-typegen": "wrangler types --env-file .dev.vars.example",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run proto && npm run cf-typegen -- --check && npm run typecheck && npm run test",
+    "check": "npm run proto && node scripts/check-config.mjs && npm run cf-typegen -- --check && npm run typecheck && npm run test",
     "keys": "node scripts/keys.mjs"
   },
   "dependencies": {
