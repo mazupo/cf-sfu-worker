@@ -34,6 +34,25 @@
     "vitest": "^4.1.12",
     "wrangler": "^4.151.0"
   },
+  "cloudflare": {
+    "bindings": {
+      "REALTIME_SFU_APP_ID": {
+        "description": "The App ID of a Realtime SFU app. Create one in **Realtime > SFU** in the Cloudflare dashboard."
+      },
+      "REALTIME_SFU_BEARER_TOKEN": {
+        "description": "The API token of the same SFU app."
+      },
+      "DEVICE_PRIVATE_KEY": {
+        "description": "From `npm run keys`. See [Keys](https://github.com/mazupo/cf-sfu-worker/blob/main/docs/deployment/deploy.md#1-make-the-keys). Devices use the matching public key."
+      },
+      "VIEWER_PRIVATE_KEY": {
+        "description": "From `npm run keys`. See [Keys](https://github.com/mazupo/cf-sfu-worker/blob/main/docs/deployment/deploy.md#1-make-the-keys). Viewers use the matching public key."
+      },
+      "ALLOWED_ORIGINS": {
+        "description": "Origins of the web pages that may call the token API, separated by commas. `*` allows every page."
+      }
+    }
+  },
   "engines": {
     "node": ">=22"
   }
