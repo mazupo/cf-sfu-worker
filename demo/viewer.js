@@ -308,6 +308,15 @@ async function handle(frame) {
 
 function onError(error) {
   log(`error ${errorName(error.code)}${error.deviceId ? ` (${error.deviceId})` : ""}: ${error.message}`);
+  if (error.code === ErrorCode.ERROR_CODE_VIEWER_GONE) {
+    // The worker forgot this viewer. Join again from the start.
+    dropSocket();
+    resetPeer(false);
+    ownOffers = 0;
+    busy = false;
+    scheduleReconnect();
+    return;
+  }
   if (error.deviceId && error.request === "subscribe") {
     // The server still finishes the request for the other devices.
     const generation = devices.get(error.deviceId)?.generation;
