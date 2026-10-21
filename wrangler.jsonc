@@ -7,7 +7,7 @@
   // The demo pages are static. Only /cloudflare/* runs the Worker.
   // Generates src/proto from the protocol submodule, then bundles the demo pages into public/js.
   "build": {
-    "command": "npm run proto && npm run build:demo",
+    "command": "npm run build",
     "watch_dir": ["src", "demo", "external/protocol/protos"]
   },
   "assets": {
