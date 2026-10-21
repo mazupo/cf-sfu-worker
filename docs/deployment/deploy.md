@@ -74,7 +74,10 @@ It answers `{"service":"cf-sfu-worker","ok":true}`. Then open `/sfu/device` and 
 The pages and the API are all under `/sfu/`. Add a route in `wrangler.jsonc`, and deploy again:
 
 ```jsonc
-"routes": [{ "pattern": "example.com/sfu/*", "zone_name": "example.com" }],
+"routes": [
+  { "pattern": "example.com/sfu", "zone_name": "example.com" },
+  { "pattern": "example.com/sfu/*", "zone_name": "example.com" }
+],
 "workers_dev": false
 ```
 

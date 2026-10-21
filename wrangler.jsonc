@@ -53,7 +53,10 @@
     // It repeats the settings above; `npm run check` checks that they match.
     "mazupo": {
       "workers_dev": false,
-      "routes": [{ "pattern": "api.mazupo.com/sfu/*", "zone_name": "mazupo.com" }],
+      "routes": [
+        { "pattern": "api.mazupo.com/sfu", "zone_name": "mazupo.com" },
+        { "pattern": "api.mazupo.com/sfu/*", "zone_name": "mazupo.com" }
+      ],
       "durable_objects": {
         "bindings": [
           { "name": "DEVICES", "class_name": "Device" },
