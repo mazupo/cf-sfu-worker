@@ -8,12 +8,13 @@ Run the tests, change the messages, and find out what the worker is doing.
 npm run check
 ```
 
-It does four things:
+It does five things:
 
 1. Generates `src/proto` from the protocol submodule.
-2. Checks that `worker-configuration.d.ts` matches `wrangler.jsonc` and `.dev.vars.example`.
-3. Typechecks.
-4. Runs the tests in workerd, the runtime of Cloudflare Workers. The SFU and TURN APIs are mocked.
+2. Checks that each env in `wrangler.jsonc` repeats the top-level settings.
+3. Checks that `worker-configuration.d.ts` matches `wrangler.jsonc` and `.dev.vars.example`.
+4. Typechecks.
+5. Runs the tests in workerd, the runtime of Cloudflare Workers. The SFU and TURN APIs are mocked.
 
 To run one file:
 
