@@ -33,7 +33,8 @@ Keep all four values. The private keys go into the worker. The public keys go to
 1. Click the button.
 2. Cloudflare copies this repo to your GitHub or GitLab account.
 3. Enter the four secrets: `REALTIME_SFU_APP_ID`, `REALTIME_SFU_BEARER_TOKEN`, `DEVICE_PRIVATE_KEY` and `VIEWER_PRIVATE_KEY`.
-4. Click **Deploy**.
+4. Leave **Protect with Cloudflare Access** off, or choose **Previews only**. **All traffic** blocks every device and viewer. To protect the dashboard, see [Dashboard](dashboard.md).
+5. Click **Deploy**.
 
 Each push to your copy deploys it again.
 
