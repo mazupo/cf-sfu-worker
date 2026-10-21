@@ -13,6 +13,7 @@ import {
   openChannel,
   openSocket,
   persistForm,
+  apiPath,
   requestToken,
   sameViewer,
   stateName,
@@ -41,7 +42,7 @@ const statusEl = document.getElementById("status");
 const tilesEl = document.getElementById("tiles");
 const log = createLog(document.getElementById("log"));
 
-document.getElementById("worker-url").value = location.origin;
+document.getElementById("api-url").value = `${location.origin}/sfu`;
 persistForm(form, "cf-sfu-worker.viewer");
 try {
   viewerIdInput.value = sessionStorage.getItem("cf-sfu-worker.viewerIdInput") ?? "";
@@ -144,7 +145,7 @@ async function join() {
   viewerIdInput.disabled = true;
   setStatus("Requesting a token…");
   try {
-    const { token, url } = await requestToken(data.get("workerUrl"), data.get("viewerKey"), {
+    const { token, url } = await requestToken(data.get("apiUrl"), data.get("viewerKey"), {
       viewer_id: viewerId(),
       room_id: data.get("room"),
       can_subscribe: true,
@@ -731,8 +732,8 @@ startDebugPanel({
   updated: document.getElementById("debug-updated"),
   url: () => {
     const data = new FormData(form);
-    if (!data.get("workerUrl") || !data.get("room") || !data.get("viewerKey")) return null;
-    return new URL(`/sfu/debug/rooms/${encodeURIComponent(data.get("room"))}`, data.get("workerUrl")).toString();
+    if (!data.get("apiUrl") || !data.get("room") || !data.get("viewerKey")) return null;
+    return apiPath(data.get("apiUrl"), `/debug/rooms/${encodeURIComponent(data.get("room"))}`);
   },
   key: () => new FormData(form).get("viewerKey"),
 });

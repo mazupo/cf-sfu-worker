@@ -64,8 +64,13 @@ export function newSecret() {
 }
 
 /** Trades a public key for a 30 s, single-use access token. */
-export async function requestToken(workerUrl, publicKey, body) {
-  const response = await fetch(new URL("/sfu/token", workerUrl), {
+/** A path under the API URL, which ends with /sfu like the SDK's apiUrl and pi-webrtc's --api-url. */
+export function apiPath(apiUrl, path) {
+  return `${apiUrl.replace(/\/+$/, "")}${path}`;
+}
+
+export async function requestToken(apiUrl, publicKey, body) {
+  const response = await fetch(apiPath(apiUrl, "/token"), {
     method: "POST",
     headers: { Authorization: `Bearer ${publicKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
