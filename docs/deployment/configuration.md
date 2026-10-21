@@ -2,6 +2,8 @@
 
 Every secret and variable of the worker. Set secrets with `npx wrangler secret put <NAME>`, or in the dashboard under **Settings > Variables and Secrets**. Change variables in `vars` of `wrangler.jsonc`, then deploy again.
 
+In the dashboard, choose the type **Secret**. Each deploy replaces the **Text** variables with the `vars` in `wrangler.jsonc`, so a value added as text is gone after the next deploy.
+
 For local development, put secrets in `.dev.vars`. See `.dev.vars.example`.
 
 ## Secrets
