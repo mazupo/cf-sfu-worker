@@ -1,6 +1,6 @@
 # cf-sfu-worker Documentation
 
-cf-sfu-worker connects cameras to viewers through Cloudflare Realtime SFU. These docs show how to run it, deploy it, and build a client for it.
+cf-sfu-worker lets a team work together with embedded devices that run pi-webrtc, through Cloudflare Realtime SFU. These docs show how to run it, deploy it, and build a client for it.
 
 ## Start here
 
