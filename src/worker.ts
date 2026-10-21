@@ -135,7 +135,7 @@ app.get(SOCKET_PATH, async (c) => {
 
 app.get("/sfu/health", (c) => c.json({ service: "cf-sfu-worker", ok: true }));
 
-// Debug views of the Durable Objects. They show SFU session IDs: localhost or DEBUG_STATE only, with a public key.
+// Debug views of the Durable Objects. They show SFU session IDs: open on localhost, else DEBUG_STATE and a public key.
 app.get("/sfu/debug/rooms/:roomId", async (c) => {
   const denied = await debugDenied(c);
   if (denied) return denied;
@@ -214,8 +214,8 @@ function error(c: Context<App>, status: 400 | 401 | 403 | 404 | 413 | 426 | 429 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 async function debugDenied(c: Context<App>): Promise<Response | null> {
-  const enabled = String(c.env.DEBUG_STATE) === "true" || LOOPBACK_HOSTS.has(new URL(c.req.url).hostname);
-  if (!enabled) return error(c, 404, "route_not_found", "Unknown path.");
+  if (LOOPBACK_HOSTS.has(new URL(c.req.url).hostname)) return null;
+  if (String(c.env.DEBUG_STATE) !== "true") return error(c, 404, "route_not_found", "Unknown path.");
   const bearer = /^Bearer\s+(\S+)$/i.exec(c.req.header("Authorization") ?? "")?.[1];
   let role: Awaited<ReturnType<typeof roleForPublicKey>> = null;
   try {

@@ -8,7 +8,7 @@ VIEWER_PRIVATE_KEY=
 # Optional. Adds TURN servers to the ICE servers sent to devices and viewers.
 # REALTIME_TURN_KEY_ID=
 # REALTIME_TURN_KEY_API_TOKEN=
-# Optional. "true" turns on /sfu/debug/* on any host. On localhost it is always on.
+# Optional. "true" turns on /sfu/debug/* on any host, with a public key. On localhost they are open.
 # DEBUG_STATE=true
 # Optional. Opens the dashboard (/sfu/admin/) on any host with this key. Without it, only on localhost.
 # ADMIN_KEY=
