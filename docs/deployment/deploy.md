@@ -81,6 +81,8 @@ The pages and the API are all under `/sfu/`. Add a route in `wrangler.jsonc`, an
 "workers_dev": false
 ```
 
+A route does not create a DNS record. `example.com` must already have one that Cloudflare proxies, for example a website or another Worker's custom domain. For a new host, use a custom domain instead: `{ "pattern": "sfu.example.com", "custom_domain": true }`.
+
 The rest of `example.com` is not affected, but nothing else on it can use paths under `/sfu/`. The `mazupo` environment in `wrangler.jsonc` is the mazupo deployment. You do not need it.
 
 ## When you deploy again
