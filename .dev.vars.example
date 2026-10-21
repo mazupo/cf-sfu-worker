@@ -6,8 +6,8 @@ REALTIME_SFU_BEARER_TOKEN=
 DEVICE_PRIVATE_KEY=
 VIEWER_PRIVATE_KEY=
 # Optional. Adds TURN servers to the ICE servers sent to devices and viewers.
-REALTIME_TURN_KEY_ID=
-REALTIME_TURN_KEY_API_TOKEN=
+# REALTIME_TURN_KEY_ID=
+# REALTIME_TURN_KEY_API_TOKEN=
 # Optional. "true" turns on /cloudflare/debug/* on any host. On localhost it is always on.
 # DEBUG_STATE=true
 # Optional. Lets the dashboard (/cloudflare/admin/) read every room on any host, with this key. Without it, the dashboard works on localhost only.
