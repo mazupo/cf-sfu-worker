@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Generates src/proto, checks the generated types, typechecks and runs the tests.
+      - name: Check
+        run: npm run check
+
+      # Runs `npm run build` too, as a real deploy does.
+      - name: Bundle the worker and the pages
+        run: npx wrangler deploy --dry-run --outdir=dist
+
+  protocol:
+    name: Protocol pin matches pi-webrtc
+    runs-on: ubuntu-latest
+
+    # The worker and the devices parse each other's messages. Both must pin the same protos.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Compare pins
+        run: |
+          ours=$(git rev-parse HEAD:external/protocol)
+          theirs=$(curl -sSf \
+            "https://api.github.com/repos/mazupo/pi-webrtc/contents/external/protocol?ref=main" \
+            | jq -r .sha)
+
+          echo "cf-sfu-worker  $ours"
+          echo "pi-webrtc      $theirs"
+
+          if [ "$ours" != "$theirs" ]; then
+            echo "::error::protocol submodule drift: this branch pins $ours, pi-webrtc main pins $theirs"
+            echo "Update whichever is behind, or land the pi-webrtc change on main first."
+            exit 1
+          fi
+
+          echo "In sync."
