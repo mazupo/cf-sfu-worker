@@ -511,14 +511,18 @@ describe("recovery", () => {
     expect(joined).toMatchObject({ resumed: false, data: [] });
     expect(joined.devices).toEqual([expect.objectContaining({ deviceId: "cam-1", state: state_("live") })]);
 
-    await new Promise((resolve) => setTimeout(resolve, 1600));
-    expect(calls.some((call) => call.path.endsWith("/datachannels/close"))).toBe(true);
+    // Its requests do not wait for the old channels to close.
+    const started = Date.now();
     again.send("offer", { sdp: "v=0 viewer-offer-2" });
     expect(await again.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
     again.send("subscribe", { data: ["cam-1"] });
     expect((await again.next("subscribed")).data).toEqual([expect.objectContaining({ deviceId: "cam-1" })]);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(calls.some((call) => call.path.endsWith("/datachannels/close"))).toBe(true);
     expect(device.has("sleep")).toBe(false);
     expect(again.has("error")).toBe(false);
+    // Let the slow close finish before the next test.
+    await new Promise((resolve) => setTimeout(resolve, 1600));
     again.close();
     device.close();
   });
