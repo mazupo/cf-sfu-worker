@@ -1,4 +1,4 @@
-// Dashboard: every room this worker serves, from /cloudflare/admin/*. Behind Cloudflare Access it
+// Dashboard: every room this worker serves, from /sfu/admin/*. Behind Cloudflare Access it
 // needs nothing more. Otherwise, when the worker has an ADMIN_KEY secret, enter it here; without
 // one, the dashboard answers on localhost only.
 import { renderRoom } from "./debug.js";
@@ -62,7 +62,7 @@ function get(path) {
   // Makes Access answer 401 when its sign-in has expired, instead of redirecting to its login page.
   const headers = { "X-Requested-With": "XMLHttpRequest" };
   if (key) headers.Authorization = `Bearer ${key}`;
-  return fetch(`/cloudflare/admin${path}`, {
+  return fetch(`/sfu/admin${path}`, {
     headers,
     cache: "no-store",
     signal: AbortSignal.timeout(TIMEOUT_MS),

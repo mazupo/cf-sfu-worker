@@ -8,7 +8,7 @@
     "dev": "wrangler dev --ip 0.0.0.0",
     "build": "npm run proto && npm run build:demo",
     "deploy": "wrangler deploy",
-    "build:demo": "esbuild demo/viewer.js demo/device.js demo/dashboard.js --bundle --format=esm --target=es2022 --outdir=public/cloudflare/js --log-level=warning",
+    "build:demo": "esbuild demo/viewer.js demo/device.js demo/dashboard.js --bundle --format=esm --target=es2022 --outdir=public/sfu/js --log-level=warning",
     "proto": "node scripts/prepare-protocol.mjs && buf generate",
     "cf-typegen": "wrangler types --env-file .dev.vars.example",
     "typecheck": "tsc --noEmit",

@@ -44,5 +44,5 @@ Common errors, and how to fix them. Errors from the token API come as `{ "error"
 
 | What you see | What to do |
 | --- | --- |
-| `/cloudflare/admin/` answers `404` on a deployed worker | Set up [Access or ADMIN_KEY](../deployment/dashboard.md). |
-| `/cloudflare/debug/*` answers `404` on a deployed worker | Set `DEBUG_STATE` to `true`. See [Debug pages](../deployment/dashboard.md#debug-pages). |
+| `/sfu/admin/` answers `404` on a deployed worker | Set up [Access or ADMIN_KEY](../deployment/dashboard.md). |
+| `/sfu/debug/*` answers `404` on a deployed worker | Set `DEBUG_STATE` to `true`. See [Debug pages](../deployment/dashboard.md#debug-pages). |

@@ -18,7 +18,7 @@ import {
 /** The request the worker hands a Durable Object for this token, with its claims. */
 function socketRequest(token: string): Request {
   const claims = atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/"));
-  return new Request("http://localhost/cloudflare/rtc", {
+  return new Request("http://localhost/sfu/rtc", {
     headers: { Upgrade: "websocket", [CLAIMS_HEADER]: encodeURIComponent(claims) },
   });
 }

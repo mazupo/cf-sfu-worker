@@ -8,9 +8,9 @@ VIEWER_PRIVATE_KEY=
 # Optional. Adds TURN servers to the ICE servers sent to devices and viewers.
 # REALTIME_TURN_KEY_ID=
 # REALTIME_TURN_KEY_API_TOKEN=
-# Optional. "true" turns on /cloudflare/debug/* on any host. On localhost it is always on.
+# Optional. "true" turns on /sfu/debug/* on any host. On localhost it is always on.
 # DEBUG_STATE=true
-# Optional. Lets the dashboard (/cloudflare/admin/) read every room on any host, with this key. Without it, the dashboard works on localhost only.
+# Optional. Lets the dashboard (/sfu/admin/) read every room on any host, with this key. Without it, the dashboard works on localhost only.
 # ADMIN_KEY=
 # Optional. Both together put the dashboard behind Cloudflare Access; ADMIN_KEY then no longer opens it.
 # ACCESS_TEAM_DOMAIN=https://<your-team>.cloudflareaccess.com

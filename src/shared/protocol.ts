@@ -2,9 +2,9 @@ import { z } from "zod";
 
 import { DeviceState, ErrorCode, type DeviceInfo } from "../proto/cloudflare";
 
-/** Paths. The Worker only runs for /cloudflare/*; everything else is a static demo page. */
-export const TOKEN_PATH = "/cloudflare/token";
-export const SOCKET_PATH = "/cloudflare/rtc";
+/** Paths. The Worker only runs for /sfu/*; everything else is a static demo page. */
+export const TOKEN_PATH = "/sfu/token";
+export const SOCKET_PATH = "/sfu/rtc";
 
 /**
  * Device IDs and room IDs are locators, never credentials. They name Durable Objects and appear in

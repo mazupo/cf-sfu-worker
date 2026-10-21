@@ -60,9 +60,9 @@ The worker runs at `http://localhost:8787`.
 
 ## 6. Watch the test camera
 
-1. Open [localhost:8787/cloudflare/device](http://localhost:8787/cloudflare/device). This page acts as a camera.
+1. Open [localhost:8787/sfu/device](http://localhost:8787/sfu/device). This page acts as a camera.
 2. Enter the **Device public key** and a room, such as `lab-a`. Click **Connect**. The state shows `sleeping`.
-3. In another tab, open [localhost:8787/cloudflare/](http://localhost:8787/cloudflare/).
+3. In another tab, open [localhost:8787/sfu/](http://localhost:8787/sfu/).
 4. Enter the **Viewer public key** and the same room. Click **Join**.
 
 The camera wakes and the video shows in a few seconds. Click **Leave**: about 30 seconds later, the camera goes back to `sleeping`.
@@ -71,7 +71,7 @@ The camera wakes and the video shows in a few seconds. Click **Leave**: about 30
 
 - **Data channels**: check **Enable IPC** on both pages before you connect. Then send messages both ways.
 - **Server state**: open it on either page to see what the worker holds.
-- **Dashboard**: [localhost:8787/cloudflare/admin/](http://localhost:8787/cloudflare/admin/) lists every room.
+- **Dashboard**: [localhost:8787/sfu/admin/](http://localhost:8787/sfu/admin/) lists every room.
 - **Other devices**: `npm run dev` listens on all interfaces. Use `http://<your computer's IP>:8787` from your network. The **Camera** source works only on `localhost` or `https`.
 
 ## Next

@@ -406,7 +406,7 @@ startDebugPanel({
   url: () => {
     const data = new FormData(form);
     if (!data.get("workerUrl") || !data.get("deviceId") || !data.get("deviceKey")) return null;
-    return new URL(`/cloudflare/debug/devices/${encodeURIComponent(data.get("deviceId"))}`, data.get("workerUrl")).toString();
+    return new URL(`/sfu/debug/devices/${encodeURIComponent(data.get("deviceId"))}`, data.get("workerUrl")).toString();
   },
   key: () => new FormData(form).get("deviceKey"),
 });

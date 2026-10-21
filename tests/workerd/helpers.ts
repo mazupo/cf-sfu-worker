@@ -14,7 +14,7 @@ const SFU = "https://rtc.live.cloudflare.com/v1/apps/test-app";
 
 export function requestToken(key: string, body: unknown): Promise<Response> {
   return workerExports.default.fetch(
-    new Request(`${ORIGIN}/cloudflare/token`, {
+    new Request(`${ORIGIN}/sfu/token`, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -49,7 +49,7 @@ export async function viewerToken(viewerId: string, room: string, dataChannels =
 
 export async function openSocket(token: string): Promise<Response> {
   return workerExports.default.fetch(
-    new Request(`${ORIGIN}/cloudflare/rtc?access_token=${encodeURIComponent(token)}`, {
+    new Request(`${ORIGIN}/sfu/rtc?access_token=${encodeURIComponent(token)}`, {
       headers: { Upgrade: "websocket" },
     }),
   );

@@ -4,9 +4,9 @@ cf-sfu-worker is one Worker with three kinds of Durable Objects. This page shows
 
 ```mermaid
 flowchart LR
-  P["Device"] -->|"1. POST /cloudflare/token"| W["Worker<br/>tokens, routing"]
+  P["Device"] -->|"1. POST /sfu/token"| W["Worker<br/>tokens, routing"]
   P -->|"2. WebSocket"| W
-  V["Viewer"] -->|"1. POST /cloudflare/token"| W
+  V["Viewer"] -->|"1. POST /sfu/token"| W
   V -->|"2. WebSocket"| W
   W --> D["Device DO<br/>one per device"]
   W --> R["Room DO<br/>one per room"]
@@ -111,7 +111,7 @@ The viewer's PeerConnection connects while the device wakes. So the video shows 
 | `src/server/access.ts` | Checking Cloudflare Access sign-ins |
 | `src/server/config.ts` | Settings and fixed timings |
 | `src/shared/protocol.ts` | The token request rules and the paths |
-| `demo/` | The scripts of the demo pages, bundled into `public/cloudflare/js` |
-| `public/cloudflare/` | The demo pages and the dashboard |
+| `demo/` | The scripts of the demo pages, bundled into `public/sfu/js` |
+| `public/sfu/` | The demo pages and the dashboard |
 | `tests/workerd/` | The tests |
 | `external/protocol` | The protobuf messages (a git submodule) |

@@ -67,7 +67,7 @@ export function newSecret() {
 
 /** Trades a public key for a 30 s, single-use access token. */
 export async function requestToken(workerUrl, publicKey, body) {
-  const response = await fetch(new URL("/cloudflare/token", workerUrl), {
+  const response = await fetch(new URL("/sfu/token", workerUrl), {
     method: "POST",
     headers: { Authorization: `Bearer ${publicKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),

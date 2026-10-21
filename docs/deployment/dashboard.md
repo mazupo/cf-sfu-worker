@@ -1,13 +1,13 @@
 # Dashboard
 
-The dashboard at `/cloudflare/admin/` lists every room, with its devices and viewers. This page shows how to open it on a deployed worker, and where to find the debug pages and the logs.
+The dashboard at `/sfu/admin/` lists every room, with its devices and viewers. This page shows how to open it on a deployed worker, and where to find the debug pages and the logs.
 
 On `localhost`, the dashboard is always open. On any other host, it answers `404` until you protect it in one of these two ways.
 
 ## Cloudflare Access (recommended)
 
 1. In the Cloudflare dashboard, go to **Zero Trust > Access > Applications**.
-2. Add a **self-hosted** application for your hostname, with the path `cloudflare/admin`.
+2. Add a **self-hosted** application for your hostname, with the path `sfu/admin`.
    Protect only this path. Devices and viewers need the token API and the sockets.
 3. Add a policy that allows your email address.
 4. Copy the application's **AUD tag**.
@@ -34,8 +34,8 @@ Then enter it in **Admin key** on the dashboard.
 
 **Server state** on the demo pages reads these:
 
-- `/cloudflare/debug/rooms/<room ID>`: a room, its viewers and its devices.
-- `/cloudflare/debug/devices/<device ID>`: one device.
+- `/sfu/debug/rooms/<room ID>`: a room, its viewers and its devices.
+- `/sfu/debug/devices/<device ID>`: one device.
 
 They need `Authorization: Bearer <device or viewer public key>`. On `localhost` they are always on. On other hosts, they answer `404` unless `DEBUG_STATE` is `true`. They show SFU session IDs, so turn them on only while you test.
 

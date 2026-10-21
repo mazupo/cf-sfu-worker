@@ -114,7 +114,7 @@ app.post(TOKEN_PATH, async (c) => {
 app.get(SOCKET_PATH, async (c) => {
   if (upgradeRequired(c.req.raw)) return error(c, 426, "upgrade_required", "Open a WebSocket.");
   const token = c.req.query("access_token");
-  if (!token) return error(c, 401, "token_required", "Add ?access_token=<token from POST /cloudflare/token>.");
+  if (!token) return error(c, 401, "token_required", "Add ?access_token=<token from POST /sfu/token>.");
 
   let verified;
   try {
@@ -136,11 +136,11 @@ app.get(SOCKET_PATH, async (c) => {
   return stub.fetch(forwarded);
 });
 
-app.get("/cloudflare/health", (c) => c.json({ service: "cf-sfu-worker", ok: true }));
+app.get("/sfu/health", (c) => c.json({ service: "cf-sfu-worker", ok: true }));
 
 // Debug views of the Durable Objects for the demo pages. They show SFU session IDs, so they
 // answer only on localhost, or when DEBUG_STATE is "true", and only with a public key.
-app.get("/cloudflare/debug/rooms/:roomId", async (c) => {
+app.get("/sfu/debug/rooms/:roomId", async (c) => {
   const denied = await debugDenied(c);
   if (denied) return denied;
   const roomId = idSchema.safeParse(c.req.param("roomId"));
@@ -148,7 +148,7 @@ app.get("/cloudflare/debug/rooms/:roomId", async (c) => {
   return c.json(await roomDetails(c.env, roomId.data), 200, { "Cache-Control": "no-store" });
 });
 
-app.get("/cloudflare/debug/devices/:deviceId", async (c) => {
+app.get("/sfu/debug/devices/:deviceId", async (c) => {
   const denied = await debugDenied(c);
   if (denied) return denied;
   const deviceId = idSchema.safeParse(c.req.param("deviceId"));
@@ -158,7 +158,7 @@ app.get("/cloudflare/debug/devices/:deviceId", async (c) => {
 });
 
 // The dashboard: every room this worker serves. See adminAuth for who may read it.
-app.get("/cloudflare/admin/rooms", async (c) => {
+app.get("/sfu/admin/rooms", async (c) => {
   const admin = await adminAuth(c);
   if ("denied" in admin) return admin.denied;
   const rooms = await c.env.REGISTRY.getByName(REGISTRY_NAME).rooms();
@@ -183,7 +183,7 @@ app.get("/cloudflare/admin/rooms", async (c) => {
   );
 });
 
-app.get("/cloudflare/admin/rooms/:roomId", async (c) => {
+app.get("/sfu/admin/rooms/:roomId", async (c) => {
   const admin = await adminAuth(c);
   if ("denied" in admin) return admin.denied;
   const roomId = idSchema.safeParse(c.req.param("roomId"));
@@ -191,18 +191,18 @@ app.get("/cloudflare/admin/rooms/:roomId", async (c) => {
   return c.json(await roomDetails(c.env, roomId.data), 200, { "Cache-Control": "no-store" });
 });
 
-// The demo pages and the dashboard live under /cloudflare/ too, so they deploy with the route.
-app.get("/cloudflare/*", async (c) => {
+// The demo pages and the dashboard live under /sfu/ too, so they deploy with the route.
+app.get("/sfu/*", async (c) => {
   const asset = await c.env.ASSETS.fetch(c.req.raw);
   return asset.status === 404 ? error(c, 404, "route_not_found", "Unknown path.") : asset;
 });
 
-app.all("/cloudflare/*", (c) => error(c, 404, "route_not_found", "Unknown path."));
+app.all("/sfu/*", (c) => error(c, 404, "route_not_found", "Unknown path."));
 
 // On workers.dev and localhost, the pages' old addresses.
-app.get("/", (c) => c.redirect("/cloudflare/"));
-app.get("/device", (c) => c.redirect("/cloudflare/device"));
-app.get("/dashboard", (c) => c.redirect("/cloudflare/admin/"));
+app.get("/", (c) => c.redirect("/sfu/"));
+app.get("/device", (c) => c.redirect("/sfu/device"));
+app.get("/dashboard", (c) => c.redirect("/sfu/admin/"));
 
 app.onError((err, c) => {
   console.error(JSON.stringify({ event: "unhandled_error", path: new URL(c.req.url).pathname, message: String(err) }));
@@ -256,7 +256,7 @@ async function roomDetails(env: Env, roomId: string) {
 type AdminAuth = { mode: "access"; email: string | null } | { mode: "key" } | { mode: "localhost" };
 
 /**
- * Who may read /cloudflare/admin/*:
+ * Who may read /sfu/admin/*:
  * - With ACCESS_TEAM_DOMAIN and ACCESS_AUD, only requests Cloudflare Access let in. ADMIN_KEY no
  *   longer opens it, so there is no way around the sign-in.
  * - Otherwise, with ADMIN_KEY, whoever sends that key.
