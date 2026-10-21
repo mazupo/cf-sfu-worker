@@ -13,5 +13,5 @@ VIEWER_PRIVATE_KEY=
 # Optional. Opens the dashboard (/sfu/admin/) on any host with this key. Without it, only on localhost.
 # ADMIN_KEY=
 # Optional. Both put the dashboard behind Cloudflare Access; ADMIN_KEY then no longer works.
-# ACCESS_TEAM_DOMAIN=https://<your-team>.cloudflareaccess.com
+# ACCESS_TEAM_DOMAIN=<your-team>.cloudflareaccess.com
 # ACCESS_AUD=<the Access application's AUD tag>

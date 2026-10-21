@@ -6,17 +6,21 @@ On `localhost`, the dashboard is always open. On any other host, it answers `404
 
 ## Cloudflare Access (recommended)
 
-1. In the Cloudflare dashboard, go to **Zero Trust > Access > Applications**.
-2. Add a **self-hosted** application for your hostname, with the path `sfu/admin`.
-   Protect only this path. Devices and viewers need the token API and the sockets.
-3. Add a policy that allows your email address.
-4. Copy the application's **AUD tag**.
-5. Set two secrets:
+1. In the Cloudflare dashboard, go to **Zero Trust > Access controls > Applications**.
+2. Select **Create new application**, then **Self-hosted and private**.
+3. Under **Destinations**, select **Add public hostname**. Enter your worker's hostname, and the path `sfu/admin`.
+   For example: subdomain `cf-sfu-worker`, domain `<your-subdomain>.workers.dev`, path `sfu/admin`.
+4. Add a policy that allows your email address, and save.
+5. Copy the application's **Application Audience (AUD) Tag**.
+6. Copy your team domain from **Zero Trust > Settings > Team domain**, such as `your-team.cloudflareaccess.com`.
+7. Set two secrets, with `wrangler` or in your worker's **Settings > Variables and Secrets**:
 
    ```sh
-   npx wrangler secret put ACCESS_TEAM_DOMAIN   # https://<your-team>.cloudflareaccess.com
+   npx wrangler secret put ACCESS_TEAM_DOMAIN   # your-team.cloudflareaccess.com
    npx wrangler secret put ACCESS_AUD           # the AUD tag
    ```
+
+Protect only the `sfu/admin` path. Do not use **Add Workers** or **Protect this Worker**: they protect the whole worker, and devices and viewers then cannot reach the token API and the sockets.
 
 With these two secrets, only Access opens the dashboard. `ADMIN_KEY` no longer works.
 
