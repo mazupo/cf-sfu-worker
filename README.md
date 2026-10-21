@@ -1,29 +1,30 @@
-# cf-sfu-worker
+<h1 align="center">cf-sfu-worker</h1>
 
-[![CI](https://github.com/mazupo/cf-sfu-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/mazupo/cf-sfu-worker/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-purple.svg)](https://opensource.org/licenses/Apache-2.0)
+<p align="center">
+    <a href="https://github.com/mazupo/cf-sfu-worker/actions/workflows/ci.yml"><img src="https://github.com/mazupo/cf-sfu-worker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://developers.cloudflare.com/realtime/sfu/"><img src="https://img.shields.io/badge/Cloudflare-Realtime_SFU-F38020?logo=cloudflare&logoColor=white" alt="Cloudflare Realtime SFU"></a>
+    <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-purple.svg" alt="License Apache"></a>
+</p>
 
 ## What is cf-sfu-worker?
 
-A Cloudflare Worker that connects cameras to viewers through [Cloudflare Realtime SFU](https://developers.cloudflare.com/realtime/sfu/). A camera waits on a WebSocket and streams only while someone watches. A viewer joins a room and sees every camera in it.
+A Cloudflare Worker that lets a team work together with embedded devices that run [pi-webrtc](https://github.com/mazupo/pi-webrtc), such as a Raspberry Pi or a Jetson. Devices and people join rooms through [Cloudflare Realtime SFU](https://developers.cloudflare.com/realtime/sfu/). Everyone in a room sees every device and can talk, and one person at a time controls a device.
 
 ```mermaid
 flowchart LR
-  Device["Camera<br/>(pi-webrtc)"] -- WebSocket --> Worker["cf-sfu-worker"]
-  Viewer["Viewer<br/>(browser or app)"] -- WebSocket --> Worker
+  Device["Devices<br/>(pi-webrtc)"] -- WebSocket --> Worker["cf-sfu-worker"]
+  People["People<br/>(browser or app)"] -- WebSocket --> Worker
   Worker -- sessions and tracks --> SFU(("Realtime SFU"))
-  Device == video and audio ==> SFU
-  SFU == video and audio ==> Viewer
+  Device <== video, audio and voices ==> SFU
+  SFU <== video, audio and voices ==> People
 ```
 
 ## Features
 
-- **Streams only when watched**: an idle camera sends only a small ping.
-- **Rooms**: a viewer sees every camera in its room. A camera can be in up to 4 rooms.
-- **Data channels**: send messages to a camera and back. One viewer at a time controls it.
-- **Voice**: viewers talk to each other, and the cameras play their voices.
-- **Survives reconnects and deploys**: streams keep going while a socket comes back.
-- **Keeps your SFU token safe**: clients only get short access tokens.
+- **Shared rooms**: everyone in a room sees every device and talks by voice. A device can be in up to 4 rooms.
+- **Remote control**: send commands and data to a device and back. One person controls it at a time; the others wait in line.
+- **Streams only when watched**: an idle device sends only a small ping, so it costs almost nothing.
+- **On your Cloudflare account**: deploy with one click. Your SFU secret stays in the worker; clients get short access tokens.
 
 ## Quick Start
 
@@ -45,7 +46,7 @@ In `.dev.vars`, set:
 
 Then open two browser tabs:
 
-1. [localhost:8787/sfu/device](http://localhost:8787/sfu/device): a camera simulator. Enter the device public key and a room. Click **Connect**.
+1. [localhost:8787/sfu/device](http://localhost:8787/sfu/device): a device simulator. Enter the device public key and a room. Click **Connect**.
 2. [localhost:8787/sfu/](http://localhost:8787/sfu/): the viewer. Enter the viewer public key and the same room. Click **Join**.
 
 Step by step: [Run it on your computer](docs/getting-started/local.md) · [Connect pi-webrtc](docs/getting-started/pi-webrtc.md)
@@ -58,7 +59,7 @@ Make your keys with `npm run keys` first. See [Deploy](docs/deployment/deploy.md
 
 ## Clients
 
-- [pi-webrtc](https://github.com/mazupo/pi-webrtc): streams a Raspberry Pi or Jetson camera.
+- [pi-webrtc](https://github.com/mazupo/pi-webrtc): runs on a Raspberry Pi or a Jetson and joins its rooms.
 - [@mazupo/client](https://github.com/mazupo/client-sdk-js): watch a room from a web or React Native app.
 
 ## Documentation
