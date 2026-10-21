@@ -37,7 +37,11 @@ Then enter it in **Admin key** on the dashboard.
 - `/sfu/debug/rooms/<room ID>`: a room, its viewers and its devices.
 - `/sfu/debug/devices/<device ID>`: one device.
 
-They need `Authorization: Bearer <device or viewer public key>`. On `localhost` they are always on. On other hosts, they answer `404` unless `DEBUG_STATE` is `true`. They show SFU session IDs, so turn them on only while you test.
+On `localhost` they are open, like the dashboard. On other hosts, they answer `404` unless `DEBUG_STATE` is `true`, and then they need `Authorization: Bearer <device or viewer public key>`. They show SFU session IDs, so turn them on only while you test.
+
+```sh
+curl -H "Authorization: Bearer <public key>" https://<your host>/sfu/debug/devices/<device ID>
+```
 
 ## Logs
 

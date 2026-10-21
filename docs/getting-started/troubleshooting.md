@@ -46,3 +46,4 @@ Common errors, and how to fix them. Errors from the token API come as `{ "error"
 | --- | --- |
 | `/sfu/admin/` answers `404` on a deployed worker | Set up [Access or ADMIN_KEY](../deployment/dashboard.md). |
 | `/sfu/debug/*` answers `404` on a deployed worker | Set `DEBUG_STATE` to `true`. See [Debug pages](../deployment/dashboard.md#debug-pages). |
+| `/sfu/debug/*` answers `401 key_required` on a deployed worker | Send a device or viewer public key. See [Debug pages](../deployment/dashboard.md#debug-pages). |

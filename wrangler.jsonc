@@ -43,7 +43,7 @@
     "MAX_DEVICES_PER_ROOM": "16",
     "MAX_ROOMS_PER_DEVICE": "4",
     "MAX_MICROPHONES_PER_ROOM": "10",
-    // "true" opens /sfu/debug/* on this host. It is always open on localhost.
+    // "true" opens /sfu/debug/* on this host, with a public key. They are open on localhost.
     "DEBUG_STATE": "false"
   },
   "observability": { "enabled": true },
