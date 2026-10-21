@@ -1,6 +1,6 @@
 # Connect pi-webrtc
 
-Stream a Raspberry Pi or a Jetson camera to the worker with [pi-webrtc](https://github.com/mazupo/pi-webrtc). First install pi-webrtc on the device. See its [Getting Started](https://github.com/mazupo/pi-webrtc/blob/main/docs/getting-started/README.md).
+Stream a Raspberry Pi or a Jetson camera to the worker with [pi-webrtc](https://github.com/mazupo/pi-webrtc). First install pi-webrtc on the device. See its [Getting Started](https://mazupo.com/docs/pi-webrtc/getting-started).
 
 ## Run on the device
 
@@ -25,9 +25,9 @@ The log shows `Connected to the Cloudflare worker`. The device now waits, and st
 ## Watch it
 
 - **Viewer page**: open `/sfu/` on the worker, and join the same room. Check **Enable IPC** to send messages.
-- **Web app**: use `CloudflareRoom` from [@mazupo/client](https://github.com/mazupo/client-sdk-js/blob/main/docs/reference/cloudflare-room.md).
+- **Web app**: use `CloudflareRoom` from [@mazupo/client](https://mazupo.com/docs/client-sdk-js/reference/cloudflare-room).
 
 ## More
 
-- Data channels, voice and log messages: see [SFU](https://github.com/mazupo/pi-webrtc/blob/main/docs/signaling/sfu.md#cloudflare-realtime) in the pi-webrtc docs.
+- Data channels, voice and log messages: see [SFU](https://mazupo.com/docs/pi-webrtc/signaling/sfu#cloudflare-realtime) in the pi-webrtc docs.
 - If it does not connect, see [Troubleshooting](troubleshooting.md).
