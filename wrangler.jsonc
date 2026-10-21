@@ -5,7 +5,7 @@
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
   // The demo pages are static. Only /sfu/* runs the Worker.
-  // Generates src/proto from the protocol submodule, then bundles the demo pages into public/js.
+  // Generates src/proto and bundles the demo pages.
   "build": {
     "command": "npm run build",
     "watch_dir": ["src", "demo", "external/protocol/protos"]
@@ -47,9 +47,7 @@
     "DEBUG_STATE": "false"
   },
   "observability": { "enabled": true },
-  // Secrets (wrangler secret put): REALTIME_SFU_APP_ID, REALTIME_SFU_BEARER_TOKEN,
-  // DEVICE_PRIVATE_KEY, VIEWER_PRIVATE_KEY, and optionally REALTIME_TURN_KEY_ID and
-  // REALTIME_TURN_KEY_API_TOKEN. See .dev.vars.example.
+  // Secrets: see .dev.vars.example.
   "env": {
     // The mazupo deployment: `wrangler deploy --env mazupo`. Other deployments can ignore it.
     // It repeats the settings above; `npm run check` checks that they match.

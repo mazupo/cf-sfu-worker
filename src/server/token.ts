@@ -1,11 +1,6 @@
 import { claimsSchema, type Claims, type Grant, type Role } from "../shared/protocol";
 
-/**
- * Access tokens are JWTs signed with Ed25519 (alg EdDSA). Each role has its own key pair:
- * the private key is a Worker secret, and the public key is what clients send as
- * `Authorization: Bearer <public key>` to get a token. The header's `kid` names the role.
- * The public key itself never goes into a token.
- */
+/** Access tokens are EdDSA JWTs, one key pair per role; `kid` names the role. The public key is never in a token. */
 
 type RoleKeys = {
   publicKey: string;
@@ -88,7 +83,7 @@ export async function signToken(
   return `${input}.${base64UrlEncode(new Uint8Array(signature))}`;
 }
 
-/** Checks the signature, the role and the expiry. Single use is checked by the target DO. */
+/** Checks the signature, the role and the expiry. The target DO checks single use. */
 export async function verifyToken(env: Env, token: string): Promise<{ role: Role; claims: Claims }> {
   const parts = token.split(".");
   if (parts.length !== 3 || token.length > 4096) {
@@ -134,7 +129,7 @@ function timingSafeEqual(a: string, b: string): boolean {
   return crypto.subtle.timingSafeEqual(left, right);
 }
 
-/** What a token carries instead of the client's secret: its SHA-256, base64url. */
+/** Tokens carry the secret's SHA-256 (base64url), not the secret. */
 export async function hashSecret(secret: string): Promise<string> {
   return base64UrlEncode(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(secret))));
 }

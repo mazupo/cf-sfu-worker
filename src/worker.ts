@@ -36,10 +36,7 @@ app.use(TOKEN_PATH, (c, next) =>
   })(c, next),
 );
 
-/**
- * Trades a public key for a 30 s, single-use access token. The IDs and rooms go in the body,
- * so the public key never appears in a URL.
- */
+/** Trades a public key for a 30 s, single-use access token. The key goes in a header, never in a URL. */
 app.post(TOKEN_PATH, async (c) => {
   const ip = c.req.header("cf-connecting-ip") ?? "unknown";
   if (c.env.TOKEN_LIMITER) {
@@ -110,7 +107,7 @@ app.post(TOKEN_PATH, async (c) => {
   }
 });
 
-/** Opens a device or viewer socket. The token decides which Durable Object gets it. */
+/** Opens a device or viewer socket in the Durable Object the token names. */
 app.get(SOCKET_PATH, async (c) => {
   if (upgradeRequired(c.req.raw)) return error(c, 426, "upgrade_required", "Open a WebSocket.");
   const token = c.req.query("access_token");
@@ -128,7 +125,7 @@ app.get(SOCKET_PATH, async (c) => {
   const { role, claims } = verified;
 
   const headers = new Headers(c.req.raw.headers);
-  // Header values must be ASCII, and viewer IDs may hold any letters.
+  // Header values must be ASCII; viewer IDs may hold any letters.
   headers.set(CLAIMS_HEADER, encodeURIComponent(JSON.stringify(claims)));
   const forwarded = new Request(c.req.raw.url, { headers });
   const stub =
@@ -138,8 +135,7 @@ app.get(SOCKET_PATH, async (c) => {
 
 app.get("/sfu/health", (c) => c.json({ service: "cf-sfu-worker", ok: true }));
 
-// Debug views of the Durable Objects for the demo pages. They show SFU session IDs, so they
-// answer only on localhost, or when DEBUG_STATE is "true", and only with a public key.
+// Debug views of the Durable Objects. They show SFU session IDs: localhost or DEBUG_STATE only, with a public key.
 app.get("/sfu/debug/rooms/:roomId", async (c) => {
   const denied = await debugDenied(c);
   if (denied) return denied;
@@ -157,12 +153,12 @@ app.get("/sfu/debug/devices/:deviceId", async (c) => {
   return c.json({ device }, 200, { "Cache-Control": "no-store" });
 });
 
-// The dashboard: every room this worker serves. See adminAuth for who may read it.
+// The dashboard: every room this worker serves. See adminAuth.
 app.get("/sfu/admin/rooms", async (c) => {
   const admin = await adminAuth(c);
   if ("denied" in admin) return admin.denied;
   const rooms = await c.env.REGISTRY.getByName(REGISTRY_NAME).rooms();
-  // A device can be in several rooms. Count it once, live if any room sees it live.
+  // Count each device once, live if any room sees it live.
   const devices = new Map<string, boolean>();
   for (const room of rooms) {
     for (const device of room.devices) devices.set(device.deviceId, devices.get(device.deviceId) === true || device.state === "live");
@@ -191,7 +187,7 @@ app.get("/sfu/admin/rooms/:roomId", async (c) => {
   return c.json(await roomDetails(c.env, roomId.data), 200, { "Cache-Control": "no-store" });
 });
 
-// The demo pages and the dashboard live under /sfu/ too, so they deploy with the route.
+// The demo pages and the dashboard are under /sfu/ too, so they deploy with the route.
 app.get("/sfu/*", async (c) => {
   const asset = await c.env.ASSETS.fetch(c.req.raw);
   return asset.status === 404 ? error(c, 404, "route_not_found", "Unknown path.") : asset;
@@ -199,7 +195,7 @@ app.get("/sfu/*", async (c) => {
 
 app.all("/sfu/*", (c) => error(c, 404, "route_not_found", "Unknown path."));
 
-// On workers.dev and localhost, the pages' old addresses.
+// Short addresses for the pages on workers.dev and localhost.
 app.get("/", (c) => c.redirect("/sfu/"));
 app.get("/device", (c) => c.redirect("/sfu/device"));
 app.get("/dashboard", (c) => c.redirect("/sfu/admin/"));
@@ -225,7 +221,7 @@ async function debugDenied(c: Context<App>): Promise<Response | null> {
   try {
     role = bearer ? await roleForPublicKey(c.env, bearer) : null;
   } catch (err) {
-    // A private key is missing, as for the token API.
+    // A private key is missing.
     if (err instanceof TokenError) return error(c, 503, err.code, err.message);
     throw err;
   }
@@ -257,10 +253,9 @@ type AdminAuth = { mode: "access"; email: string | null } | { mode: "key" } | { 
 
 /**
  * Who may read /sfu/admin/*:
- * - With ACCESS_TEAM_DOMAIN and ACCESS_AUD, only requests Cloudflare Access let in. ADMIN_KEY no
- *   longer opens it, so there is no way around the sign-in.
- * - Otherwise, with ADMIN_KEY, whoever sends that key.
- * - Otherwise, only localhost.
+ * - with ACCESS_TEAM_DOMAIN and ACCESS_AUD, only Access sign-ins (ADMIN_KEY is ignored);
+ * - otherwise, with ADMIN_KEY, whoever sends it;
+ * - otherwise, only localhost.
  */
 async function adminAuth(c: Context<App>): Promise<{ auth: AdminAuth } | { denied: Response }> {
   const access = accessSettings(c.env);
@@ -281,7 +276,7 @@ async function adminAuth(c: Context<App>): Promise<{ auth: AdminAuth } | { denie
   return { auth: { mode: "key" } };
 }
 
-/** Compares in constant time, so the answer time says nothing about the key. */
+/** Compares in constant time. */
 async function sameSecret(given: string, expected: string): Promise<boolean> {
   const encoder = new TextEncoder();
   const [a, b] = await Promise.all([
@@ -296,7 +291,7 @@ function allowedOrigin(env: Env, origin: string): string | null {
     .split(",")
     .map((value) => value.trim().replace(/\/+$/, ""))
     .filter(Boolean);
-  // `*` is safe here: nothing authenticates with cookies.
+  // `*` is safe: nothing uses cookies.
   if (allowed.includes("*")) return "*";
   return allowed.includes(origin) ? origin : null;
 }

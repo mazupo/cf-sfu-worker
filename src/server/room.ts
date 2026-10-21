@@ -65,12 +65,12 @@ type ViewerRow = {
   data_transport: typeof DATA_NONE | typeof DATA_READY;
   /** The microphone's mid in the viewer's own session, while it publishes one. */
   mic_mid: string | null;
-  /** Counts its microphone publications, so others can tell a new one from the last. */
+  /** Counts microphone publications, so others can tell a new one from the last. */
   mic_generation: number;
   muted: number;
-  /** 1 while its microphone offer waits for the SFU: it holds a place under the room's limit. */
+  /** 1 while its microphone offer waits for the SFU: it holds a place under the limit. */
   mic_pending: number;
-  /** The hash of the secret it joined with. Only a token with the same one resumes or replaces it. */
+  /** The hash of the secret it joined with. Only the same one resumes or replaces it. */
   secret_hash: string | null;
 };
 
@@ -78,7 +78,7 @@ type DataSubscriptionRow = {
   viewer_id: string;
   device_id: string;
   generation: number;
-  /** The device's session the channels were pulled from, needed to change canReply. */
+  /** The device session the channels come from, needed to change canReply. */
   device_session: string;
   channels: string;
   can_reply: number;
@@ -152,19 +152,15 @@ const SCHEMA = `
   ) WITHOUT ROWID;
 `;
 
-/**
- * One instance per room_id. Keeps the member list and the room's viewers: their sockets,
- * their SFU sessions for receiving, and what each one subscribed to. Each viewer has its own
- * queue, so one viewer waiting on the SFU does not hold up the others.
- */
+/** One per room_id: its members, and its viewers' sockets, SFU sessions and subscriptions. */
 export class Room extends DurableObject<Env> {
   private readonly config: Settings;
   private readonly queue = new KeyedQueue();
-  /** Tables exist only while the room has members or viewers. */
+  /** The tables exist only while the room has members or viewers. */
   private ready: boolean;
-  /** Receive sessions started at join time, by viewer_id. The first subscribe picks one up. */
+  /** Receive sessions started at join, by viewer_id. The first subscribe takes one. */
   private readonly earlySessions = new Map<string, Promise<string | null>>();
-  /** A report to the Registry is on its way for the current burst of changes. */
+  /** A report to the Registry is on its way for this burst of changes. */
   private reportQueued = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -174,11 +170,10 @@ export class Room extends DurableObject<Env> {
     this.ready = tableExists(ctx.storage.sql, "members");
     if (this.ready) {
       addMissingColumns(ctx.storage.sql);
-      // A new instance has no request running, so no microphone offer is waiting.
+      // A new instance runs no request, so no microphone offer waits.
       ctx.storage.sql.exec("UPDATE viewers SET mic_pending = 0 WHERE mic_pending = 1");
     }
-    // A deploy drops every socket without a close event. Hibernation keeps them, so no sockets
-    // here means they are gone: count the viewers as disconnected from now, so they can resume.
+    // A deploy drops sockets without a close. No sockets: the viewers are away from now, so they can resume.
     if (this.ready && ctx.getWebSockets().length === 0) {
       ctx.storage.sql.exec("UPDATE viewers SET socket_closed_at = ? WHERE socket_closed_at IS NULL", Date.now());
     }
@@ -200,9 +195,7 @@ export class Room extends DurableObject<Env> {
     return this.ctx.storage.sql;
   }
 
-  // -------------------------------------------------------------------------
   // RPC from Device
-  // -------------------------------------------------------------------------
 
   async addMember(deviceId: string): Promise<AddMemberResult> {
     this.ensureSchema();
@@ -242,7 +235,7 @@ export class Room extends DurableObject<Env> {
     await this.deleteIfEmpty();
   }
 
-  /** The device hands its control to this viewer. Returns false when the viewer cannot take it. */
+  /** The device hands its control to this viewer. False when the viewer cannot take it. */
   async grantControl(deviceId: string, viewerId: string): Promise<boolean> {
     if (!this.ready) return false;
     return this.queue.run(viewerId, async () => {
@@ -259,7 +252,7 @@ export class Room extends DurableObject<Env> {
     });
   }
 
-  /** Takes canReply back, e.g. when the viewer did not confirm control in time. */
+  /** Takes canReply back, e.g. the viewer did not confirm in time. */
   async revokeControl(deviceId: string, viewerId: string, timedOut: boolean): Promise<void> {
     if (!this.ready) return;
     await this.queue.run(viewerId, async () => {
@@ -279,7 +272,7 @@ export class Room extends DurableObject<Env> {
     });
   }
 
-  /** Returns whether this room still wants updates from the device. */
+  /** Returns whether this room still wants the device's updates. */
   async deviceChanged(deviceId: string, info: DeviceInfo): Promise<{ watching: boolean }> {
     if (!this.ready || !this.isMember(deviceId) || this.viewerCount() === 0) return { watching: false };
     this.sql.exec(
@@ -293,9 +286,7 @@ export class Room extends DurableObject<Env> {
     return { watching: true };
   }
 
-  // -------------------------------------------------------------------------
   // Viewer socket
-  // -------------------------------------------------------------------------
 
   override async fetch(request: Request): Promise<Response> {
     if (upgradeRequired(request)) return jsonError(426, "upgrade_required", "Open a WebSocket.");
@@ -309,8 +300,7 @@ export class Room extends DurableObject<Env> {
       return jsonError(401, "token_used", "The access token was already used. Request a new one.");
     }
 
-    // Asked first, before anything changes. Between closing the old socket and accepting this
-    // one, only watchAll() waits, when the room was empty; onSocketGone() skips the old socket.
+    // Asked first: between closing the old socket and accepting this one, only watchAll() may wait.
     const ice = await iceServers(this.env);
 
     const viewerId = claims.sub;
@@ -329,8 +319,7 @@ export class Room extends DurableObject<Env> {
       if (!resumable) {
         await this.dropViewer(viewerId);
       } else if (viewer.data_channels && !claims.grant.dataChannels) {
-        // Resumed without data channels: it gives up its control, and the SFU closes them in the
-        // background, since the old PeerConnection is usually gone.
+        // Resumed without data channels: give up control, and let the SFU close them in the background.
         await this.dropData(viewerId, false, true);
       }
       viewer = this.viewer(viewerId);
@@ -360,8 +349,7 @@ export class Room extends DurableObject<Env> {
         claims.grant.secretHash,
       );
     }
-    // Devices are waking now. Create the receive session meanwhile, so the first subscribe
-    // needs one SFU call less.
+    // Devices are waking now. Create the receive session meanwhile, saving the first subscribe an SFU call.
     if (!viewer?.sfu_session_id && !this.earlySessions.has(viewerId)) {
       this.earlySessions.set(viewerId, new RealtimeSfu(this.env).createSession().catch(() => null));
     }
@@ -385,7 +373,7 @@ export class Room extends DurableObject<Env> {
       },
     });
     this.broadcastViewers(server);
-    // A viewer that dropped while an offer was pending gets the same offer again.
+    // A viewer that dropped with an offer pending gets it again.
     if (resumed && viewer?.negotiating && viewer.pending_offer) {
       sendViewer(server, {
         offer: { sdp: viewer.pending_offer, tracks: this.subscriptions(viewerId), sessionReset: false },
@@ -462,8 +450,7 @@ export class Room extends DurableObject<Env> {
     if (!attachment || !this.ready) return;
     if (this.ctx.getWebSockets(attachment.viewerId).some((other) => other !== ws)) return;
     const viewer = this.viewer(attachment.viewerId);
-    // Gone, or the socket of an earlier viewer with this ID that someone else took over: its
-    // close can come while the new one is joining.
+    // Gone, or an older socket of this ID that someone else took over.
     if (!viewer || attachment.connectedAt < viewer.created_at) return;
     const now = Date.now();
     this.sql.exec(
@@ -574,9 +561,7 @@ export class Room extends DurableObject<Env> {
       result = await sfu.addTracks(sessionId, remote);
     } catch (error) {
       if (!(error instanceof SfuError && error.sessionGone)) throw error;
-      // The session expired, e.g. it was made at join time and nothing was live for a long
-      // time. The viewer has to start a new PeerConnection for the new one, and send its own
-      // offer again for the data channel transport.
+      // The session expired, e.g. made at join and idle for long. The viewer starts a new PeerConnection.
       this.forgetSession(viewerId);
       sessionId = await this.newSession(sfu, viewerId);
       sessionReset = true;
@@ -628,11 +613,7 @@ export class Room extends DurableObject<Env> {
     sendViewer(ws, { subscribed: this.subscribed(viewerId) });
   }
 
-  /**
-   * The viewer's own offer, with only an m=application section. The SFU answers it at once: one SFU
-   * call, no renegotiate. The viewer connects only once the SFU has the whole exchange, which avoids
-   * most DTLS waits, and it connects while the devices wake. Data channels need this transport.
-   */
+  /** The viewer's own offer, with only m=application. One SFU call, and it connects while the devices wake. */
   private async onViewerOffer(ws: WebSocket, viewerId: string, message: SubscribeOffer): Promise<void> {
     const parsed = viewerOfferSchema.safeParse(message);
     if (!parsed.success) {
@@ -646,9 +627,7 @@ export class Room extends DurableObject<Env> {
     }
     let viewer = this.viewer(viewerId)!;
     if (viewer.data_transport === DATA_READY || viewer.negotiating) {
-      // A new PeerConnection: the last one failed, e.g. the SFU was out of reach for a while or
-      // did not take its answer. Viewers send their own offer only from a new one. It gets a new
-      // session and subscribes again. Whatever the old one was negotiating is void.
+      // The last PeerConnection failed: a new session, and the viewer subscribes again.
       this.forgetSession(viewerId);
       viewer = this.viewer(viewerId)!;
     }
@@ -664,7 +643,7 @@ export class Room extends DurableObject<Env> {
     try {
       answer = await sfu.establishDataChannels(sessionId, parsed.data.sdp);
     } catch (error) {
-      // A session made at join time can expire before the offer. One with tracks cannot be replaced here.
+      // A session made at join can expire before the offer. One with tracks cannot be replaced here.
       if (!(error instanceof SfuError && error.sessionGone) || this.subscriptions(viewerId).length > 0) throw error;
       sessionId = await this.newSession(sfu, viewerId);
       answer = await sfu.establishDataChannels(sessionId, parsed.data.sdp);
@@ -673,11 +652,7 @@ export class Room extends DurableObject<Env> {
     sendViewer(ws, { answer: { sdp: answer.sdp } });
   }
 
-  /**
-   * Publishes the viewer's microphone on its own session, so the other viewers can pull it: an
-   * offer of the viewer's with the microphone in `tracks`. The offer carries the whole
-   * PeerConnection, and the SFU answers it at once. Whether it starts muted came with `mute`.
-   */
+  /** Publishes the viewer's microphone: its offer with the microphone in `tracks`. `mute` set the start state. */
   private async onMicrophone(ws: WebSocket, viewerId: string, sdp: string, mid: string): Promise<void> {
     const viewer = this.viewer(viewerId)!;
     if (viewer.data_transport !== DATA_READY || !viewer.sfu_session_id) {
@@ -692,8 +667,7 @@ export class Room extends DurableObject<Env> {
       this.failMicrophone(ws, ErrorCode.ERROR_CODE_BUSY, "This PeerConnection already publishes a microphone.");
       return;
     }
-    // Offers still waiting for the SFU count too: each viewer runs in its own queue, so two can
-    // be here at once.
+    // Offers still waiting for the SFU count too: two viewers' queues can be here at once.
     const speakers = this.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM viewers WHERE mic_mid IS NOT NULL OR mic_pending = 1")
       .one().n;
@@ -735,7 +709,7 @@ export class Room extends DurableObject<Env> {
     this.tellDevicesSoon();
   }
 
-  /** Before a microphone is published, it only sets the state the microphone starts in. */
+  /** Before a microphone is published, it sets the state the microphone starts in. */
   private onMute(viewerId: string, message: Mute): void {
     this.sql.exec("UPDATE viewers SET muted = ? WHERE viewer_id = ?", message.muted ? 1 : 0, viewerId);
     if (this.viewer(viewerId)?.mic_mid) this.broadcastViewers();
@@ -801,7 +775,7 @@ export class Room extends DurableObject<Env> {
     }
   }
 
-  /** Closes the viewer's channels to these devices. A controller gives up its control. */
+  /** Closes the viewer's channels to these devices. A controller gives up control. */
   private async unsubscribeData(viewer: ViewerRow, deviceIds: string[]): Promise<void> {
     const sfu = new RealtimeSfu(this.env);
     for (const deviceId of new Set(deviceIds)) {
@@ -814,11 +788,7 @@ export class Room extends DurableObject<Env> {
     await this.releaseViewer(viewer.viewer_id, deviceIds);
   }
 
-  /**
-   * Closes the viewer's channels to a device at the SFU. A viewer with canReply gives it up too:
-   * otherwise the SFU takes about 5 s to give it to the next viewer. Both calls go at once, since
-   * each takes about 5 s when the viewer's PeerConnection is already gone.
-   */
+  /** Closes the viewer's channels to a device and gives up canReply. Both at once: each can take ~5 s. */
   private async closeData(sfu: RealtimeSfu, sessionId: string, sub: DataSubscriptionRow): Promise<void> {
     const ids = (JSON.parse(sub.channels) as DataChannel[]).map((channel) => channel.id);
     await Promise.allSettled([
@@ -854,8 +824,7 @@ export class Room extends DurableObject<Env> {
     }
     const { deviceId } = parsed.data;
     const sub = this.dataSubscription(viewerId, deviceId);
-    // Stop this viewer's messages before the next one takes over. If the SFU fails, give up the
-    // control anyway, so the viewers waiting are not stuck behind it.
+    // Stop this viewer's messages before the next one takes over. On an SFU failure, give up control anyway.
     if (sub?.can_reply) {
       await this.setCanReply(viewerId, sub, false).catch((error) => {
         console.log(JSON.stringify({ event: "revoke_failed", room: this.roomId, deviceId, code: error instanceof SfuError ? error.code : "internal" }));
@@ -928,7 +897,7 @@ export class Room extends DurableObject<Env> {
     this.finishNegotiation(ws, viewerId, result, false);
   }
 
-  /** Sends the SFU's offer when it needs an answer, otherwise confirms the subscriptions. */
+  /** Sends the SFU's offer when it needs an answer, else confirms the subscriptions. */
   private finishNegotiation(ws: WebSocket, viewerId: string, result: TracksResponse, sessionReset: boolean): void {
     const tracks = this.subscriptions(viewerId);
     if (result.requiresImmediateRenegotiation && result.sessionDescription?.type === "offer") {
@@ -949,9 +918,7 @@ export class Room extends DurableObject<Env> {
     return sessionId;
   }
 
-  // -------------------------------------------------------------------------
   // Alarm
-  // -------------------------------------------------------------------------
 
   override async alarm(): Promise<void> {
     if (!this.ready) return;
@@ -988,7 +955,7 @@ export class Room extends DurableObject<Env> {
       if (!open) await this.dropViewer(viewer_id);
     }
 
-    // Keep telling the devices that this room is still watching.
+    // Keep telling the devices that this room still watches.
     if (this.viewerCount() > 0) {
       const stale = this.sql
         .exec<{ device_id: string }>(
@@ -1006,11 +973,9 @@ export class Room extends DurableObject<Env> {
     await this.scheduleAlarm(now);
   }
 
-  // -------------------------------------------------------------------------
   // Helpers
-  // -------------------------------------------------------------------------
 
-  /** Everything this object holds, for the local debug page. Includes SFU session IDs. */
+  /** Everything this object holds, for the debug page. Includes SFU session IDs. */
   async debugState() {
     const now = Date.now();
     if (!this.ready) {
@@ -1091,7 +1056,7 @@ export class Room extends DurableObject<Env> {
         mid: row.mid,
         generation: row.generation,
         viewerId: row.mic_of ?? "",
-        // Only a device's pull of a microphone needs the room: a viewer's are all in its own.
+        // Only a device's pull of a microphone needs the room.
         room: "",
       }));
   }
@@ -1120,7 +1085,7 @@ export class Room extends DurableObject<Env> {
     return { tracks: this.subscriptions(viewerId), data: this.dataSubscriptions(viewerId) };
   }
 
-  /** Viewers in this room that receive a track or the data channels of the device. */
+  /** Viewers here that receive a track or the data channels of the device. */
   private subscribedViewers(deviceId: string): string[] {
     return this.sql
       .exec<{ viewer_id: string }>(
@@ -1133,10 +1098,7 @@ export class Room extends DurableObject<Env> {
       .map((row) => row.viewer_id);
   }
 
-  /**
-   * The device counts a viewer from its first successful resolve. Once the viewer gets nothing from
-   * the device (it unsubscribed, left, or its subscribe failed), the device stops counting it.
-   */
+  /** The device counts a viewer from its first resolve, and stops once the viewer gets nothing from it. */
   private async releaseViewer(viewerId: string, deviceIds: Iterable<string>): Promise<void> {
     // A microphone's subscription has no device.
     const done = [...new Set(deviceIds)].filter((deviceId) => deviceId && !this.isSubscribedTo(viewerId, deviceId));
@@ -1163,17 +1125,11 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("DELETE FROM members WHERE device_id = ?", deviceId);
     this.sql.exec("DELETE FROM devices WHERE device_id = ?", deviceId);
     this.sql.exec("DELETE FROM data_subscriptions WHERE device_id = ?", deviceId);
-    // Its tracks stay until each viewer unsubscribes them, so the SFU closes them too. The device
-    // forgets its generation once it has left, so mark them with 0, which no publication has:
-    // when it comes back, they never pass for its new tracks.
+    // Its tracks stay until each viewer unsubscribes. Generation 0 never matches its new tracks.
     this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE device_id = ?", deviceId);
   }
 
-  /**
-   * Closes and forgets the viewer's data channels. Unless `keepControl`, each device then drops it
-   * from its control state, and the next one waiting takes over. With `background`, the SFU
-   * closes them meanwhile: without the viewer's PeerConnection, each call takes about 5 s.
-   */
+  /** Closes the viewer's data channels; unless `keepControl`, also its control. `background`: don't wait. */
   private async dropData(viewerId: string, keepControl = false, background = false): Promise<string[]> {
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
     const sessionId = this.viewer(viewerId)?.sfu_session_id;
@@ -1193,16 +1149,11 @@ export class Room extends DurableObject<Env> {
     await Promise.allSettled(subs.map((sub) => this.closeData(sfu, sessionId, sub)));
   }
 
-  /**
-   * The viewer's PeerConnection and SFU session are done with: its tracks and channels go with
-   * them. It keeps its control and its place in the devices' counts, because it subscribes again
-   * on the next session, which its next offer starts.
-   */
+  /** The viewer's PeerConnection and session are done. It keeps control and counts, and subscribes again. */
   private forgetSession(viewerId: string): void {
     const viewer = this.viewer(viewerId);
     const hadMicrophone = Boolean(viewer?.mic_mid);
-    // The old session's channels close in the background: with its PeerConnection gone, each
-    // call takes about 5 s, and the new offer's answer should not wait for them.
+    // The old channels close in the background: each call can take ~5 s.
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
     if (viewer?.sfu_session_id && subs.length > 0) void this.closeAllData(viewer.sfu_session_id, subs);
     this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
@@ -1258,8 +1209,7 @@ export class Room extends DurableObject<Env> {
     for (const deviceId of await this.dropData(viewerId, true)) affected.add(deviceId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM viewers WHERE viewer_id = ?", viewerId);
-    // Others' pulls of its microphone stay until they unsubscribe, so the SFU closes them too.
-    // Its generations start over if it joins again: mark them with 0, which no publication has.
+    // Others' pulls of its microphone stay until they unsubscribe. Generation 0 never matches a new one.
     this.sql.exec("UPDATE subscriptions SET generation = 0 WHERE mic_of = ?", viewerId);
     this.broadcastViewers();
     if (hadMicrophone) this.tellDevicesSoon();
@@ -1267,8 +1217,7 @@ export class Room extends DurableObject<Env> {
       .exec<{ device_id: string }>("SELECT device_id FROM members")
       .toArray()
       .map((row) => row.device_id);
-    // Every device takes it out of its control state: between PeerConnections it has no channels,
-    // yet it may still control a device. Its channels closed first, so the next one gets canReply fast.
+    // Between PeerConnections it has no channels but may still control a device, so each device drops it.
     if (licensed) {
       await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
     }
@@ -1276,12 +1225,12 @@ export class Room extends DurableObject<Env> {
       await this.releaseViewer(viewerId, affected);
       return;
     }
-    // Nobody is watching any more. Each device sleeps after its linger time.
+    // Nobody watches any more. Each device sleeps after its linger time.
     await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).unwatch(this.roomId)));
     this.sql.exec("DELETE FROM devices");
   }
 
-  /** Sends to the viewer's open sockets; there is one unless a replaced one is still closing. */
+  /** Sends to the viewer's open sockets: one, unless a replaced one is still closing. */
   private sendTo(viewerId: string, message: ViewerResponse): void {
     for (const ws of this.ctx.getWebSockets(viewerId)) {
       if (ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
@@ -1289,7 +1238,7 @@ export class Room extends DurableObject<Env> {
   }
 
   private broadcast(message: ViewerResponse, except?: WebSocket): void {
-    // Whatever viewers hear about, the dashboard wants too.
+    // The dashboard wants whatever viewers hear about.
     this.reportSoon();
     for (const ws of this.ctx.getWebSockets()) {
       if (ws !== except && ws.readyState === WebSocket.OPEN) sendViewer(ws, message);
@@ -1308,13 +1257,13 @@ export class Room extends DurableObject<Env> {
     }, 0);
   }
 
-  /** For the Registry. Null once the room is empty and its storage is gone. */
+  /** For the Registry. Null once the room is empty. */
   private summary(): RoomSummary | null {
     if (!this.ready) return null;
     const viewers = this.sql
       .exec<{ data_channels: number; socket_closed_at: number | null }>("SELECT data_channels, socket_closed_at FROM viewers")
       .toArray();
-    // The room keeps a device's state only while someone watches.
+    // The room knows a device's state only while someone watches.
     const devices = this.sql
       .exec<{ device_id: string; info: string | null }>(
         "SELECT m.device_id, d.info FROM members m LEFT JOIN devices d ON d.device_id = m.device_id ORDER BY m.device_id",
@@ -1359,11 +1308,7 @@ export class Room extends DurableObject<Env> {
       .map((row) => ({ viewerId: row.viewer_id, sessionId: row.sfu_session_id!, generation: row.mic_generation }));
   }
 
-  /**
-   * Tells every device in the room which microphones to play, without holding up the caller. One
-   * update at a time, each with the list as it is when it starts, so every device ends on the latest.
-   * The key cannot be a viewer ID: those have no colon.
-   */
+  /** Tells every device which microphones to play, in the background. The key has a colon, unlike viewer IDs. */
   private tellDevicesSoon(): void {
     void this.queue.run("devices:voices", async () => {
       if (!this.ready) return;
@@ -1376,7 +1321,7 @@ export class Room extends DurableObject<Env> {
     });
   }
 
-  /** Tells the viewers who is in the room now. `except` already has it, e.g. in its joined. */
+  /** Tells the viewers who is in the room. `except` already knows, e.g. from its joined. */
   private broadcastViewers(except?: WebSocket): void {
     this.broadcast({ viewers: { viewers: this.viewerInfos() } }, except);
   }
@@ -1389,12 +1334,12 @@ export class Room extends DurableObject<Env> {
     sendViewer(ws, { error: signalError({ code, message, request, deviceId }) });
   }
 
-  /** A microphone offer failed: the viewer rolls it back and only listens, or tries again later. */
+  /** A microphone offer failed: the viewer rolls it back and only listens, or tries later. */
   private failMicrophone(ws: WebSocket, code: ErrorCode, message: string): void {
     sendViewer(ws, { error: signalError({ code, message, request: "offer", trackName: MICROPHONE_TRACK }) });
   }
 
-  /** An error for one device, track or microphone of a subscribe. The rest of the request goes on. */
+  /** An error for one device, track or microphone of a subscribe. The rest goes on. */
   private failTrack(
     ws: WebSocket,
     fields: { code: ErrorCode; message: string; deviceId?: string; viewerId?: string; trackName?: string; retryable?: boolean },
@@ -1436,10 +1381,7 @@ export class Room extends DurableObject<Env> {
   }
 }
 
-/**
- * For the debug view. away: the socket closed and the viewer may still resume. joined: no SFU
- * session yet. ready: it has one.
- */
+/** For the debug view: away (may still resume), joined (no SFU session yet) or ready. */
 function viewerState(viewer: ViewerRow): "away" | "negotiating" | "joined" | "ready" {
   if (viewer.socket_closed_at !== null) return "away";
   if (viewer.negotiating) return "negotiating";
@@ -1460,7 +1402,7 @@ function offlineInfo(deviceId: string): DeviceInfo {
   };
 }
 
-/** Tables made before the microphone columns get them. A room keeps its tables while it is in use. */
+/** Tables made before the microphone columns get them. */
 function addMissingColumns(sql: SqlStorage): void {
   const columns = (table: string) =>
     new Set(sql.exec<{ name: string }>(`SELECT name FROM pragma_table_info('${table}')`).toArray().map((row) => row.name));

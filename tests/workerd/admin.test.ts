@@ -106,7 +106,7 @@ describe("dashboard behind Cloudflare Access", () => {
       .sign(options.key ?? keys.privateKey);
   }
 
-  /** The worker with Access turned on. The team domain is given without https://, as people often do. */
+  /** Access turned on, with the team domain given without https://. */
   async function viaAccess(path: string, headers: Record<string, string> = {}): Promise<Response> {
     network.use(http.get(`${TEAM}/cdn-cgi/access/certs`, () => HttpResponse.json({ keys: [jwk] })));
     const ctx = createExecutionContext();

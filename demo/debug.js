@@ -1,5 +1,4 @@
-// "Server state" panel for the demo pages. Reads /sfu/debug/* every 2 s while the panel
-// is open. Those routes answer on localhost, or when the worker has DEBUG_STATE=true.
+// "Server state" panel: reads /sfu/debug/* every 2 s while open. On localhost, or with DEBUG_STATE=true.
 
 import { ago as agoAt, clock, duration } from "./time.js";
 
@@ -16,7 +15,7 @@ const SOCKET_STATES = ["connecting", "open", "closing", "closed"];
 export function startDebugPanel({ panel, body, updated, url, key, intervalMs = 2000 }) {
   let timer = null;
   let running = false;
-  // The body is rebuilt on every refresh, so remember what the user opened and scrolled.
+  // The body is rebuilt on every refresh, so remember what was opened and scrolled.
   const raw = { open: false, scrollTop: 0 };
 
   async function refresh() {
@@ -35,7 +34,7 @@ export function startDebugPanel({ panel, body, updated, url, key, intervalMs = 2
       } else if (!response.ok) {
         body.replaceChildren(note(json.error?.message ?? `Request failed (${response.status}).`));
       } else if (selecting(body)) {
-        // Rebuilding would drop the selection, so wait until the user has copied it.
+        // Rebuilding would drop the selection, so wait until it is copied.
         updated.textContent = "paused while text is selected";
       } else {
         raw.scrollTop = body.querySelector("details.raw pre")?.scrollTop ?? raw.scrollTop;
@@ -141,7 +140,7 @@ function viewerTable(room) {
   );
 }
 
-/** One line per track, then one per device whose data channels the viewer has, marked when it controls that device. */
+/** One line per track, then one per device with data channels, marked when it controls it. */
 function subscriptionList(viewer) {
   const list = document.createElement("div");
   for (const sub of viewer.subscriptions) list.append(line(`${sub.deviceId}/${sub.trackName} mid ${sub.mid}`));
@@ -193,7 +192,7 @@ function note(text) {
   return Object.assign(document.createElement("p"), { className: "empty", textContent: text });
 }
 
-/** Long IDs, such as SFU sessions and random viewer IDs, show their first 8 characters. */
+/** Long IDs show their first 8 characters. */
 function short(id) {
   if (!id) return "—";
   const text = String(id);

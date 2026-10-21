@@ -47,7 +47,7 @@ const SLEEPING = DeviceState.DEVICE_STATE_SLEEPING;
 const WAKING = DeviceState.DEVICE_STATE_WAKING;
 const LIVE = DeviceState.DEVICE_STATE_LIVE;
 
-/** The publishing state that survives hibernation. Offline is computed from the socket. */
+/** The publishing state, kept across hibernation. Offline comes from the socket. */
 type PublishState = typeof SLEEPING | typeof WAKING | typeof LIVE;
 
 type DeviceRow = {
@@ -67,11 +67,11 @@ type DeviceRow = {
   last_seen: number;
   disconnected_at: number | null;
   offline_notified: number;
-  /** The hash of the secret it connected with. Only a token with the same one replaces a live connection. */
+  /** The hash of the secret it connected with. Only the same one replaces a live connection. */
   secret_hash: string | null;
 };
 
-/** `joined` is false until the socket got `joined`; sockets from before it have none. */
+/** `joined` is false until the socket gets `joined`; older sockets have none. */
 type SocketAttachment = { connectedAt: number; joined?: boolean };
 
 export type WatchResult = { member: boolean; info: DeviceInfo };
@@ -85,15 +85,15 @@ export type ControlResult = { ok: true } | { ok: false; code: ErrorCode; message
 /** A viewer's microphone that a room wants its devices to play. */
 export type RoomMicrophone = { viewerId: string; sessionId: string; generation: number };
 
-/** A room's microphone as this device keeps it; with a mid once pulled into its session. */
+/** A room's microphone as this device keeps it, with a mid once pulled. */
 type VoiceRow = { room_id: string; viewer_id: string; session_id: string; generation: number };
 type VoicePullRow = VoiceRow & { mid: string };
 type VoiceState = { enabled: number; offer_sent_at: number | null; retry_at: number | null };
 
-/** Who may send to the device through its data channels. Survives new publications. */
+/** Who may send to the device. It survives new publications. */
 type ControlState = {
   controller: ViewerRef | null;
-  /** Handed control; has until `deadline` to confirm with control_ready. */
+  /** Handed control; must send control_ready before `deadline`. */
   handover: (ViewerRef & { deadline: number }) | null;
   /** In line, first one next. */
   waiting: ViewerRef[];
@@ -142,7 +142,7 @@ const SCHEMA = `
   ) WITHOUT ROWID;
 `;
 
-/** The viewers' voices. Separate, so devices stored before them get the tables on start. */
+/** The viewers' voices. Separate, so older devices get the tables on start. */
 const VOICE_SCHEMA = `
   -- The microphones each room wants the device to play, as the room last sent them.
   CREATE TABLE IF NOT EXISTS voices (
@@ -170,40 +170,33 @@ const VOICE_SCHEMA = `
   );
 `;
 
-/**
- * One instance per device_id. Owns the device's socket and presence, its SFU publisher session,
- * and when the device should publish: it sends `wake` when a room starts watching and `sleep`
- * once no room has watched for IDLE_LINGER_SECONDS.
- */
+/** One per device_id: its socket, presence and SFU session. `wake` when a room watches, `sleep` when none does. */
 export class Device extends DurableObject<Env> {
   private readonly config: Settings;
   private readonly queue = new KeyedQueue();
-  /** Tables exist from the first connection until the device has left every room and is forgotten. */
+  /** The tables exist until the device has left every room and is forgotten. */
   private ready: boolean;
-  /** The SFU session started together with `wake`, so the offer needs one SFU call instead of two. */
+  /** The SFU session started with `wake`, so the offer needs one SFU call, not two. */
   private earlySession: Promise<string | null> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.config = settings(env);
-    // Devices send "ping" every 15 s. The runtime answers without waking this object.
+    // The runtime answers "ping" without waking this object.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ready = tableExists(ctx.storage.sql, "device");
     if (this.ready) {
       ctx.storage.sql.exec(VOICE_SCHEMA);
-      // A device stored before secrets gets the column; its next connection fills it.
+      // Devices stored before secrets get the column; the next connection fills it.
       const columns = ctx.storage.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('device')").toArray();
       if (!columns.some((column) => column.name === "secret_hash")) {
         ctx.storage.sql.exec("ALTER TABLE device ADD COLUMN secret_hash TEXT");
       }
     }
-    // A deploy drops the socket without a close event. Hibernation keeps it, so no socket here
-    // means it is gone: count the device as disconnected from now, so it has the usual grace
-    // time to reconnect before viewers see it offline.
+    // A deploy drops sockets without a close. No socket: disconnected from now, with the usual grace time.
     if (this.ready && ctx.getWebSockets().length === 0) {
       ctx.storage.sql.exec("UPDATE device SET disconnected_at = ? WHERE disconnected_at IS NULL", Date.now());
-      // No alarm may be set, e.g. it was connected and nobody watched it. Without one it would
-      // never go offline or leave its rooms.
+      // There may be no alarm. Without one the device would never go offline or leave its rooms.
       void ctx.blockConcurrencyWhile(() => this.scheduleAlarm(Date.now()));
     }
   }
@@ -218,9 +211,7 @@ export class Device extends DurableObject<Env> {
     return this.ctx.storage.sql;
   }
 
-  // -------------------------------------------------------------------------
   // Socket
-  // -------------------------------------------------------------------------
 
   override async fetch(request: Request): Promise<Response> {
     if (upgradeRequired(request)) return jsonError(426, "upgrade_required", "Open a WebSocket.");
@@ -245,25 +236,23 @@ export class Device extends DurableObject<Env> {
     }
     if (!stored) this.createRow(now);
 
-    // A newer connection with the same secret wins, and so does any once the old one stopped pinging.
+    // A newer connection with the same secret wins, and so does any once the old one stops pinging.
     for (const old of this.ctx.getWebSockets()) {
       console.log(JSON.stringify({ event: "device_replaced", deviceId: this.deviceId }));
       closeSocket(old, CloseCode.CLOSE_CODE_REPLACED, "Another connection uses the same device_id.");
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
-    // Accepted at once, so the old socket's close does not count as the device leaving. Nothing
-    // goes to it before `joined`: socket() skips it until then.
+    // Accepted at once, so the old socket's close is not a leave. socket() skips it until `joined`.
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment({ connectedAt: now, joined: false } satisfies SocketAttachment);
 
     const [{ errors: roomErrors, left }, ice] = await Promise.all([this.updateRooms(claims, now), iceServers(this.env)]);
     if (left.length > 0) await this.queue.run("control", () => this.removeFromControl((ref) => left.includes(ref.room)));
-    // Nothing below waits until `joined` is sent, so no other request can come in between.
+    // Nothing below awaits before `joined` is sent, so no request comes in between.
     const row = this.row()!;
 
-    // Keep the publication only when the same publisher reconnects its socket: it sends the
-    // generation of the answer its PeerConnection uses.
+    // Keep the publication only when the same publisher reconnects, with its answer's generation.
     const continuing =
       (row.state === WAKING || row.state === LIVE) &&
       row.sfu_session_id !== null &&
@@ -276,7 +265,7 @@ export class Device extends DurableObject<Env> {
     row.secret_hash = claims.grant.secretHash;
     this.save(row);
 
-    // `joined` comes first: the device needs its ICE servers before a wake.
+    // `joined` first: the device needs its ICE servers before a wake.
     sendDevice(server, {
       joined: {
         deviceId: this.deviceId,
@@ -334,7 +323,7 @@ export class Device extends DurableObject<Env> {
     // A heartbeat timeout already set it to the last ping.
     row.disconnected_at ??= now;
     if (code === 1000 || code === 1001) {
-      // The device closed on purpose, e.g. it shut down or changed its ID.
+      // A close on purpose, e.g. it shut down or changed its ID.
       await this.leaveRooms(row);
     } else {
       this.save(row);
@@ -342,10 +331,7 @@ export class Device extends DurableObject<Env> {
     await this.scheduleAlarm(now);
   }
 
-  /**
-   * The device closed its socket on purpose, or sent nothing for DEVICE_GONE_MS. It leaves its
-   * rooms, so viewers do not keep an offline tile for it. It joins them again when it reconnects.
-   */
+  /** A close on purpose, or silence for DEVICE_GONE_MS: leave the rooms. It joins again on reconnect. */
   private async leaveRooms(row: DeviceRow): Promise<void> {
     const rooms = this.rooms(row);
     this.resetPublication(row);
@@ -365,8 +351,7 @@ export class Device extends DurableObject<Env> {
       return;
     }
     const { sdp, tracks, dataChannels, voices } = parsed.data;
-    // Any offer while waking or live will do, even one sent before the latest wake: it comes
-    // from the same device, which uses only the reply to its last offer.
+    // Any offer while waking or live will do: the device uses only the reply to its last offer.
     const before = this.row();
     if (!before || before.state === SLEEPING) {
       this.fail(ws, ErrorCode.ERROR_CODE_WAKE_STALE, "The device was put to sleep.", "offer");
@@ -382,7 +367,7 @@ export class Device extends DurableObject<Env> {
       try {
         result = await sfu.addTracks(sessionId, local, { type: "offer", sdp });
       } catch (error) {
-        // A session made at wake time can expire if the offer comes late. Start a new one.
+        // A session made at wake time can expire if the offer is late. Start a new one.
         if (!(early && error instanceof SfuError && error.sessionGone)) throw error;
         sessionId = await sfu.createSession();
         result = await sfu.addTracks(sessionId, local, { type: "offer", sdp });
@@ -395,20 +380,19 @@ export class Device extends DurableObject<Env> {
         throw new SfuError("sfu_answer_missing", "The SFU did not answer the offer.", 502);
       }
 
-      // The device may have been put to sleep while the SFU call was running.
+      // The device may have gone to sleep during the SFU call.
       const row = this.row();
       if (!row || row.state === SLEEPING) {
         this.fail(ws, ErrorCode.ERROR_CODE_WAKE_STALE, "The device was put to sleep.", "offer");
         return;
       }
-      // The device is live once it says its PeerConnection is connected ("ready"). Until then
-      // the SFU has no packets for these tracks, and viewers would get not_found_track_error.
+      // Live only after "ready": until then the SFU has no packets, and viewers would get not_found_track_error.
       const now = Date.now();
       row.state = WAKING;
       row.generation += 1;
       row.sfu_session_id = sessionId;
       row.tracks = JSON.stringify(tracks.map((track) => track.trackName));
-      // A new session: the last publication's channels are gone with its session.
+      // A new session: the last publication's channels are gone.
       row.channels = "[]";
       row.data_channels = dataChannels ? 1 : 0;
       row.wake_deadline = now + this.config.wakeTimeoutMs;
@@ -422,9 +406,7 @@ export class Device extends DurableObject<Env> {
       if (!this.hasWatchers(now)) this.startLinger(now);
       void this.notifyRoomsSoon();
       await this.scheduleAlarm(now);
-      // The SFU answers this once the device's PeerConnection is connected. The device's
-      // ready waits behind it in the queue, so the device goes live with its channels. If it
-      // takes too long, e.g. the SFU is out of reach for a while, ready tries again.
+      // The SFU answers once the PeerConnection connects. ready waits behind it, and retries if it is slow.
       if (dataChannels) await this.openChannels(ws, sessionId, false);
     } catch (error) {
       const code = error instanceof SfuError ? error.code : "publish_failed";
@@ -434,10 +416,7 @@ export class Device extends DurableObject<Env> {
     }
   }
 
-  /**
-   * Publishes _lossy and _reliable on the device's session and sends their ids. Only the `last`
-   * try tells the device when it fails.
-   */
+  /** Publishes _lossy and _reliable and sends their ids. Only the `last` try reports a failure. */
   private async openChannels(ws: WebSocket, sessionId: string, last: boolean): Promise<void> {
     let channels: DataChannel[];
     try {
@@ -462,11 +441,11 @@ export class Device extends DurableObject<Env> {
     const row = this.row();
     if (!row) return;
     if (row.state === SLEEPING) {
-      // This publication ended while the device was not looking, e.g. its wake timed out.
+      // This publication ended meanwhile, e.g. its wake timed out.
       sendDevice(ws, { sleep: {} });
       return;
     }
-    // Waking with no answer yet: the wake went out after this ready, and the device starts over.
+    // Waking with no answer yet: the wake came after this ready, and the device starts over.
     if (!row.sfu_session_id || row.state === LIVE) return;
     if (row.data_channels && (JSON.parse(row.channels) as DataChannel[]).length === 0) {
       // They did not open after the answer. The PeerConnection is connected now, so the SFU answers at once.
@@ -486,15 +465,13 @@ export class Device extends DurableObject<Env> {
     this.save(row);
     void this.notifyRoomsSoon();
     await this.scheduleAlarm(now);
-    // Behind this in the queue: the device's PeerConnection is connected, so it can take an offer.
+    // Behind this in the queue: the PeerConnection is connected, so it can take an offer.
     this.syncVoicesSoon();
   }
 
-  // -------------------------------------------------------------------------
   // The viewers' voices: their microphones, pulled into the device's session
-  // -------------------------------------------------------------------------
 
-  /** The device's answer to the SFU's offer for the voices. Then the next change goes. */
+  /** The device's answer to the voices offer. Then the next change goes. */
   private async onVoicesAnswer(ws: WebSocket, message: SubscribeAnswer): Promise<void> {
     const parsed = sdpMessageSchema.safeParse(message);
     if (!parsed.success) {
@@ -522,11 +499,7 @@ export class Device extends DurableObject<Env> {
     void this.queue.run("publish", () => this.syncVoices());
   }
 
-  /**
-   * Pulls the microphones the rooms want into the device's session and closes the ones they no
-   * longer want, one SFU negotiation at a time: changes that come meanwhile wait for the device's
-   * answer. Only while live, with voices on, and with the device connected.
-   */
+  /** Pulls the microphones the rooms want, one negotiation at a time. Only while live, with voices on. */
   private async syncVoices(): Promise<void> {
     const row = this.row();
     const ws = this.socket();
@@ -539,7 +512,7 @@ export class Device extends DurableObject<Env> {
     const wantedKeys = new Set(wanted.map(key));
     const pulledKeys = new Set(pulled.map(key));
     const closing = pulled.filter((pull) => !wantedKeys.has(key(pull)));
-    // Microphones the SFU could not pull wait for their retry, so a failing one cannot loop.
+    // A microphone the SFU could not pull waits for its retry, so it cannot loop.
     const retrying = state.retry_at !== null && state.retry_at > Date.now();
     const adding = retrying ? [] : wanted.filter((voice) => !pulledKeys.has(key(voice)));
     if (closing.length === 0 && adding.length === 0) return;
@@ -564,7 +537,7 @@ export class Device extends DurableObject<Env> {
       await this.scheduleAlarm(Date.now());
       return;
     }
-    // The publication may have ended while the SFU call ran.
+    // The publication may have ended during the SFU call.
     if (this.row()?.sfu_session_id !== sessionId) return;
     if (closing.length > 0) {
       for (const pull of closing) this.sql.exec("DELETE FROM voice_pulls WHERE mid = ?", pull.mid);
@@ -633,7 +606,7 @@ export class Device extends DurableObject<Env> {
     );
   }
 
-  /** Plays no voices until the device publishes again, rather than pile up offers it cannot take. */
+  /** Plays no voices until the device publishes again, rather than pile up offers. */
   private stopVoices(message: string): void {
     console.log(JSON.stringify({ event: "voices_stopped", deviceId: this.deviceId, message }));
     this.sql.exec("UPDATE voice_state SET enabled = 0, offer_sent_at = NULL, retry_at = NULL WHERE id = 1");
@@ -659,15 +632,9 @@ export class Device extends DurableObject<Env> {
     }
   }
 
-  // -------------------------------------------------------------------------
   // RPC from Room
-  // -------------------------------------------------------------------------
 
-  /**
-   * A room has viewers. Records the interest, wakes the device and returns its state. `viewers`
-   * are the room's viewers that receive this device. Rows of other viewers are removed, unless
-   * they were counted so recently that their subscribe may still be running.
-   */
+  /** A room watches with these viewers: record them, wake the device and return its state. */
   async watch(roomId: string, viewers: string[]): Promise<WatchResult> {
     const now = Date.now();
     const row = this.row();
@@ -695,7 +662,7 @@ export class Device extends DurableObject<Env> {
     return { member: true, info: this.info(now) };
   }
 
-  /** The microphones a room wants this device to play. The room sends its whole list on each change. */
+  /** The microphones a room wants this device to play: the whole list on each change. */
   async hear(roomId: string, microphones: RoomMicrophone[]): Promise<void> {
     const row = this.row();
     if (!row || !this.rooms(row).includes(roomId)) return;
@@ -713,16 +680,13 @@ export class Device extends DurableObject<Env> {
     await this.scheduleAlarm(now);
   }
 
-  /** A viewer gets nothing from this device any more, so it stops counting toward the limit. */
+  /** A viewer gets nothing from this device any more, so it stops counting. */
   async release(roomId: string, viewerId: string): Promise<void> {
     if (!this.ready) return;
     this.sql.exec("DELETE FROM room_viewers WHERE room_id = ? AND viewer_id = ?", roomId, viewerId);
   }
 
-  /**
-   * Gives a room what it needs to pull this device's tracks, if the viewer limit allows, and counts
-   * the viewer. The check and the count happen in one step, so viewers asking at once queue here.
-   */
+  /** What a room needs to pull this device's tracks, if the viewer limit allows. Checks and counts in one step. */
   async resolve(roomId: string, viewerId: string): Promise<ResolveResult> {
     const now = Date.now();
     const row = this.row();
@@ -761,9 +725,7 @@ export class Device extends DurableObject<Env> {
     };
   }
 
-  // -------------------------------------------------------------------------
   // Control: one viewer at a time can send to the device (the SFU's canReply)
-  // -------------------------------------------------------------------------
 
   /** Controls the device if nobody does, or waits in line. */
   async takeControl(roomId: string, viewerId: string): Promise<ControlResult> {
@@ -793,7 +755,7 @@ export class Device extends DurableObject<Env> {
     });
   }
 
-  /** The viewer handed control has canReply and open channels, so the takeover is done. */
+  /** The new controller has canReply and open channels: the takeover is done. */
   async confirmControl(roomId: string, viewerId: string): Promise<ControlResult> {
     return this.queue.run("control", async () => {
       if (!this.ready) {
@@ -822,7 +784,7 @@ export class Device extends DurableObject<Env> {
     return this.info(Date.now());
   }
 
-  /** Everything this object holds, for the local debug page. Includes the SFU session ID. */
+  /** Everything this object holds, for the debug page. Includes the SFU session ID. */
   async debugState() {
     const now = Date.now();
     const row = this.row();
@@ -870,9 +832,7 @@ export class Device extends DurableObject<Env> {
     };
   }
 
-  // -------------------------------------------------------------------------
   // Alarm
-  // -------------------------------------------------------------------------
 
   override async alarm(): Promise<void> {
     const now = Date.now();
@@ -887,7 +847,7 @@ export class Device extends DurableObject<Env> {
       // Half-open connection: the socket exists but pings stopped.
       console.log(JSON.stringify({ event: "device_stale", deviceId: this.deviceId, silentMs: now - this.lastSeen(ws) }));
       closeSocket(ws, CloseCode.CLOSE_CODE_HEARTBEAT_TIMEOUT, "No ping received.");
-      // The device has been silent since its last ping, so the grace time is already over.
+      // Silent since its last ping, so the grace time is over.
       row.disconnected_at ??= this.lastSeen(ws);
     }
 
@@ -932,8 +892,7 @@ export class Device extends DurableObject<Env> {
     }
     this.save(row);
 
-    // Rooms are still watching but the device is not publishing. Try again on the next check,
-    // so viewers see the timeout first.
+    // Rooms still watch: try again on the next check, so viewers see the timeout first.
     const current = this.socket();
     if (!timedOut && this.hasWatchers(now) && row.state === SLEEPING && online && current) {
       this.startWake(current, now);
@@ -961,7 +920,7 @@ export class Device extends DurableObject<Env> {
     }
 
     row = this.row()!;
-    // Gone from every room: nothing here is needed any more, once no used token can come back.
+    // Gone from every room: forget it once no used token can come back.
     if (!this.connection() && this.rooms(row).length === 0 && this.tokensExpireAt() === null) {
       await this.ctx.storage.deleteAll();
       this.ready = false;
@@ -970,9 +929,7 @@ export class Device extends DurableObject<Env> {
     await this.scheduleAlarm(now);
   }
 
-  // -------------------------------------------------------------------------
   // Helpers
-  // -------------------------------------------------------------------------
 
   private fail(ws: WebSocket, code: ErrorCode, message: string, request: string): void {
     sendDevice(ws, { error: signalError({ code, message, request }) });
@@ -1033,7 +990,7 @@ export class Device extends DurableObject<Env> {
     return JSON.parse(row.rooms) as string[];
   }
 
-  /** Joins the rooms in the token and leaves the rooms that are no longer in it. */
+  /** Joins the token's rooms and leaves the others. */
   private async updateRooms(claims: Claims, now: number): Promise<{ errors: SignalError[]; left: string[] }> {
     const wanted = [...new Set(claims.grant.rooms)];
     const previous = this.rooms(this.row()!);
@@ -1063,7 +1020,7 @@ export class Device extends DurableObject<Env> {
       this.sql.exec("DELETE FROM voices WHERE room_id = ?", room);
     }
 
-    // Read again: a room's watch() may have changed the row meanwhile.
+    // Read again: a room's watch() may have changed the row.
     const row = this.row()!;
     row.rooms = JSON.stringify(joined);
     this.save(row);
@@ -1120,7 +1077,7 @@ export class Device extends DurableObject<Env> {
     this.earlySession = new RealtimeSfu(this.env).createSession().catch(() => null);
   }
 
-  /** The session started with this wake, or null when there is none (a retry, or the object restarted). */
+  /** The session started with this wake, or null (a retry, or the object restarted). */
   private async takeEarlySession(): Promise<string | null> {
     const early = this.earlySession;
     this.earlySession = null;
@@ -1134,10 +1091,7 @@ export class Device extends DurableObject<Env> {
     this.save(row);
   }
 
-  /**
-   * Forgets the current publication. The generation stays: it counts publications and goes up
-   * only with the next offer. Viewers drop their tracks because the state is no longer live.
-   */
+  /** Forgets the publication. The generation stays: it goes up with the next offer. */
   private resetPublication(row: DeviceRow): void {
     row.state = SLEEPING;
     row.wake_deadline = null;
@@ -1165,7 +1119,7 @@ export class Device extends DurableObject<Env> {
     return Math.max(pong, attachment?.connectedAt ?? 0);
   }
 
-  /** When the last used token may be forgotten, or null when none is kept. */
+  /** When the last used token may be forgotten, or null. */
   private tokensExpireAt(): number | null {
     return this.sql.exec<{ at: number | null }>("SELECT MAX(expires_at) AS at FROM used_tokens").one().at;
   }
@@ -1175,11 +1129,7 @@ export class Device extends DurableObject<Env> {
     return ws !== null && now - this.lastSeen(ws) <= this.config.deviceStaleMs;
   }
 
-  /**
-   * The device's connection: the newest open socket, joined or still joining, so rooms do not
-   * see a reconnecting device go offline. Whether the device is there goes by this one; messages
-   * go only to socket().
-   */
+  /** The newest open socket, joined or not. Presence uses it, so a reconnect does not look offline. */
   private connection(): WebSocket | null {
     const sockets = this.ctx.getWebSockets().filter((ws) => ws.readyState === WebSocket.OPEN);
     return sockets[sockets.length - 1] ?? null;
@@ -1225,10 +1175,7 @@ export class Device extends DurableObject<Env> {
     return state ? (JSON.parse(state) as ControlState) : { controller: null, handover: null, waiting: [] };
   }
 
-  /**
-   * Stores the control state, tells the device when the controller changed, and tells the rooms.
-   * A new handover asks the viewer's room to grant canReply, outside the control queue.
-   */
+  /** Stores the control state and tells the device and the rooms. A new handover asks for canReply. */
   private async saveControl(control: ControlState): Promise<void> {
     const before = this.control();
     this.sql.exec("INSERT OR REPLACE INTO control (id, state) VALUES (1, ?)", JSON.stringify(control));
@@ -1261,7 +1208,7 @@ export class Device extends DurableObject<Env> {
     if (next) control.handover = { ...next, deadline: handoverDeadline() };
   }
 
-  /** Asks the viewer's room to grant canReply. A viewer that cannot take it is skipped at once. */
+  /** Asks the viewer's room to grant canReply. A viewer that cannot take it is skipped. */
   private async offerControl(to: ViewerRef): Promise<void> {
     const granted = await this.env.ROOMS.getByName(to.room)
       .grantControl(this.deviceId, to.viewerId)
@@ -1270,7 +1217,7 @@ export class Device extends DurableObject<Env> {
       await this.queue.run("control", () => this.removeFromControl((ref) => sameViewer(ref, to)));
       return;
     }
-    // The viewer has canReply now. Its CONTROL_CONFIRM_MS start here, however long the SFU took.
+    // The viewer has canReply now. Its CONTROL_CONFIRM_MS start here.
     await this.queue.run("control", async () => {
       const control = this.control();
       if (!control.handover || !sameViewer(control.handover, to)) return;
@@ -1279,7 +1226,7 @@ export class Device extends DurableObject<Env> {
     });
   }
 
-  /** A handover that was not confirmed in time goes to the next one waiting. Returns who timed out. */
+  /** Moves an unconfirmed handover to the next one waiting. Returns who timed out. */
   private async expireHandover(now: number): Promise<ViewerRef | null> {
     const control = this.control();
     const handover = control.handover;
@@ -1291,18 +1238,14 @@ export class Device extends DurableObject<Env> {
     return { room: handover.room, viewerId: handover.viewerId };
   }
 
-  /**
-   * Tells the watching rooms about the current state without holding up the caller, so the
-   * device can go on with its offer while the rooms update. Updates go out one at a time and each
-   * reads the state when it starts, so every room ends on the latest state.
-   */
+  /** Tells the watching rooms in the background, one update at a time, so each ends on the latest state. */
   private notifyRoomsSoon(exceptRoom?: string): Promise<void> {
     return this.queue.run("notify", async () => {
       if (this.ready) await this.notifyRooms(Date.now(), exceptRoom);
     });
   }
 
-  /** Tells every watching room about the current state, except the room that asked. */
+  /** Tells every watching room, except the one that asked. */
   private async notifyRooms(now: number, exceptRoom?: string): Promise<void> {
     const info = this.info(now);
     const rooms = this.watchingRooms(now).filter((room) => room !== exceptRoom);
@@ -1329,8 +1272,7 @@ export class Device extends DurableObject<Env> {
     if (voice.retry_at !== null) candidates.push(voice.retry_at);
     const ws = this.connection();
     if (this.hasWatchers(now)) {
-      // Check again when the last ping turns stale, so a silent device shows offline about
-      // DEVICE_STALE_SECONDS after its last ping instead of up to a full check interval later.
+      // Check again when the last ping turns stale, so a silent device shows offline on time.
       const stale = ws ? this.lastSeen(ws) + this.config.deviceStaleMs + 1000 : Infinity;
       candidates.push(Math.min(now + PRESENCE_CHECK_MS, stale));
     } else if (ws) {
@@ -1347,7 +1289,7 @@ export class Device extends DurableObject<Env> {
       if (this.rooms(row).length > 0) {
         if (row.disconnected_at !== null) candidates.push(row.disconnected_at + DEVICE_GONE_MS);
       } else {
-        // Forget the device once the tokens it used have expired.
+        // Forget the device once its used tokens expire.
         candidates.push(this.tokensExpireAt() ?? now);
       }
     }
@@ -1363,7 +1305,7 @@ function sameViewer(a: ViewerRef | null | undefined, b: ViewerRef | null | undef
   return !!a && !!b && a.room === b.room && a.viewerId === b.viewerId;
 }
 
-/** A new handover's deadline: time for the room to grant canReply, then to confirm. The grant resets it. */
+/** A new handover's deadline: time to grant canReply, then to confirm. The grant resets it. */
 function handoverDeadline(): number {
   return Date.now() + CONTROL_GRANT_MS + CONTROL_CONFIRM_MS;
 }

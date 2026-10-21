@@ -523,8 +523,7 @@ describe("recovery", () => {
     await publishWithData(device);
     await info(v1, (device) => device.state === state_("live") && device.dataChannels);
 
-    // Its PeerConnection failed while the SFU was out of reach: the channels of its new session
-    // did not open after the answer.
+    // Its PeerConnection failed during an SFU outage: its new channels did not open after the answer.
     device.send("offer", { sdp: "v=0 publisher-offer", tracks: PUBLISH_TRACKS, dataChannels: true });
     expect(await device.next("answer")).toMatchObject({ generation: 2 });
     expect(await info(v1, (device) => device.generation === 2)).toMatchObject({ dataChannels: false });
