@@ -14,31 +14,28 @@ export type Settings = {
 
 /** How often a watched device or a room with viewers checks heartbeats. */
 export const PRESENCE_CHECK_MS = 60_000;
-/**
- * How often a connected device nobody watches checks its socket. A deploy or restart drops the
- * socket without a close event, and nothing else wakes the device to leave its rooms.
- */
+/** How often a connected, unwatched device checks its socket. A deploy drops sockets without a close. */
 export const UNWATCHED_CHECK_MS = 5 * 60_000;
 /** How long a room's interest in a device lasts, and how often the room renews it. */
 export const WATCH_LEASE_MS = 10 * 60_000;
 export const WATCH_RENEW_MS = 5 * 60_000;
-/** A renewal leaves alone viewers counted this recently: their subscribe may still be running. */
+/** Renewals keep viewers counted this recently: their subscribe may still run. */
 export const COUNT_GRACE_MS = 60_000;
-/** A device that dropped its socket shows as offline only after this grace period. */
+/** A device whose socket dropped shows offline after this. */
 export const DISCONNECT_GRACE_MS = 10_000;
-/** A device that sends no ping for this long, and did not close its socket, leaves its rooms as if it had. */
+/** A device silent this long without a close leaves its rooms. */
 export const DEVICE_GONE_MS = 60_000;
-/** How many times a wake is sent before the device is marked as not responding. */
+/** Wakes sent before the device counts as not responding. */
 export const WAKE_ATTEMPTS = 2;
-/** A viewer handed control of a device has this long to confirm with control_ready, from when it got canReply. */
+/** Time a new controller has to send control_ready after it gets canReply. */
 export const CONTROL_CONFIRM_MS = 5_000;
-/** How long the room may take to grant canReply at the SFU, before the confirm time starts. */
+/** Time the room may take to grant canReply at the SFU. */
 export const CONTROL_GRANT_MS = 10_000;
-/** A device answers the SFU's offer for the viewers' voices within this, or plays none until it publishes again. */
+/** Time a device has to answer the voices offer. After it, the device plays none until it publishes again. */
 export const VOICE_ANSWER_MS = 10_000;
-/** A microphone the SFU could not pull yet, e.g. its first packets are still on their way, is tried again after this. */
+/** Retry delay for a microphone the SFU cannot pull yet. */
 export const VOICE_RETRY_MS = 2_000;
-/** The track name of a viewer's microphone in its own SFU session. */
+/** The track name of a viewer's microphone. */
 export const MICROPHONE_TRACK = "microphone";
 
 export function settings(env: Env): Settings {

@@ -11,16 +11,13 @@ export type RoomSummary = {
   away: number;
   /** Viewers that joined with data channels. */
   ipcViewers: number;
-  /** Member devices. The Room knows a device's state only while someone watches it. */
+  /** Member devices. The state is known only while someone watches. */
   devices: { deviceId: string; state: string | null }[];
 };
 
 export type RegistryRoom = RoomSummary & { roomId: string; updatedAt: number };
 
-/**
- * Remembers which rooms have viewers or devices, for the dashboard. Durable Objects cannot list
- * their instances, so each Room reports here when it changes, and once a minute while it is in use.
- */
+/** Lists the rooms in use, for the dashboard. Durable Objects cannot be listed, so each Room reports here. */
 export class Registry extends DurableObject<Env> {
   private readonly sql: SqlStorage;
 
@@ -36,7 +33,7 @@ export class Registry extends DurableObject<Env> {
     );
   }
 
-  /** A room's latest state. `null`: the room is empty. */
+  /** A room's latest state, or null when it is empty. */
   async report(roomId: string, summary: RoomSummary | null): Promise<void> {
     if (!summary) {
       this.sql.exec("DELETE FROM rooms WHERE room_id = ?", roomId);

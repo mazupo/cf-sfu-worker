@@ -218,9 +218,7 @@ describe("voice", () => {
   });
 });
 
-// ---------------------------------------------------------------------------------------------
 // Devices play the viewers' voices
-// ---------------------------------------------------------------------------------------------
 
 const CAM = "cam-voice";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

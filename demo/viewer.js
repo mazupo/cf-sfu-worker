@@ -1,6 +1,4 @@
-// Demo viewer: joins one room, shows every device, and pulls each live device's tracks
-// through a single PeerConnection. All signaling happens on one WebSocket. With Enable IPC it
-// also opens each device's _lossy and _reliable, and can take control of a device to send to it.
+// Demo viewer: pulls a room's live devices through one PeerConnection. Enable IPC adds data and control.
 import {
   CLOSE_ID_IN_USE,
   CLOSE_REPLACED,
@@ -24,7 +22,7 @@ import {
 import { startDebugPanel } from "./debug.js";
 import { clock } from "./time.js";
 
-/** Errors that will not change for the same publication. Do not ask again. */
+/** Errors that do not change for the same publication. Do not ask again. */
 const PERMANENT = new Set([
   ErrorCode.ERROR_CODE_VIEWER_LIMIT,
   ErrorCode.ERROR_CODE_NOT_MEMBER,
@@ -37,7 +35,7 @@ const form = document.getElementById("join-form");
 const joinButton = document.getElementById("join");
 const leaveButton = document.getElementById("leave");
 const ipcInput = document.getElementById("ipc");
-// It has no name, so persistForm does not share it between tabs. Each tab keeps its own.
+// It has no name, so persistForm does not share it between tabs.
 const viewerIdInput = document.getElementById("viewer-id");
 const statusEl = document.getElementById("status");
 const tilesEl = document.getElementById("tiles");
@@ -58,7 +56,7 @@ viewerIdInput.addEventListener("input", () => {
   }
 });
 
-/** The one socket this tab uses. Events from any older socket are ignored. */
+/** The one socket this tab uses. Events from older sockets are ignored. */
 let socket = null;
 let connectSeq = 0;
 let reconnectTimer = null;
@@ -74,15 +72,12 @@ let pending = "tracks";
 let busyFailures = 0;
 /** This connection asked for data channels. Fixed until the next join. */
 let ipc = false;
-/**
- * Our own offers without an answer yet. Only the answer to the last one applies, and subscribing
- * waits until then.
- */
+/** Our offers without an answer yet. Only the last one's answer applies, and subscribing waits for it. */
 let ownOffers = 0;
 /** Own offers in a row the server could not take, for the backoff. */
 let offerFailures = 0;
 let rebuildTimer = null;
-/** Once a device is live the SFU is reachable, and the PeerConnection gets this long to connect. */
+/** Once a device is live the SFU is reachable; the PeerConnection gets this long to connect. */
 const CONNECT_GRACE_MS = 4_000;
 let connectCheck = null;
 /** A new PeerConnection after a session reset sends its own offer again. */
@@ -243,7 +238,7 @@ async function handle(frame) {
       attempt = 0;
       iceServers = message.iceServers;
       me = { room: message.room, viewerId: message.viewerId };
-      // An answer to an offer sent on the old socket is lost. Without it, start over.
+      // An answer to an offer sent on the old socket is lost. Start over.
       if (!message.resumed || !pc || ownOffers > 0) {
         ownOffers = 0;
         resetPeer(true);
@@ -269,7 +264,7 @@ async function handle(frame) {
       const next = new Map(message.devices.map((info) => [info.deviceId, devices.get(info.deviceId) ?? info]));
       devices.clear();
       for (const [id, info] of next) devices.set(id, info);
-      // A device that left counts its generations from 1 again when it comes back.
+      // A device that left counts its generations from 1 again.
       for (const list of [refused, retries, dataRetries]) {
         for (const id of list.keys()) if (!devices.has(id)) list.delete(id);
       }
@@ -282,7 +277,7 @@ async function handle(frame) {
       break;
     case "answer":
       ownOffers = Math.max(0, ownOffers - 1);
-      // The answer to an offer from a PeerConnection we have replaced since.
+      // The answer to an offer from a PeerConnection we replaced since.
       if (ownOffers > 0 || !pc) break;
       offerFailures = 0;
       await pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
@@ -369,11 +364,7 @@ async function onOffer(message) {
   attachTracks();
 }
 
-/**
- * Connects the PeerConnection with our own offer, like pi-webrtc does: any channel puts an
- * m=application section in it. The SFU answers at once, so the PeerConnection connects while the
- * devices wake, and tracks come later with the SFU's offers. Data channels need it too.
- */
+/** Connects with our own offer (m=application) while the devices wake. Tracks come with the SFU's offers. */
 async function connectEarly() {
   const peer = pc;
   ownOffers += 1;
@@ -386,11 +377,7 @@ async function connectEarly() {
   protocol.send(socket, "offer", { sdp: peer.localDescription.sdp });
 }
 
-/**
- * A device went live, so the SFU is reachable. A PeerConnection made during an SFU outage may never
- * connect, even while its ICE checks go on, and would only fail after about 15 s. Give it a few
- * seconds, then start over.
- */
+/** A device is live, so the SFU is reachable. A PeerConnection made during an outage may never connect. */
 function checkConnects() {
   if (connectCheck || !pc || pc.connectionState === "connected") return;
   const peer = pc;
@@ -400,11 +387,7 @@ function checkConnects() {
   }, CONNECT_GRACE_MS);
 }
 
-/**
- * Starts over with a new PeerConnection after the last one failed, e.g. the SFU was out of reach
- * for a while. Our offer gets it a new SFU session; requests for the old one are void, and we
- * subscribe again once it is answered. Control of devices stays with us.
- */
+/** A new PeerConnection after the last one failed: a new SFU session, then we subscribe again. Control stays. */
 function rebuildPeer() {
   clearTimeout(rebuildTimer);
   clearTimeout(connectCheck);
@@ -425,10 +408,9 @@ function scheduleSync(delay) {
   syncTimer = setTimeout(sync, delay);
 }
 
-/** Brings the subscriptions in line with the devices that are live. One request at a time. */
+/** Brings the subscriptions in line with the live devices. One request at a time. */
 function sync() {
-  // The SFU holds a subscribe until the PeerConnection is connected, and the server answers our
-  // requests one at a time. So wait: a request stuck there would hold up a new offer.
+  // The SFU holds a subscribe until the PeerConnection connects, which would hold up a new offer.
   if (busy || ownOffers > 0 || pc?.connectionState !== "connected" || socket?.readyState !== WebSocket.OPEN) return;
 
   // Tracks from a publication that ended: the device slept, restarted or left.
@@ -465,15 +447,14 @@ function sync() {
     return;
   }
 
-  // Data channels come after the media, so they never hold up the first picture. A device that
-  // published again gets new channels; subscribing again keeps its control.
+  // Data channels come after the media, so they never hold up the first picture. Subscribing again keeps control.
   if (ipc) {
     const wantedData = [];
     for (const info of devices.values()) {
       if (info.state !== LIVE || !info.dataChannels || !due(dataRetries, info)) continue;
       const current = dataSubs.get(info.deviceId);
       if (current?.generation === info.generation) continue;
-      // Close the old channels now, so their ids are free when the new ones arrive.
+      // Close the old channels now, so their ids are free for the new ones.
       if (current) closeChannels(info.deviceId);
       wantedData.push(info.deviceId);
     }
@@ -558,7 +539,7 @@ function resetPeer(create) {
     if (peer !== pc) return;
     log(`peer ${peer.connectionState}`);
     if (peer.connectionState === "connected") sync();
-    // ICE gave up. "disconnected" may still recover on its own; "failed" does not.
+    // "disconnected" may recover on its own; "failed" does not.
     if (peer.connectionState === "failed") rebuildPeer();
   });
 }
@@ -693,7 +674,7 @@ function createIpcBox(deviceId) {
 function renderControl(tile, info) {
   const { box, control, take, release, send } = tile.ipc;
   const current = dataSubs.get(info.deviceId);
-  // Spectators see who controls the device too; only IPC viewers get the window and the buttons.
+  // Spectators see who controls the device too; only IPC viewers get the window and buttons.
   box.hidden = !info.dataChannels && !info.controller && !current;
   const mine = sameViewer(info.controller, me);
   const takingOver = sameViewer(info.handover, me);

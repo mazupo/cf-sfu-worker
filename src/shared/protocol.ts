@@ -2,21 +2,15 @@ import { z } from "zod";
 
 import { DeviceState, ErrorCode, type DeviceInfo } from "../proto/cloudflare";
 
-/** Paths. The Worker only runs for /sfu/*; everything else is a static demo page. */
+/** Paths. The Worker runs only for /sfu/*; the rest are static pages. */
 export const TOKEN_PATH = "/sfu/token";
 export const SOCKET_PATH = "/sfu/rtc";
 
-/**
- * Device IDs and room IDs are locators, never credentials. They name Durable Objects and appear in
- * URLs, so they stay plain.
- */
+/** Device and room IDs name Durable Objects and appear in URLs, so they stay plain. */
 export const idSchema = z
   .string()
   .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, 'use 1 to 64 letters, digits, ".", "_" or "-", starting with a letter or digit');
-/**
- * A viewer ID is also a name people read, e.g. who controls a device: letters and digits in any
- * language, spaces, ".", "_" and "-". It names nothing and is never part of a URL.
- */
+/** A viewer ID is a name people read: letters in any language, digits, spaces, ".", "_" and "-". */
 export const viewerIdSchema = z
   .string()
   .regex(
@@ -24,21 +18,16 @@ export const viewerIdSchema = z
     'use 1 to 64 letters, digits, spaces, ".", "_" or "-", with no space at either end',
   );
 export const trackNameSchema = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
-/** The generation of the device's last answer. Sent again on a reconnect, it keeps the stream. */
+/** The generation of the device's last answer. Sent on a reconnect, it keeps the stream. */
 const generationSchema = z.number().int().min(1);
 
-/**
- * A random value the client makes once and keeps with its id. Only a connection with the same
- * secret can resume or replace a live one with that id. The token carries only its hash.
- */
+/** Made once by the client. Only the same secret can resume or replace a live id. Tokens carry only its hash. */
 const secretSchema = z.string().min(16, "use at least 16 random characters").max(128);
 
 const sdpSchema = z.string().min(1).max(64_000);
 const midSchema = z.string().min(1).max(32);
 
-// ---------------------------------------------------------------------------
 // Token API (JSON over HTTP)
-// ---------------------------------------------------------------------------
 
 export const deviceTokenRequestSchema = z.object({
   device_id: idSchema,
@@ -90,10 +79,7 @@ export type Claims = z.infer<typeof claimsSchema>;
 
 export type Role = "device" | "viewer";
 
-// ---------------------------------------------------------------------------
-// Socket messages. The types come from cloudflare.proto in mazupo/protocol; these schemas add
-// the rules protobuf cannot express, and run on the decoded messages.
-// ---------------------------------------------------------------------------
+// Socket messages: the rules protobuf cannot express, checked on the decoded messages.
 
 export const publishOfferSchema = z.object({
   sdp: sdpSchema,
@@ -110,10 +96,7 @@ export const subscribeSchema = z
   })
   .refine((message) => message.tracks.length > 0 || message.data.length > 0 || message.microphones.length > 0);
 
-/**
- * A viewer's own offer. With a track, it publishes the viewer's microphone: the whole offer, and
- * the microphone's m=audio.
- */
+/** A viewer's own offer. With a track, it also publishes the viewer's microphone. */
 export const viewerOfferSchema = z.object({
   sdp: sdpSchema,
   tracks: z.array(z.object({ trackName: z.literal("microphone"), mid: midSchema })).max(1),

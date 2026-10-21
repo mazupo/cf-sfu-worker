@@ -487,8 +487,7 @@ describe("watching", () => {
     const { device, viewer } = await liveDevice("cam-1", "lab-a", "v1");
     const restarted = await connect(await deviceToken("cam-1", ["lab-a"]));
     await restarted.next("wake");
-    // The old publication is over. `joined` came before the new wake, so the device has its
-    // ICE servers when it builds the PeerConnection.
+    // The old publication is over. `joined` came before the new wake, so the device has its ICE servers.
     expect(Object.keys(restarted.messages[0] ?? {})).toEqual(["joined"]);
     expect(await restarted.next("joined")).toMatchObject({ state: state_("sleeping"), generation: 1 });
     expect(await viewer.device("cam-1", "waking")).toMatchObject({ generation: 1, tracks: [] });

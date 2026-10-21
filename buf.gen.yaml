@@ -1,5 +1,4 @@
-# npm run proto: generates src/proto from the mazupo/protocol submodule. buf compiles the
-# protos itself, so no protoc install is needed.
+# npm run proto: generates src/proto from the protocol submodule. No protoc needed.
 version: v2
 inputs:
   - directory: external/protocol/protos

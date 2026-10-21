@@ -40,10 +40,7 @@ export function closeSocket(ws: WebSocket, code: number, reason: string): void {
   }
 }
 
-/**
- * Turns a connection away with a close code. A browser cannot read the status of a refused
- * upgrade, so the socket is opened only to be closed at once.
- */
+/** Opens the socket only to close it with the code: a browser cannot read a refused upgrade's status. */
 export function refuseSocket(code: number, reason: string): Response {
   const [client, server] = Object.values(new WebSocketPair()) as [WebSocket, WebSocket];
   server.accept();
@@ -61,7 +58,7 @@ export function decodeFrame<T>(codec: MessageFns<T>, data: string | ArrayBuffer)
   }
 }
 
-/** The oneof field that is set, as named in the proto, e.g. "take_control". Errors name the request they answer. */
+/** The oneof field that is set, as named in the proto, e.g. "take_control". */
 export function requestName(request: DeviceRequest | ViewerRequest): string {
   const name = Object.entries(request).find(([, value]) => value !== undefined)?.[0] ?? "";
   return name.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);

@@ -14,7 +14,7 @@ export class SfuError extends Error {
     this.name = "SfuError";
   }
 
-  /** The session no longer exists, so the caller has to start a new one. */
+  /** The session is gone: start a new one. */
   get sessionGone(): boolean {
     return this.status === 404 || this.status === 410;
   }
@@ -35,7 +35,7 @@ export type TracksResponse = {
   tracks?: Array<{ mid?: string; trackName?: string; sessionId?: string; errorCode?: string; errorDescription?: string }>;
 };
 
-/** The device's channels: pi-webrtc's IPC channels. Every endpoint uses the same settings. */
+/** The device's channels, as pi-webrtc's IPC uses them. */
 export const DATA_CHANNELS = [
   { dataChannelName: "_lossy", ordered: false, maxRetransmits: 0 },
   { dataChannelName: "_reliable", ordered: true },
@@ -54,7 +54,7 @@ type DataChannelsResponse = {
   dataChannels?: Array<{ id?: number; dataChannelName?: string; errorCode?: string; errorDescription?: string }>;
 };
 
-/** The device's two channels as the SFU sees them: published by the device, or pulled from it. */
+/** The device's two channels, published by the device or pulled from it. */
 export function deviceChannels(location: "local" | "remote", deviceSession?: string, canReply?: boolean): DataChannelObject[] {
   return DATA_CHANNELS.map((channel) => ({
     location,
@@ -63,10 +63,7 @@ export function deviceChannels(location: "local" | "remote", deviceSession?: str
   }));
 }
 
-/**
- * The Realtime SFU API. The bearer token is the app secret, so this client only ever runs
- * inside the Worker and its Durable Objects.
- */
+/** The Realtime SFU API. It holds the app secret, so it runs only in the Worker and its Durable Objects. */
 export class RealtimeSfu {
   private readonly base: string;
   private readonly token: string;
@@ -97,8 +94,7 @@ export class RealtimeSfu {
       `/sessions/${encodeURIComponent(sessionId)}/tracks/new`,
       sessionDescription ? { sessionDescription, tracks } : { tracks },
     );
-    // Per-track errors stay in the response. The other tracks may have succeeded, and the
-    // response can still carry an offer that has to be answered.
+    // Per-track errors stay in the body: other tracks may have worked, and an offer may still need an answer.
     return body;
   }
 
@@ -109,7 +105,7 @@ export class RealtimeSfu {
     });
   }
 
-  /** Answers a viewer's own offer: it adds the data channel transport to the session. */
+  /** Answers a viewer's own offer, adding the data channel transport. */
   async establishDataChannels(sessionId: string, sdp: string): Promise<SessionDescription> {
     const body = await this.request<TracksResponse>(
       "POST",
@@ -125,7 +121,7 @@ export class RealtimeSfu {
     return body.sessionDescription;
   }
 
-  /** Publishes or pulls channels and returns their ids in this session, in request order. */
+  /** Publishes or pulls channels. Returns their ids in request order. */
   async addDataChannels(sessionId: string, channels: DataChannelObject[]): Promise<DataChannel[]> {
     const body = await this.request<DataChannelsResponse>(
       "POST",
@@ -196,7 +192,7 @@ export class RealtimeSfu {
         throw new SfuError("sfu_response_invalid", "The SFU returned a response that is not JSON.", 502);
       }
     }
-    // The SFU can report an error inside a 2xx response.
+    // The SFU can report an error in a 2xx response.
     const errorCode = typeof parsed.errorCode === "string" ? parsed.errorCode : undefined;
     if (!response.ok || errorCode) {
       throw new SfuError(
@@ -209,7 +205,7 @@ export class RealtimeSfu {
   }
 }
 
-/** TURN credentials last a day. Everyone in this isolate shares them for an hour. */
+/** TURN credentials last a day. The isolate shares them for an hour. */
 const TURN_TTL_SECONDS = 86_400;
 const TURN_REUSE_MS = 60 * 60 * 1000;
 let turnCache: { keyId: string; servers: IceServer[]; expiresAt: number } | null = null;
@@ -222,12 +218,12 @@ export async function iceServers(env: Env): Promise<IceServer[]> {
   const now = Date.now();
   if (turnCache?.keyId === keyId && turnCache.expiresAt > now) return turnCache.servers;
   const servers = await turnServers(keyId, apiToken);
-  // Only good answers are kept, so the next join asks again after a failure.
+  // Keep only good answers, so the next join asks again after a failure.
   if (servers) turnCache = { keyId, servers, expiresAt: now + TURN_REUSE_MS };
   return servers ?? DEFAULT_ICE_SERVERS;
 }
 
-/** Asks the TURN API for credentials. Null when it fails or takes too long: joins wait for it. */
+/** TURN credentials, or null when the API fails or is slow: joins wait for it. */
 async function turnServers(keyId: string, apiToken: string): Promise<IceServer[] | null> {
   try {
     const response = await fetch(
@@ -243,7 +239,7 @@ async function turnServers(keyId: string, apiToken: string): Promise<IceServer[]
     type TurnServer = { urls: string | string[]; username?: string; credential?: string };
     const body = await response.json<{ iceServers?: TurnServer[] | TurnServer }>();
     const servers = Array.isArray(body.iceServers) ? body.iceServers : body.iceServers ? [body.iceServers] : [];
-    // Browsers time out on port 53, so leave those URLs out.
+    // Browsers time out on port 53.
     const usable = servers
       .map((server) => ({
         urls: (Array.isArray(server.urls) ? server.urls : [server.urls]).filter((url) => !/:53(\?|$)/.test(url)),

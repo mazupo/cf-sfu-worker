@@ -1,6 +1,4 @@
-// Shared helpers for the demo pages. Socket messages are protobuf (cloudflare.proto in
-// mazupo/protocol); esbuild bundles the generated code into public/js. IPC messages on the data
-// channels are pi-webrtc's protocol.Packet (packet.proto).
+// Shared helpers for the demo pages. Socket messages are protobuf; IPC messages are pi-webrtc's Packet.
 import {
   CloseCode,
   DeviceRequest,
@@ -15,7 +13,7 @@ import { clock } from "./time.js";
 
 export { DeviceState, ErrorCode };
 
-/** The device's channels and the delivery settings every end must use (see cloudflare.proto). */
+/** The device's channels and the settings every end must use. */
 const CHANNEL_OPTIONS = {
   _lossy: { ordered: false, maxRetransmits: 0 },
   _reliable: { ordered: true },
@@ -33,7 +31,7 @@ export function encodeIpc(text) {
   return Packet.encode(Packet.fromPartial({ raw: new TextEncoder().encode(text) })).finish();
 }
 
-/** The text of an IPC message, or a note when it is something this page does not show. */
+/** The text of an IPC message, or a note for one this page does not show. */
 export function decodeIpc(data) {
   try {
     const packet = Packet.decode(new Uint8Array(data));
@@ -60,7 +58,7 @@ export const PING_INTERVAL_MS = 15_000;
 export const CLOSE_REPLACED = CloseCode.CLOSE_CODE_REPLACED;
 export const CLOSE_ID_IN_USE = CloseCode.CLOSE_CODE_ID_IN_USE;
 
-/** A random secret for the token request. Only a connection with it can take the place of ours. */
+/** A random secret for the token request. Only it can take our place. */
 export function newSecret() {
   return [...crypto.getRandomValues(new Uint8Array(16))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -77,11 +75,7 @@ export async function requestToken(workerUrl, publicKey, body) {
   return json;
 }
 
-/**
- * Calls onTick every intervalMs from a dedicated worker. When a tab is hidden for a few
- * minutes, browsers run its timers only once a minute, which is longer than the worker's
- * 45 s presence window. Timers in a dedicated worker keep their pace.
- */
+/** Calls onTick every intervalMs from a dedicated worker: hidden tabs run their own timers once a minute. */
 function startTicker(intervalMs, onTick) {
   try {
     const source = `setInterval(() => postMessage(0), ${intervalMs});`;
@@ -107,10 +101,7 @@ export function openSocket(url, token) {
   return ws;
 }
 
-/**
- * Sends requests and reads responses as `{action, message}`, where action is the field set in
- * the protobuf message, e.g. send(ws, "offer", {...}) sends DeviceRequest { offer: {...} }.
- */
+/** Sends and reads `{action, message}`: send(ws, "offer", {...}) sends DeviceRequest { offer: {...} }. */
 function protocol(Request, Response) {
   return {
     send(ws, action, message = {}) {
@@ -143,7 +134,7 @@ export function errorName(code) {
   return (ErrorCode[code] ?? "unknown").replace("ERROR_CODE_", "").toLowerCase();
 }
 
-/** Remembers form values in this browser. Storage can be blocked, so failures are ignored. */
+/** Remembers form values in this browser. Storage may be blocked, so failures are ignored. */
 export function persistForm(form, storageKey) {
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) ?? "{}");

@@ -1,10 +1,8 @@
-// Dashboard: every room this worker serves, from /sfu/admin/*. Behind Cloudflare Access it
-// needs nothing more. Otherwise, when the worker has an ADMIN_KEY secret, enter it here; without
-// one, the dashboard answers on localhost only.
+// Dashboard: every room this worker serves. Needs Access, the ADMIN_KEY, or localhost.
 import { renderRoom } from "./debug.js";
 import { ago, clock } from "./time.js";
 
-/** A Durable Object busy with the SFU can take long to answer. The page keeps its last data meanwhile. */
+/** A Durable Object busy with the SFU can be slow. The page keeps its last data meanwhile. */
 const TIMEOUT_MS = 5000;
 const KEY_STORAGE = "cf-sfu-worker.adminKey";
 const EVERY_STORAGE = "cf-sfu-worker.refreshEvery";
@@ -42,7 +40,7 @@ everySelect.addEventListener("change", () => {
   schedule();
 });
 document.getElementById("refresh-now").addEventListener("click", () => refresh());
-// A hidden tab polls for nobody. Coming back shows fresh data, unless refreshing is off.
+// A hidden tab does not poll. Coming back shows fresh data, unless refreshing is off.
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && Number(everySelect.value) > 0) refresh();
   schedule();
@@ -59,7 +57,7 @@ document.getElementById("key-form").addEventListener("submit", (event) => event.
 
 function get(path) {
   const key = keyInput.value.trim();
-  // Makes Access answer 401 when its sign-in has expired, instead of redirecting to its login page.
+  // Access then answers 401 when its sign-in expired, instead of redirecting.
   const headers = { "X-Requested-With": "XMLHttpRequest" };
   if (key) headers.Authorization = `Bearer ${key}`;
   return fetch(`/sfu/admin${path}`, {
@@ -69,7 +67,7 @@ function get(path) {
   });
 }
 
-/** The room list. The details of open rooms load on their own, so a slow room holds up nothing. */
+/** The room list. Open rooms load their details on their own, so a slow room holds up nothing. */
 async function refresh() {
   if (listing) return;
   listing = true;
@@ -81,7 +79,7 @@ async function refresh() {
       return;
     }
     if (response.status === 401) {
-      // Ours carries an error code. Access's own 401 means its sign-in expired.
+      // Ours has an error code. Access's own 401 means its sign-in expired.
       showProblem(json.error?.code === "key_required"
         ? "Enter the worker's ADMIN_KEY."
         : "Your Cloudflare Access sign-in has expired. Reload the page to sign in again.");
@@ -125,7 +123,7 @@ async function loadDetails(roomId) {
   }
 }
 
-/** Behind Access the key is not used: show who signed in instead. */
+/** Behind Access the key is not used: show who signed in. */
 function showAuth(auth) {
   const access = auth?.mode === "access";
   keyField.hidden = access;
@@ -215,7 +213,7 @@ function total(label, value, notes = []) {
   return card;
 }
 
-/** "1 live / 2" and each device with its state, as far as the room knows it. */
+/** "1 live / 2" and each device's state, as far as the room knows it. */
 function deviceList(devices, live) {
   const wrap = document.createElement("div");
   wrap.append(Object.assign(document.createElement("div"), { textContent: `${live} live / ${devices.length}` }));
@@ -236,10 +234,7 @@ function cell(content) {
   return td;
 }
 
-/**
- * Each refresh is a Worker request and a Registry request, plus one Room request per open room,
- * so a longer interval saves requests.
- */
+/** Each refresh costs a Worker request, a Registry request and one per open room. */
 function schedule() {
   clearInterval(timer);
   timer = null;

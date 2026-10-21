@@ -5,10 +5,7 @@ export type AccessIdentity = { email: string | null };
 
 export type AccessSettings = { issuer: string; audience: string };
 
-/**
- * Access protects the dashboard when both ACCESS_TEAM_DOMAIN and ACCESS_AUD are set. The team
- * domain may be given with or without https://.
- */
+/** Access guards the dashboard when ACCESS_TEAM_DOMAIN and ACCESS_AUD are both set. */
 export function accessSettings(env: Env): AccessSettings | null {
   const domain = String(env.ACCESS_TEAM_DOMAIN ?? "").trim().replace(/\/+$/, "");
   const audience = String(env.ACCESS_AUD ?? "").trim();
@@ -16,14 +13,10 @@ export function accessSettings(env: Env): AccessSettings | null {
   return { issuer: domain.startsWith("https://") ? domain : `https://${domain}`, audience };
 }
 
-// One key set per team. jose keeps the keys and fetches them again when Access rotates them.
+// One key set per team. jose fetches the keys again when Access rotates them.
 const keySets = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
-/**
- * Checks the JWT Access puts in Cf-Access-Jwt-Assertion. The worker cannot rely on Access having
- * run: workers with static assets get no ctx.access, and the same worker may also answer on
- * workers.dev or a route Access does not cover.
- */
+/** Checks the Cf-Access-Jwt-Assertion JWT itself: the worker may answer on hosts Access does not cover. */
 export async function verifyAccess(token: string, settings: AccessSettings): Promise<AccessIdentity | null> {
   if (!token) return null;
   let keys = keySets.get(settings.issuer);

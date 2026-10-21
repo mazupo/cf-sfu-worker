@@ -1,7 +1,5 @@
-// Demo device: waits on the socket, publishes after "wake", stops after "sleep".
-// This is what pi-webrtc does on a real device. With Enable IPC it also opens _lossy and
-// _reliable, like pi-webrtc's --enable-ipc. With Play viewers' voices it plays the microphones
-// of the viewers in its rooms, like pi-webrtc without --no-audio.
+// Demo device: what pi-webrtc does. Waits on the socket, publishes after "wake", stops after "sleep".
+// Enable IPC opens _lossy and _reliable; Play viewers' voices plays the room's microphones.
 import {
   CLOSE_ID_IN_USE,
   CLOSE_REPLACED,
@@ -41,8 +39,8 @@ const log = createLog(document.getElementById("log"));
 document.getElementById("worker-url").value = location.origin;
 persistForm(form, "cf-sfu-worker.device");
 
-/** The one socket this tab uses. Events from any older socket are ignored. */
-// One per page, like a device's process: a reconnect keeps it, another tab has its own.
+/** The one socket this tab uses. Events from older sockets are ignored. */
+// One per page, like a device's process: a reconnect keeps it.
 const secret = newSecret();
 let socket = null;
 let connectSeq = 0;
@@ -50,22 +48,22 @@ let reconnectTimer = null;
 let pc = null;
 let stream = null;
 let iceServers = [];
-/** Goes up with each start and stop, so a camera that opens late knows it is no longer wanted. */
+/** Goes up with each start and stop, so a camera that opens late knows it is not wanted. */
 let publication = 0;
 /** The generation of the answer the PeerConnection uses, or 0 before the answer. */
 let generation = 0;
-/** Offers sent on this socket with no reply yet. Only the reply to the last offer counts. */
+/** Offers on this socket with no reply yet. Only the reply to the last one counts. */
 let unanswered = 0;
 /** The PeerConnection sent its offer. Until then, any reply is for an older one. */
 let offered = false;
 let stopped = true;
 let attempt = 0;
 let stopPattern = null;
-/** This connection publishes data channels, and plays the viewers' voices. Fixed until the next connect. */
+/** This connection publishes data channels and plays voices. Fixed until the next connect. */
 let ipc = false;
 let voices = true;
 const channels = new Map(); // label -> RTCDataChannel
-let controller = null; // { room, viewerId } of the viewer that can send to this device
+let controller = null; // the viewer that can send to this device
 
 function setStatus(text) {
   statusEl.textContent = text;
@@ -89,7 +87,7 @@ async function connect() {
   ipcPanel.hidden = !ipc;
   const rooms = String(data.get("rooms")).split(",").map((room) => room.trim()).filter(Boolean);
   try {
-    // While publishing, send the generation of our answer so a reconnect keeps the stream.
+    // While publishing, send our answer's generation so a reconnect keeps the stream.
     const { token, url } = await requestToken(data.get("workerUrl"), data.get("deviceKey"), {
       device_id: data.get("deviceId"),
       room_ids: rooms,
@@ -140,7 +138,7 @@ function onClose(event) {
   log(`socket closed ${event.code} ${event.reason}`);
   if (stopped) return;
   if (event.code === CLOSE_REPLACED || event.code === CLOSE_ID_IN_USE) {
-    // Another connection has this device ID. Ours gets it back once that one is gone.
+    // Another connection has this device ID. Ours gets it once that one is gone.
     stopPublishing();
     scheduleReconnect("Another connection uses this device ID. ");
     return;
@@ -205,7 +203,7 @@ async function handle(frame) {
       renderIpc();
       break;
     case "error":
-      // Data channels that did not open leave the video running, and come after the answer.
+      // Data channels that did not open leave the video running.
       if (message.request === "offer" && message.code !== ErrorCode.ERROR_CODE_NO_DATA_CHANNELS) {
         unanswered = Math.max(0, unanswered - 1);
         if (!offered || unanswered > 0) break;
@@ -214,7 +212,7 @@ async function handle(frame) {
           stopPublishing();
           break;
         }
-        // Publishing failed. Try again unless something else started or stopped meanwhile.
+        // Publishing failed. Try again unless something started or stopped meanwhile.
         const current = publication;
         setTimeout(() => {
           if (publication === current && socket) startPublishing();
@@ -232,14 +230,14 @@ async function startPublishing() {
   const media = await openMedia(new FormData(form).get("source"));
   if (publication !== mine) {
     for (const track of media.getTracks()) track.stop();
-    return; // a sleep or another wake arrived while the camera was starting
+    return; // a sleep or another wake came while the camera was starting
   }
   stream = media;
   preview.srcObject = stream;
   const peer = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
   pc = peer;
   for (const track of stream.getTracks()) peer.addTransceiver(track, { direction: "sendonly" });
-  // Any channel puts an m=application section in the offer. The worker sends the real ids.
+  // Any channel puts m=application in the offer. The worker sends the real ids.
   if (ipc) peer.createDataChannel("server-events", { negotiated: true, id: 0 });
   // A viewer's voice, pulled by the worker. One <audio> each, so they mix.
   peer.addEventListener("track", (event) => {
@@ -272,7 +270,7 @@ async function startPublishing() {
   protocol.send(socket, "offer", { sdp: offer.sdp, tracks, dataChannels: ipc, voices });
 }
 
-/** Answers the SFU's offer, which lists every voice the PeerConnection now receives. */
+/** Answers the SFU's offer, which lists every voice the PeerConnection receives. */
 async function answerVoices(message) {
   const peer = pc;
   await peer.setRemoteDescription({ type: "offer", sdp: message.sdp });
@@ -297,7 +295,7 @@ function openChannels(list) {
     if (current?.id === spec.id && current.readyState !== "closed") continue;
     current?.close();
     const channel = openChannel(pc, spec);
-    // Only the viewer in control can send here, so a message comes from the controller.
+    // Only the controller can send here.
     channel.addEventListener("message", (event) =>
       ipcLine("in", spec.label, `${decodeIpc(event.data)}${controller ? `  (${viewerName(controller)})` : ""}`),
     );
@@ -352,7 +350,7 @@ async function openMedia(source) {
   return testPattern();
 }
 
-/** A clock with hundredths of a second, so you can see that frames arrive and how late they are. */
+/** A clock with hundredths of a second, to see that frames arrive and how late. */
 function testPattern() {
   const canvas = Object.assign(document.createElement("canvas"), { width: 640, height: 360 });
   const context = canvas.getContext("2d");

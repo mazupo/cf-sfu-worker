@@ -1,10 +1,5 @@
-// Prints a fresh Ed25519 key pair for one role (device or viewer).
-//
-//   npm run keys            -> prints both roles
-//   npm run keys -- device  -> prints only the device key pair
-//
-// The private key goes into a Worker secret (DEVICE_PRIVATE_KEY or VIEWER_PRIVATE_KEY).
-// The public key is what devices or viewers send as `Authorization: Bearer <public key>`.
+// Prints a new Ed25519 key pair per role: `npm run keys`, or `npm run keys -- device` for one.
+// The private key is a Worker secret; clients send the public key as `Authorization: Bearer <key>`.
 import { generateKeyPairSync } from "node:crypto";
 
 const roles = process.argv.slice(2).filter((arg) => arg === "device" || arg === "viewer");
