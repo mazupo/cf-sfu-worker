@@ -42,6 +42,7 @@ The messages live in [mazupo/protocol](https://github.com/mazupo/protocol). This
 2. Run `npm run proto`. It warns that the submodule is not at the recorded commit. That is expected while you work.
 3. Merge the protocol change to its `main`.
 4. Point the submodule of this repo, pi-webrtc and client-sdk-js at the same commit.
+5. In this repo, set `protocol.commit` in `package.json` to that commit too. A copy made by the Deploy to Cloudflare button has no submodule, so its build downloads the protos at this commit. `npm run check` fails when the two differ.
 
 CI checks that this repo pins the same protocol commit as pi-webrtc `main`. So merge the pi-webrtc change first.
 

@@ -16,6 +16,10 @@
     "check": "npm run proto && node scripts/check-config.mjs && npm run cf-typegen -- --check && npm run typecheck && npm run test",
     "keys": "node scripts/keys.mjs"
   },
+  "protocol": {
+    "repo": "mazupo/protocol",
+    "commit": "0a656963b82b7168f8dda9752e2ff1ee9a39ad10"
+  },
   "dependencies": {
     "@bufbuild/protobuf": "^2.16.0",
     "hono": "^4.13.13",
