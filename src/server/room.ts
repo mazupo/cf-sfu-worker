@@ -1226,7 +1226,8 @@ export class Room extends DurableObject<Env> {
     if (viewer?.data_channels) {
       await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
     }
-    if (viewer?.sfu_session_id && data.length > 0) await this.closeAllData(viewer.sfu_session_id, data);
+    // Closing the channels of a gone PeerConnection can take seconds. A join meanwhile does not wait for it.
+    if (viewer?.sfu_session_id && data.length > 0) void this.closeAllData(viewer.sfu_session_id, data);
     if (this.viewerCount() > 0) {
       await this.releaseViewer(viewerId, affected);
       return;
