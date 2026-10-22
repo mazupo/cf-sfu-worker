@@ -471,7 +471,7 @@ export class Room extends DurableObject<Env> {
     await this.dropControl(attachment.viewerId);
   }
 
-  /** A viewer that loses its socket gives up control and its place in line at once, even if it resumes. */
+  /** A viewer that loses its socket or PeerConnection gives up control and its place in line at once, even if it comes back. */
   private async dropControl(viewerId: string): Promise<void> {
     const viewer = this.viewer(viewerId);
     if (!viewer?.data_channels) return;
@@ -587,7 +587,7 @@ export class Room extends DurableObject<Env> {
     } catch (error) {
       if (!(error instanceof SfuError && error.sessionGone)) throw error;
       // The session expired, e.g. made at join and idle for long. The viewer starts a new PeerConnection.
-      this.forgetSession(viewerId);
+      await this.forgetSession(viewerId);
       sessionId = await this.newSession(sfu, viewerId);
       sessionReset = true;
       result = await sfu.addTracks(sessionId, remote);
@@ -653,7 +653,7 @@ export class Room extends DurableObject<Env> {
     let viewer = this.viewer(viewerId)!;
     if (viewer.data_transport === DATA_READY || viewer.negotiating) {
       // The last PeerConnection failed: a new session, and the viewer subscribes again.
-      this.forgetSession(viewerId);
+      await this.forgetSession(viewerId);
       viewer = this.viewer(viewerId)!;
     }
     const sfu = new RealtimeSfu(this.env);
@@ -1193,8 +1193,10 @@ export class Room extends DurableObject<Env> {
     await Promise.race([revoking, new Promise((resolve) => setTimeout(resolve, REVOKE_HEAD_START_MS))]);
   }
 
-  /** The viewer's PeerConnection and session are done. It keeps control and counts, and subscribes again. */
-  private forgetSession(viewerId: string): void {
+  /** The viewer's PeerConnection and session are done. It gives up control at once, keeps its counts, and subscribes again. */
+  private async forgetSession(viewerId: string): Promise<void> {
+    // Before its new channels can get canReply from a device that still counts it as the controller.
+    await this.dropControl(viewerId);
     const viewer = this.viewer(viewerId);
     const hadMicrophone = Boolean(viewer?.mic_mid);
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
