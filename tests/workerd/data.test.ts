@@ -428,7 +428,7 @@ describe("control", () => {
 });
 
 describe("recovery", () => {
-  test("a viewer that offers again gets a new session, keeps control and subscribes again", async () => {
+  test("a viewer that offers again gets a new session, gives up control at once and subscribes again", async () => {
     const { calls, device } = await setup();
     const v1 = await dataViewer("v1");
     await publishWithData(device);
@@ -441,6 +441,7 @@ describe("recovery", () => {
     v1.messages.splice(0);
     v1.send("offer", { sdp: "v=0 viewer-offer-2" });
     expect(await v1.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    expect(await device.next("control")).toEqual({ controller: undefined });
     const establish = calls.filter((call) => call.path.endsWith("/datachannels/establish")).at(-1)!;
     expect(sessionOf(establish)).not.toBe(old);
     expect(canReplyUpdates(calls)).toContainEqual([old, false]);
@@ -449,11 +450,33 @@ describe("recovery", () => {
     );
     expect(rows).toBe(0);
 
-    // Still in control: its new channels come with canReply.
+    // Its new channels come without canReply: it takes control again like anyone else.
     v1.send("subscribe", { data: ["cam-1"] });
-    const subscribed = await v1.next("subscribed");
-    expect(subscribed.data).toEqual([expect.objectContaining({ deviceId: "cam-1", canReply: true })]);
-    expect(device.has("control")).toBe(false);
+    expect((await v1.next("subscribed")).data).toEqual([expect.objectContaining({ deviceId: "cam-1", canReply: false })]);
+  });
+
+  test("a controller whose PeerConnection is rebuilt hands control to the one waiting at once", async () => {
+    const { calls, device } = await setup();
+    const v1 = await dataViewer("v1");
+    const v2 = await dataViewer("v2");
+    const [first, second] = calls.filter((call) => call.path.endsWith("/datachannels/establish")).map(sessionOf);
+    await publishWithData(device);
+    await openData(v1);
+    await openData(v2);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    v2.send("takeControl", { deviceId: "cam-1" });
+    await info(v2, (device) => device.waiting.length === 1);
+
+    v1.send("offer", { sdp: "v=0 viewer-offer-2" });
+    await canReply(v2, true);
+    v2.send("controlReady", { deviceId: "cam-1" });
+    expect(await device.next("control")).toEqual({ controller: undefined });
+    expect(await device.next("control")).toEqual(controller("lab-a", "v2"));
+    const updates = canReplyUpdates(calls);
+    const revoked = updates.findIndex(([session, value]) => session === first && !value);
+    expect(revoked).toBeGreaterThanOrEqual(0);
+    expect(revoked).toBeLessThan(updates.findIndex(([session, value]) => session === second && value));
   });
 
   test("a viewer that leaves between PeerConnections gives up its control", async () => {
