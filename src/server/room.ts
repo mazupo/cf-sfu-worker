@@ -52,6 +52,8 @@ const CLOSE_LEFT = 1000;
 /** The data channel transport of a viewer's session. */
 const DATA_NONE = 0;
 const DATA_READY = 1;
+/** How long a dropped session's revoke goes first: the SFU must see it before the next grant. */
+const REVOKE_HEAD_START_MS = 200;
 
 type ViewerRow = {
   viewer_id: string;
@@ -1153,13 +1155,22 @@ export class Room extends DurableObject<Env> {
     await Promise.allSettled(subs.map((sub) => this.closeData(sfu, sessionId, sub)));
   }
 
+  /** Takes canReply back from a dropped session before the next grant, or the SFU holds that grant ~5 s. Its channels stay: closing only waits ~5 s for an error. */
+  private async revokeFirst(sessionId: string | null | undefined, subs: DataSubscriptionRow[]): Promise<void> {
+    const held = subs.filter((sub) => sub.can_reply);
+    if (!sessionId || held.length === 0) return;
+    const sfu = new RealtimeSfu(this.env);
+    const revoking = Promise.allSettled(held.map((sub) => sfu.updateDataChannels(sessionId, deviceChannels("remote", sub.device_session, false))));
+    // A gone session answers only after ~5 s; the SFU just has to see this first.
+    await Promise.race([revoking, new Promise((resolve) => setTimeout(resolve, REVOKE_HEAD_START_MS))]);
+  }
+
   /** The viewer's PeerConnection and session are done. It keeps control and counts, and subscribes again. */
   private forgetSession(viewerId: string): void {
     const viewer = this.viewer(viewerId);
     const hadMicrophone = Boolean(viewer?.mic_mid);
-    // The old channels close in the background: each call can take ~5 s.
     const subs = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ?", viewerId).toArray();
-    if (viewer?.sfu_session_id && subs.length > 0) void this.closeAllData(viewer.sfu_session_id, subs);
+    void this.revokeFirst(viewer?.sfu_session_id, subs);
     this.sql.exec("DELETE FROM data_subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec("DELETE FROM subscriptions WHERE viewer_id = ?", viewerId);
     this.sql.exec(
@@ -1222,12 +1233,11 @@ export class Room extends DurableObject<Env> {
       .exec<{ device_id: string }>("SELECT device_id FROM members")
       .toArray()
       .map((row) => row.device_id);
+    await this.revokeFirst(viewer?.sfu_session_id, data);
     // Between PeerConnections it has no channels but may still control a device, so each device drops it.
     if (viewer?.data_channels) {
       await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
     }
-    // Closing the channels of a gone PeerConnection can take seconds. A join meanwhile does not wait for it.
-    if (viewer?.sfu_session_id && data.length > 0) void this.closeAllData(viewer.sfu_session_id, data);
     if (this.viewerCount() > 0) {
       await this.releaseViewer(viewerId, affected);
       return;
