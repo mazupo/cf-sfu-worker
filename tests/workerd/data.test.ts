@@ -346,13 +346,15 @@ describe("control", () => {
     v2.send("takeControl", { deviceId: "cam-1" });
     await info(v2, (device) => device.waiting.length === 1);
 
-    // Leaving without releasing: the SFU would take about 5 s to give canReply to v2.
+    // Leaving without releasing. The SFU must see the revoke first, or it holds v2's grant ~5 s to take canReply itself.
     v1.send("leave");
     await canReply(v2, true);
     const updates = canReplyUpdates(calls);
     const revoked = updates.findIndex(([session, value]) => session === first && !value);
     expect(revoked).toBeGreaterThanOrEqual(0);
     expect(revoked).toBeLessThan(updates.findIndex(([session, value]) => session === second && value));
+    // Its channels are not closed: that only waits for the SFU to fail on a gone PeerConnection.
+    expect(calls.some((call) => call.path.endsWith("/datachannels/close") && sessionOf(call) === first)).toBe(false);
     // The confirm time counts from the grant, not from when v2 was picked.
     const stub = env.DEVICES.getByName("cam-1");
     await expect
@@ -496,7 +498,8 @@ describe("recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 1600));
   });
 
-  test("a viewer that leaves and joins again at once starts anew while its old channels close", async () => {
+  test("a viewer that leaves and joins again at once starts anew, and its old channels are not closed", async () => {
+    // A close would be slow, as for a gone PeerConnection.
     const calls = mockSfu({ dataCloseDelayMs: 1500 });
     const device = await connect(await deviceToken("cam-1", ["lab-a"]));
     await device.next("joined");
@@ -511,18 +514,15 @@ describe("recovery", () => {
     expect(joined).toMatchObject({ resumed: false, data: [] });
     expect(joined.devices).toEqual([expect.objectContaining({ deviceId: "cam-1", state: state_("live") })]);
 
-    // Its requests do not wait for the old channels to close.
     const started = Date.now();
     again.send("offer", { sdp: "v=0 viewer-offer-2" });
     expect(await again.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
     again.send("subscribe", { data: ["cam-1"] });
     expect((await again.next("subscribed")).data).toEqual([expect.objectContaining({ deviceId: "cam-1" })]);
     expect(Date.now() - started).toBeLessThan(1000);
-    expect(calls.some((call) => call.path.endsWith("/datachannels/close"))).toBe(true);
+    expect(calls.some((call) => call.path.endsWith("/datachannels/close"))).toBe(false);
     expect(device.has("sleep")).toBe(false);
     expect(again.has("error")).toBe(false);
-    // Let the slow close finish before the next test.
-    await new Promise((resolve) => setTimeout(resolve, 1600));
     again.close();
     device.close();
   });
