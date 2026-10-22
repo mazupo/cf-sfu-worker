@@ -471,6 +471,29 @@ describe("recovery", () => {
     expect(await device.next("control")).toEqual({ controller: undefined });
   });
 
+  test("an own offer on a session that expired unused gets a new session", async () => {
+    // The SFU answers decoding_error for a session that was never connected and expired.
+    const calls = mockSfu({ failEstablish: { sessions: ["session-1"], status: 400, errorCode: "decoding_error" } });
+    const v1 = await connect(await viewerToken("v1", "lab-a", true));
+    await v1.next("joined");
+    v1.send("offer", { sdp: "v=0 viewer-offer" });
+    expect(await v1.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    expect(calls.filter((call) => call.path.endsWith("/datachannels/establish")).map(sessionOf)).toEqual(["session-1", "session-2"]);
+    expect(v1.has("error")).toBe(false);
+  });
+
+  test("after an own offer fails, the next one starts on a new session", async () => {
+    const calls = mockSfu({ failEstablish: { sessions: ["session-1"], status: 500, errorCode: "internal_error" } });
+    const v1 = await connect(await viewerToken("v1", "lab-a", true));
+    await v1.next("joined");
+    v1.send("offer", { sdp: "v=0 viewer-offer" });
+    expect(await v1.next("error")).toMatchObject({ code: ErrorCode.ERROR_CODE_SFU, request: "offer" });
+    // The page offers again after a while, by then the old session may have expired.
+    v1.send("offer", { sdp: "v=0 viewer-offer-2" });
+    expect(await v1.next("answer")).toEqual({ sdp: "v=0 datachannel-answer" });
+    expect(calls.filter((call) => call.path.endsWith("/datachannels/establish")).map(sessionOf)).toEqual(["session-1", "session-2"]);
+  });
+
   test("an own offer while an SFU offer waits for its answer starts over instead of failing", async () => {
     const { device } = await setup();
     const v1 = await earlyViewer("v1", "lab-a", false);

@@ -190,6 +190,8 @@ export function mockSfu(
     failRevoke?: boolean;
     /** The SFU takes this long to close data channels, as when the viewer's PeerConnection is gone. */
     dataCloseDelayMs?: number;
+    /** Sessions whose establish fails with this answer, as a session that expired unused answers decoding_error. */
+    failEstablish?: { sessions: string[]; status: number; errorCode: string };
   } = {},
 ): SfuCall[] {
   const calls: SfuCall[] = [];
@@ -250,8 +252,12 @@ export function mockSfu(
       }
       return new HttpResponse(null, { status: 200 });
     }),
-    http.post(`${SFU}/sessions/:sessionId/datachannels/establish`, async ({ request }) => {
+    http.post(`${SFU}/sessions/:sessionId/datachannels/establish`, async ({ request, params }) => {
       await record(request);
+      const fail = options.failEstablish;
+      if (fail?.sessions.includes(String(params.sessionId))) {
+        return HttpResponse.json({ errorCode: fail.errorCode, errorDescription: "Failed." }, { status: fail.status });
+      }
       return HttpResponse.json({
         requiresImmediateRenegotiation: false,
         dataChannel: { dataChannelName: "server-events", id: 0 },

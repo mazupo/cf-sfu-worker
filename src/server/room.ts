@@ -668,8 +668,15 @@ export class Room extends DurableObject<Env> {
     try {
       answer = await sfu.establishDataChannels(sessionId, parsed.data.sdp);
     } catch (error) {
-      // A session made at join can expire before the offer. One with tracks cannot be replaced here.
-      if (!(error instanceof SfuError && error.sessionGone) || this.subscriptions(viewerId).length > 0) throw error;
+      // One with tracks cannot be replaced here.
+      if (this.subscriptions(viewerId).length > 0) throw error;
+      // A session that was never connected expires within ~30 s, and then answers decoding_error.
+      const expired = error instanceof SfuError && (error.sessionGone || error.code === "decoding_error");
+      if (!expired) {
+        // The next offer starts on a new session rather than wait on this one until it expires.
+        this.sql.exec("UPDATE viewers SET sfu_session_id = NULL WHERE viewer_id = ?", viewerId);
+        throw error;
+      }
       sessionId = await this.newSession(sfu, viewerId);
       answer = await sfu.establishDataChannels(sessionId, parsed.data.sdp);
     }
