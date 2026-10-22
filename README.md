@@ -8,7 +8,7 @@
 
 ## What is cf-sfu-worker?
 
-A Cloudflare Worker that lets a team work together with embedded devices that run [pi-webrtc](https://github.com/mazupo/pi-webrtc), such as a Raspberry Pi or a Jetson. Devices and people join rooms through [Cloudflare Realtime SFU](https://developers.cloudflare.com/realtime/sfu/). Everyone in a room sees every device and can talk, and one person at a time controls a device.
+A Cloudflare Worker that lets teams view, talk, and control [pi-webrtc](https://github.com/mazupo/pi-webrtc) devices through [Cloudflare Realtime SFU](https://developers.cloudflare.com/realtime/sfu/).
 
 ```mermaid
 flowchart LR
@@ -64,7 +64,7 @@ Make your keys with `npm run keys` first. See [Deploy](docs/deployment/deploy.md
 
 ## Documentation
 
-All guides are in [docs/](docs/README.md).
+📚 **[Full documentation](https://mazupo.com/docs/cf-sfu-worker)**, also readable in [docs/](docs/README.md).
 
 ## License
 
