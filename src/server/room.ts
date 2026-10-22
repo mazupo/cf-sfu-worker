@@ -327,6 +327,8 @@ export class Room extends DurableObject<Env> {
       viewer = this.viewer(viewerId);
     }
     const resumed = viewer !== null;
+    // A socket that is replaced, e.g. after a network blip, loses control like one that closed.
+    const replacing = this.ctx.getWebSockets(viewerId).length > 0;
     for (const old of this.ctx.getWebSockets(viewerId)) {
       closeSocket(old, CloseCode.CLOSE_CODE_REPLACED, "Another connection uses the same viewer_id.");
     }
@@ -382,6 +384,7 @@ export class Room extends DurableObject<Env> {
       });
     }
     await this.scheduleAlarm(now);
+    if (replacing) void this.dropControl(viewerId).catch(() => undefined);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -465,6 +468,23 @@ export class Room extends DurableObject<Env> {
     );
     this.broadcastViewers();
     await this.scheduleAlarm(now);
+    await this.dropControl(attachment.viewerId);
+  }
+
+  /** A viewer that loses its socket gives up control and its place in line at once, even if it resumes. */
+  private async dropControl(viewerId: string): Promise<void> {
+    const viewer = this.viewer(viewerId);
+    if (!viewer?.data_channels) return;
+    const held = this.sql.exec<DataSubscriptionRow>("SELECT * FROM data_subscriptions WHERE viewer_id = ? AND can_reply = 1", viewerId).toArray();
+    this.sql.exec("UPDATE data_subscriptions SET can_reply = 0 WHERE viewer_id = ?", viewerId);
+    await this.revokeFirst(viewer.sfu_session_id, held);
+    const members = this.sql
+      .exec<{ device_id: string }>("SELECT device_id FROM members")
+      .toArray()
+      .map((row) => row.device_id);
+    await Promise.allSettled(members.map((deviceId) => this.env.DEVICES.getByName(deviceId).controlGone(this.roomId, viewerId)));
+    // A resumed socket learns that its channels lost canReply.
+    if (held.length > 0) this.sendTo(viewerId, { subscribed: this.subscribed(viewerId) });
   }
 
   private async onSubscribe(ws: WebSocket, viewerId: string, message: Subscribe): Promise<void> {
@@ -931,7 +951,7 @@ export class Room extends DurableObject<Env> {
     this.sql.exec("DELETE FROM used_tokens WHERE expires_at <= ?", now);
 
     // Half-open sockets: the socket exists but pings stopped.
-    let wentAway = false;
+    const wentAway: string[] = [];
     for (const ws of this.ctx.getWebSockets()) {
       if (ws.readyState !== WebSocket.OPEN || now - this.lastSeen(ws) <= this.config.viewerStaleMs) continue;
       const attachment = ws.deserializeAttachment() as ViewerAttachment | null;
@@ -943,10 +963,11 @@ export class Room extends DurableObject<Env> {
           now,
           attachment.viewerId,
         );
-        wentAway = true;
+        wentAway.push(attachment.viewerId);
       }
     }
-    if (wentAway) this.broadcastViewers();
+    if (wentAway.length > 0) this.broadcastViewers();
+    for (const viewerId of wentAway) await this.dropControl(viewerId);
 
     // Viewers that did not come back in time.
     const expired = this.sql

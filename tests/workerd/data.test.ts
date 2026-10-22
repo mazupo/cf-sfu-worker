@@ -291,6 +291,62 @@ describe("control", () => {
     await canReply(v2, true);
   });
 
+  test("a controller whose socket drops hands control on at once, and does not get it back when it resumes", async () => {
+    const { calls, device } = await setup();
+    const v1 = await dataViewer("v1");
+    const v2 = await dataViewer("v2");
+    const [first, second] = calls.filter((call) => call.path.endsWith("/datachannels/establish")).map(sessionOf);
+    await publishWithData(device);
+    await openData(v1);
+    await openData(v2);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    v2.send("takeControl", { deviceId: "cam-1" });
+    await info(v2, (device) => device.waiting.length === 1);
+
+    // No leave: the socket drops, as on a network blip or a closed tab.
+    v1.close();
+    await canReply(v2, true);
+    expect(await device.next("control")).toEqual({ controller: undefined });
+    v2.send("controlReady", { deviceId: "cam-1" });
+    expect(await device.next("control")).toEqual(controller("lab-a", "v2"));
+    const updates = canReplyUpdates(calls);
+    const revoked = updates.findIndex(([session, value]) => session === first && !value);
+    expect(revoked).toBeGreaterThanOrEqual(0);
+    expect(revoked).toBeLessThan(updates.findIndex(([session, value]) => session === second && value));
+
+    // Back within the resume time, it no longer controls.
+    const back = await connect(await viewerToken("v1", "lab-a", true));
+    const joined = await back.next("joined");
+    expect(joined.resumed).toBe(true);
+    expect(joined.data).toEqual([expect.objectContaining({ deviceId: "cam-1", canReply: false })]);
+    expect(device.has("control")).toBe(false);
+  });
+
+  test("a controller whose socket drops gives control up even when nobody waits", async () => {
+    const { device } = await setup();
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await openData(v1);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    v1.close();
+    expect(await device.next("control")).toEqual({ controller: undefined });
+  });
+
+  test("a controller replaced by its own new socket loses control", async () => {
+    const { device } = await setup();
+    const v1 = await dataViewer("v1");
+    await publishWithData(device);
+    await openData(v1);
+    await control(v1);
+    expect(await device.next("control")).toEqual(controller("lab-a", "v1"));
+    const again = await connect(await viewerToken("v1", "lab-a", true));
+    expect((await again.next("joined")).resumed).toBe(true);
+    expect(await device.next("control")).toEqual({ controller: undefined });
+    expect(await canReply(again, false)).toMatchObject({ deviceId: "cam-1" });
+  });
+
   test("control is per device, so a viewer in another room waits in the same line", async () => {
     const { device } = await setup(["lab-a", "lab-b"]);
     const v1 = await dataViewer("v1", "lab-a");
