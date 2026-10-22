@@ -2,6 +2,9 @@ import type { DataChannel, IceServer } from "../proto/cloudflare";
 
 const SFU_BASE = "https://rtc.live.cloudflare.com/v1";
 const REQUEST_TIMEOUT_MS = 10_000;
+/** SFU calls in flight in this isolate, by id. A timeout logs them. */
+const inFlight = new Map<number, string>();
+let lastCallId = 0;
 const DEFAULT_ICE_SERVERS: IceServer[] = [{ urls: ["stun:stun.cloudflare.com:3478"], username: "", credential: "" }];
 
 export class SfuError extends Error {
@@ -165,6 +168,17 @@ export class RealtimeSfu {
   }
 
   private async request<T>(method: "POST" | "PUT", path: string, body?: unknown): Promise<T> {
+    const call = `${method} ${path.replace(/^\/sessions\/[^/]+\//, "/sessions/_/")}`;
+    const id = ++lastCallId;
+    inFlight.set(id, call);
+    try {
+      return await this.send<T>(method, path, body, call, id);
+    } finally {
+      inFlight.delete(id);
+    }
+  }
+
+  private async send<T>(method: "POST" | "PUT", path: string, body: unknown, call: string, id: number): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let response: Response;
@@ -176,9 +190,10 @@ export class RealtimeSfu {
         signal: controller.signal,
       });
     } catch {
-      throw controller.signal.aborted
-        ? new SfuError("sfu_timeout", "The SFU did not answer in time.", 504)
-        : new SfuError("sfu_unreachable", "The SFU could not be reached.", 503);
+      if (!controller.signal.aborted) throw new SfuError("sfu_unreachable", "The SFU could not be reached.", 503);
+      const others = [...inFlight].filter(([other]) => other !== id).map(([, name]) => name);
+      console.log(JSON.stringify({ event: "sfu_timeout", call, inFlight: others.length, calls: countBy(others) }));
+      throw new SfuError("sfu_timeout", "The SFU did not answer in time.", 504);
     } finally {
       clearTimeout(timer);
     }
@@ -203,6 +218,12 @@ export class RealtimeSfu {
     }
     return parsed as T;
   }
+}
+
+function countBy(names: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const name of names) counts[name] = (counts[name] ?? 0) + 1;
+  return counts;
 }
 
 /** TURN credentials last a day. The isolate shares them for an hour. */
