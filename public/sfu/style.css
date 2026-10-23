@@ -68,6 +68,7 @@ button:disabled { opacity: 0.5; cursor: default; }
 .status { font-family: var(--mono); font-size: 0.85rem; color: var(--muted); }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
 .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; display: grid; }
+.tile .videos { display: grid; gap: 2px; background: var(--line); }
 .tile video { width: 100%; aspect-ratio: 16 / 9; background: #000; display: block; object-fit: contain; }
 .tile .bar { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px; }
 .tile .name { font-family: var(--mono); font-size: 0.9rem; overflow-wrap: anywhere; }
