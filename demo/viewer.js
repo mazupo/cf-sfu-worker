@@ -91,7 +91,7 @@ const dataSubs = new Map(); // deviceId -> { generation, ids, canReply, channels
 const refused = new Map(); // deviceId -> generation the server refused for good
 const retries = new Map(); // deviceId -> { generation, count, at }
 const dataRetries = new Map(); // deviceId -> { generation, count, at }
-const tiles = new Map(); // deviceId -> { root, video, chip, note, ipc }
+const tiles = new Map(); // deviceId -> { root, videos, chip, note, ipc }
 
 function viewerId() {
   const typed = viewerIdInput.value.trim();
@@ -540,7 +540,7 @@ function resetPeer(create) {
   pc?.close();
   pc = null;
   subscriptions.clear();
-  for (const tile of tiles.values()) tile.video.srcObject = null;
+  for (const tile of tiles.values()) for (const video of tile.videos.children) video.srcObject = null;
   if (!create) return;
   const peer = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
   pc = peer;
@@ -554,7 +554,7 @@ function resetPeer(create) {
   });
 }
 
-/** Puts each received track on the tile of the device it came from, matched by mid. */
+/** Plays each received video on its own player in its device's tile, matched by mid. Audio plays in the first. */
 function attachTracks() {
   if (!pc) return;
   const byDevice = new Map();
@@ -567,9 +567,17 @@ function attachTracks() {
   }
   for (const [deviceId, tile] of tiles) {
     const tracks = byDevice.get(deviceId) ?? [];
-    const current = tile.video.srcObject?.getTracks() ?? [];
-    const same = current.length === tracks.length && tracks.every((track) => current.includes(track));
-    if (!same) tile.video.srcObject = tracks.length ? new MediaStream(tracks) : null;
+    const audio = tracks.filter((track) => track.kind === "audio");
+    const videos = tracks.filter((track) => track.kind === "video");
+    const groups = videos.length ? videos.map((video, i) => (i === 0 ? [video, ...audio] : [video])) : [audio];
+    while (tile.videos.children.length < groups.length) tile.videos.append(createVideo());
+    while (tile.videos.children.length > groups.length) tile.videos.lastElementChild.remove();
+    groups.forEach((group, i) => {
+      const video = tile.videos.children[i];
+      const current = video.srcObject?.getTracks() ?? [];
+      const same = current.length === group.length && group.every((track) => current.includes(track));
+      if (!same) video.srcObject = group.length ? new MediaStream(group) : null;
+    });
   }
 }
 
@@ -611,12 +619,9 @@ function createTile(deviceId) {
   const root = document.createElement("article");
   root.className = "tile";
   root.dataset.deviceId = deviceId;
-  const video = Object.assign(document.createElement("video"), {
-    autoplay: true,
-    playsInline: true,
-    muted: true,
-    controls: true,
-  });
+  const videos = document.createElement("div");
+  videos.className = "videos";
+  videos.append(createVideo());
   const bar = document.createElement("div");
   bar.className = "bar";
   const name = Object.assign(document.createElement("span"), { className: "name", textContent: deviceId });
@@ -624,12 +629,12 @@ function createTile(deviceId) {
   const note = document.createElement("span");
   note.className = "status";
   bar.append(name, note, chip);
-  root.append(video, bar, createIpcBox(deviceId));
+  root.append(videos, bar, createIpcBox(deviceId));
   tilesEl.append(root);
   const box = root.querySelector(".ipc");
   return {
     root,
-    video,
+    videos,
     chip,
     note,
     ipc: {
@@ -641,6 +646,10 @@ function createTile(deviceId) {
       send: box.querySelector(".ipc-send"),
     },
   };
+}
+
+function createVideo() {
+  return Object.assign(document.createElement("video"), { autoplay: true, playsInline: true, muted: true, controls: true });
 }
 
 /** The tile's IPC window: who controls the device, its messages, and a send box. */
