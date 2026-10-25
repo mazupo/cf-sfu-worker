@@ -44,6 +44,17 @@ const log = createLog(document.getElementById("log"));
 
 document.getElementById("api-url").value = `${location.origin}/sfu`;
 persistForm(form, "cf-sfu-worker.viewer");
+// A shared link fills in the form: ?room=lab-a&viewer_key=...
+const query = new URLSearchParams(location.search);
+let fromQuery = false;
+for (const [param, name] of [["room", "room"], ["viewer_key", "viewerKey"]]) {
+  const value = query.get(param)?.trim();
+  if (!value) continue;
+  form.elements.namedItem(name).value = value;
+  fromQuery = true;
+}
+// Save them as if typed.
+if (fromQuery) form.dispatchEvent(new Event("input"));
 try {
   viewerIdInput.value = sessionStorage.getItem("cf-sfu-worker.viewerIdInput") ?? "";
 } catch {
