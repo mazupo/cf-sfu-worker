@@ -70,6 +70,7 @@ The camera wakes and the video shows in a few seconds. Click **Leave**: about 30
 ## Try more
 
 - **Data channels**: check **Enable IPC** on both pages before you connect. Then send messages both ways.
+- **Share a link**: add `?room=lab-a&viewer_key=<viewer public key>` to the viewer URL. The page fills in the form.
 - **Server state**: open it on either page to see what the worker holds.
 - **Dashboard**: [localhost:8787/sfu/admin/](http://localhost:8787/sfu/admin/) lists every room.
 - **Other devices**: `npm run dev` listens on all interfaces. Use `http://<your computer's IP>:8787` from your network. The **Camera** source works only on `localhost` or `https`.
