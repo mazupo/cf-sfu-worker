@@ -10,6 +10,14 @@
 
 A Cloudflare Worker that lets teams view, talk, and control [pi-webrtc](https://github.com/mazupo/pi-webrtc) devices through [Cloudflare Realtime SFU](https://developers.cloudflare.com/realtime/sfu/).
 
+<p align="center">
+  <img width="600" alt="A Raspberry Pi 5 streams through Cloudflare Realtime SFU to a laptop and two phones, about 100 ms glass to glass" src="https://github.com/user-attachments/assets/6ec337b1-70c5-494a-bee0-c224664011f5" />
+</p>
+
+<p align="center">
+  <a href="https://youtu.be/NMARa-pnQoQ">▶ Watch the full demo</a>
+</p>
+
 ```mermaid
 flowchart LR
   Device["Devices<br/>(pi-webrtc)"] -- WebSocket --> Worker["cf-sfu-worker"]
